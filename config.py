@@ -20,15 +20,15 @@ API_ENDPOINT = "/metadata/stats"
 # =============================================================================
 # Timing Configuration (in minutes unless noted)
 # =============================================================================
-SCAN_INTERVAL_SECONDS = 300      # 5 minutes
-TRACK_INTERVAL_SECONDS = 300     # 5 minutes
+SCAN_INTERVAL_SECONDS = 180      # 3 minutes
+TRACK_INTERVAL_SECONDS = 180     # 3 minutes
 FRESHNESS_THRESHOLD_MINUTES = 10
 
 # =============================================================================
 # Strategy Thresholds (percentage points)
 # =============================================================================
 ENTRY_THRESHOLD = 2.0
-EXIT_THRESHOLD = 0.5
+EXIT_THRESHOLD = 0.15
 INVALIDATION_THRESHOLD = 4.0
 
 # =============================================================================
