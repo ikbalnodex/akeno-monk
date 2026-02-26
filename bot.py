@@ -88,6 +88,8 @@ scan_stats = {
     "count": 0,
     "last_btc_price": None,
     "last_eth_price": None,
+    "last_btc_ret": None,
+    "last_eth_ret": None,
     "last_gap": None,
     "signals_sent": 0,
 }
@@ -535,9 +537,11 @@ def build_heartbeat_message() -> str:
     """Build periodic status/heartbeat message."""
     lb = get_lookback_label()
     
-    # Format prices
-    btc_str = f"${float(scan_stats['last_btc_price']):,.2f}" if scan_stats['last_btc_price'] else "N/A"
-    eth_str = f"${float(scan_stats['last_eth_price']):,.2f}" if scan_stats['last_eth_price'] else "N/A"
+    # Format prices with percentage
+    btc_ret_str = f" ({format_value(scan_stats['last_btc_ret'])}%)" if scan_stats['last_btc_ret'] is not None else ""
+    eth_ret_str = f" ({format_value(scan_stats['last_eth_ret'])}%)" if scan_stats['last_eth_ret'] is not None else ""
+    btc_str = f"${float(scan_stats['last_btc_price']):,.2f}{btc_ret_str}" if scan_stats['last_btc_price'] else "N/A"
+    eth_str = f"${float(scan_stats['last_eth_price']):,.2f}{eth_ret_str}" if scan_stats['last_eth_price'] else "N/A"
     gap_str = f"{format_value(scan_stats['last_gap'])}%" if scan_stats['last_gap'] is not None else "N/A"
     
     # Calculate data collection status
@@ -996,8 +1000,10 @@ def main_loop() -> None:
                             price_then.eth,
                         )
                         
-                        # Update scan stats with gap
+                        # Update scan stats with gap and returns
                         scan_stats["last_gap"] = gap
+                        scan_stats["last_btc_ret"] = btc_ret
+                        scan_stats["last_eth_ret"] = eth_ret
                         
                         logger.info(
                             f"Mode: {current_mode.value} | "
