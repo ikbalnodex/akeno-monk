@@ -1,6 +1,6 @@
 # Monk Bot - BTC/ETH Divergence Alert Bot
 
-A lightweight Python bot that monitors BTC/ETH price divergence and sends Telegram alerts for trading signals.
+A lightweight Python bot that monitors BTC/ETH price divergence and sends Telegram alerts for trading signals. Features **peak detection** for optimal entry timing.
 
 ## Strategy
 
@@ -10,25 +10,49 @@ The bot implements a pairs trading strategy based on BTC/ETH relative performanc
 - Triggers when ETH pumps more than BTC (gap >= +2%)
 - ETH outperforming = expect reversion
 
-**Strategy 2 (S2): Long ETH / Short BTC**  
+**Strategy 2 (S2): Long ETH / Short BTC**
 - Triggers when ETH dumps more than BTC (gap <= -2%)
 - ETH underperforming = expect reversion
 
 ### How It Works
 
-1. Bot scans BTC and ETH mark prices every 5 minutes
+1. Bot scans BTC and ETH mark prices every 3 minutes
 2. Calculates rolling % change over the lookback period (1h-24h)
 3. Gap = ETH % change - BTC % change
-4. If gap exceeds threshold, sends Telegram alert
+4. If gap exceeds threshold, bot enters **Peak Watch** mode
+5. Bot waits for gap to peak and reverse before sending entry signal
+
+### Peak Detection
+
+Instead of entering immediately when the gap crosses the threshold, the bot waits for the gap to peak and start reversing — this gives a more optimal entry point.
+
+```
+Gap
+ |
+3.5% -------- PEAK (bot tracks this)
+3.2%              \
+3.1%               ← ENTRY triggered here (dropped 0.4% from peak)
+2.0% --- entry threshold
+ |
+ └─────────────── time →
+```
+
+**Flow:**
+1. Gap crosses entry threshold → `PEAK WATCH` (bot monitors, no entry yet)
+2. Gap keeps rising → bot updates peak internally
+3. Gap drops `peak_reversal`% from peak → `ENTRY SIGNAL` sent
+4. Gap retreats below threshold before confirming → `PEAK CANCELLED`
 
 ### Signal Types
 
 | Signal | Condition | Action |
 |--------|-----------|--------|
-| **S1 ENTRY** | Gap >= +2.0% | Long BTC / Short ETH |
-| **S2 ENTRY** | Gap <= -2.0% | Long ETH / Short BTC |
+| **PEAK WATCH** | Gap crosses ±2.0% | Monitoring for peak reversal |
+| **S1 ENTRY** | Gap reverses from peak (S1) | Long BTC / Short ETH |
+| **S2 ENTRY** | Gap reverses from peak (S2) | Long ETH / Short BTC |
 | **EXIT** | Gap returns to ±0.5% | Close positions |
-| **INVALIDATION** | Gap exceeds ±4.0% | Stop loss |
+| **INVALIDATION** | Gap exceeds ±5.0% | Stop loss |
+| **PEAK CANCELLED** | Gap retreats before confirming | Back to scan mode |
 
 ## Telegram Commands
 
@@ -43,17 +67,18 @@ Control the bot directly from Telegram by messaging it:
 | `/threshold entry <val>` | Set entry threshold % |
 | `/threshold exit <val>` | Set exit threshold % |
 | `/threshold invalid <val>` | Set invalidation threshold % |
+| `/peak <val>` | Set peak reversal % to confirm entry |
 | `/status` | View bot status and data collection progress |
 | `/help` | Show all commands |
 
 Commands respond instantly using Telegram long polling.
 
-The bot sends a heartbeat message every 30 minutes (configurable) with a summary of scans performed and current prices.
+The bot sends a heartbeat message every 30 minutes (configurable) with a summary of scans performed, current prices, and % change.
 
 ## Requirements
 
 - Python 3.10+
-- Linux server (Ubuntu 22.04/24.04 recommended)
+- Linux server (Ubuntu 22.04/24.04 recommended) or cloud platform (Railway, Fly.io, Oracle Cloud)
 - Telegram bot token
 
 ## Quick Start
@@ -90,6 +115,7 @@ LOG_LEVEL=INFO
 **Getting Telegram credentials:**
 1. Create a bot via [@BotFather](https://t.me/botfather) → get token
 2. Message [@userinfobot](https://t.me/userinfobot) → get chat ID
+3. Start your bot in Telegram before running
 
 ### 4. Test Run
 
@@ -98,6 +124,20 @@ source venv/bin/activate
 export $(cat .env | xargs)
 python bot.py
 ```
+
+## Deploy to Railway (Recommended)
+
+Railway is the easiest way to run this bot 24/7 for free.
+
+1. Fork this repo to your GitHub account
+2. Go to [railway.app](https://railway.app) → Login with GitHub
+3. New Project → Deploy from GitHub repo → select `monk-bot`
+4. Go to service → **Variables** tab → add:
+   - `TELEGRAM_BOT_TOKEN` = your token
+   - `TELEGRAM_CHAT_ID` = your chat ID
+   - `LOG_LEVEL` = `INFO`
+5. Go to **Settings** → Start Command → set `python bot.py`
+6. Redeploy and check **Logs** tab
 
 ## Production Deployment (Ubuntu)
 
@@ -128,11 +168,28 @@ Default settings (all configurable via Telegram commands):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `lookback_hours` | 24 | Lookback period for % change (1-24h) |
-| `scan_interval` | 300 | Time between scans in seconds (5 min) |
+| `scan_interval` | 180 | Time between scans in seconds (3 min) |
 | `heartbeat_minutes` | 30 | Status update interval (0 to disable) |
-| `entry_threshold` | 2.0 | Gap % to trigger entry |
+| `entry_threshold` | 2.0 | Gap % to start peak watch |
 | `exit_threshold` | 0.5 | Gap % to trigger exit |
-| `invalidation_threshold` | 4.0 | Gap % for stop loss |
+| `invalidation_threshold` | 5.0 | Gap % for stop loss |
+| `peak_reversal` | 0.3 | Gap must drop this % from peak to confirm entry |
+
+**Quick Testing Setup** (faster signals for testing):
+```
+/lookback 1
+/threshold entry 0.5
+/peak 0.2
+```
+
+**Optimal Trading Setup:**
+```
+/lookback 24
+/threshold entry 2.0
+/threshold exit 0.5
+/threshold invalid 5.0
+/peak 0.3
+```
 
 **Note:** With 24h lookback (default), the bot needs ~24 hours of data collection before sending signals. Use `/lookback 1` for faster startup with 1-hour timeframe.
 
