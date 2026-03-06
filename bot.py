@@ -1023,12 +1023,27 @@ def prune_history(now: datetime) -> None:
 
 
 def get_lookback_price(now: datetime) -> Optional[PricePoint]:
+    if not price_history:
+        return None
+
     target_time = now - timedelta(hours=settings["lookback_hours"])
+
+    # Cari point paling dekat dengan target waktu (toleransi 30 menit)
     best_point, best_diff = None, timedelta(minutes=30)
     for point in price_history:
         diff = abs(point.timestamp - target_time)
         if diff < best_diff:
             best_diff, best_point = diff, point
+
+    # Fallback: kalau tidak ada yang masuk window 30 menit (misal setelah restart),
+    # pakai point tertua selama usianya sudah >= 90% dari lookback
+    if best_point is None:
+        oldest = price_history[0]
+        min_age = timedelta(hours=settings["lookback_hours"] * 0.9)
+        if (now - oldest.timestamp) >= min_age:
+            best_point = oldest
+            logger.debug(f"Lookback fallback: using oldest point at {oldest.timestamp}")
+
     return best_point
 
 
