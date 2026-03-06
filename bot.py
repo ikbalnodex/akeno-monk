@@ -82,6 +82,9 @@ class SLTPState:
         self.tp_gap: Optional[float] = None
         self.sl_gap: Optional[float] = None
 
+        # Trailing SL: best gap yang pernah dicapai sejak entry
+        self.best_gap: Optional[float] = None
+
         # Entry snapshot untuk PnL
         self.entry_gap: Optional[float] = None
         self.entry_btc: Optional[Decimal] = None
@@ -95,21 +98,38 @@ class SLTPState:
         self.entry_time = now
 
     def auto_set(self, entry_gap: float, strategy: "Strategy", tp_offset: float, sl_offset: float):
-        """
-        Auto-hitung TP dan SL dari entry gap + offset settings.
-        S1 (Long BTC/Short ETH): gap positif, konvergen ke 0 = profit
-          → TP = entry_gap - tp_offset (gap mengecil)
-          → SL = entry_gap + sl_offset (gap makin besar)
-        S2 (Long ETH/Short BTC): gap negatif, konvergen ke 0 = profit
-          → TP = entry_gap + tp_offset (gap mengecil / kurang negatif)
-          → SL = entry_gap - sl_offset (gap makin negatif)
-        """
         if strategy == Strategy.S1:
             self.tp_gap = entry_gap - tp_offset
             self.sl_gap = entry_gap + sl_offset
-        else:  # S2
+        else:
             self.tp_gap = entry_gap + tp_offset
             self.sl_gap = entry_gap - sl_offset
+        self.best_gap = entry_gap  # init trailing dari entry gap
+
+    def update_trailing(self, gap_float: float, strategy: "Strategy", sl_offset: float) -> bool:
+        """
+        Update trailing SL jika gap bergerak ke arah profit.
+        Return True jika SL berhasil digeser (untuk logging).
+        S1: profit = gap mengecil → best_gap turun → SL = best_gap + sl_offset
+        S2: profit = gap mengecil (kurang negatif) → best_gap naik → SL = best_gap - sl_offset
+        """
+        if self.best_gap is None or self.sl_gap is None:
+            return False
+
+        moved = False
+        if strategy == Strategy.S1 and gap_float < self.best_gap:
+            self.best_gap = gap_float
+            new_sl = self.best_gap + sl_offset
+            if new_sl < self.sl_gap:  # SL hanya boleh turun (menguntungkan)
+                self.sl_gap = new_sl
+                moved = True
+        elif strategy == Strategy.S2 and gap_float > self.best_gap:
+            self.best_gap = gap_float
+            new_sl = self.best_gap - sl_offset
+            if new_sl > self.sl_gap:  # SL hanya boleh naik (menguntungkan)
+                self.sl_gap = new_sl
+                moved = True
+        return moved
 
     def has_any(self) -> bool:
         return self.tp_gap is not None or self.sl_gap is not None
@@ -421,7 +441,7 @@ def _show_sltp_status(reply_chat: str) -> None:
         f"*Auto SL/TP Offset:*\n"
         f"┌─────────────────────\n"
         f"│ ✅ TP offset: {tp_off}% dari entry gap\n"
-        f"│ ⛔ SL offset: {sl_off}% dari entry gap\n"
+        f"│ 🔄 Trailing SL distance: {sl_off}%\n"
         f"└─────────────────────\n"
     )
 
@@ -456,12 +476,14 @@ def _show_sltp_status(reply_chat: str) -> None:
     active_levels = ""
     if sltp.tp_gap is not None or sltp.sl_gap is not None:
         tp_line = f"│ ✅ TP Gap: {sltp.tp_gap:+.2f}%\n" if sltp.tp_gap is not None else ""
-        sl_line = f"│ ⛔ SL Gap: {sltp.sl_gap:+.2f}%\n" if sltp.sl_gap is not None else ""
+        sl_line = f"│ 🔄 Trailing SL: {sltp.sl_gap:+.2f}%\n" if sltp.sl_gap is not None else ""
+        best_line = f"│ 🏆 Best Gap: {sltp.best_gap:+.2f}%\n" if sltp.best_gap is not None else ""
         active_levels = (
             f"*Level Aktif:*\n"
             f"┌─────────────────────\n"
             f"{tp_line}"
             f"{sl_line}"
+            f"{best_line}"
             f"└─────────────────────\n\n"
         )
 
@@ -504,6 +526,13 @@ def evaluate_sltp(
     triggered_tp = False
     triggered_sl = False
     trigger_reason = ""
+
+    # Update trailing SL sebelum cek trigger
+    if active_strategy is not None:
+        sl_before = sltp.sl_gap
+        moved = sltp.update_trailing(gap_float, active_strategy, settings["sl_offset"])
+        if moved:
+            logger.info(f"Trailing SL moved: {sl_before:+.2f}% → {sltp.sl_gap:+.2f}% (best gap: {sltp.best_gap:+.2f}%)")
 
     if sltp.tp_gap is not None:
         if active_strategy == Strategy.S1 and gap_float <= sltp.tp_gap:
@@ -572,7 +601,7 @@ def build_sl_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal, reason: s
     lb = get_lookback_label()
     return (
         f"………\n"
-        f"⛔ *STOP LOSS HIT*\n"
+        f"⛔ *TRAILING STOP LOSS HIT*\n"
         f"\n"
         f"Ara ara~ maaf ya sayangku... Akeno sudah berusaha sepenuh hati,\n"
         f"tapi pasar tidak mau kerja sama kali ini. Ufufufu, bukan salahmu~ (◕ω◕)\n"
@@ -1057,7 +1086,8 @@ def build_heartbeat_message() -> str:
     peak_line = f"│ Peak: {peak_gap:+.2f}%\n" if (current_mode == Mode.PEAK_WATCH and peak_gap is not None) else ""
     sltp_line = ""
     if current_mode == Mode.TRACK and sltp.has_any():
-        sltp_line = f"│ SL/TP: Aktif~\n"
+        sl_val = f" (Trailing SL: {sltp.sl_gap:+.2f}%)" if sltp.sl_gap is not None else ""
+        sltp_line = f"│ SL/TP: Aktif~{sl_val}\n"
     return (
         f"💓 *Ara ara~ kamu khawatir Akeno pergi kemana-mana ya?*\n"
         f"\n"
