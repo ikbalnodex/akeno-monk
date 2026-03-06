@@ -78,14 +78,9 @@ class SLTPState:
         self.reset()
 
     def reset(self):
-        # Auto-computed gap levels (set saat entry)
         self.tp_gap: Optional[float] = None
         self.sl_gap: Optional[float] = None
-
-        # Trailing SL: best gap yang pernah dicapai sejak entry
         self.best_gap: Optional[float] = None
-
-        # Entry snapshot untuk PnL
         self.entry_gap: Optional[float] = None
         self.entry_btc: Optional[Decimal] = None
         self.entry_eth: Optional[Decimal] = None
@@ -104,12 +99,12 @@ class SLTPState:
         else:
             self.tp_gap = entry_gap + tp_offset
             self.sl_gap = entry_gap - sl_offset
-        self.best_gap = entry_gap  # init trailing dari entry gap
+        self.best_gap = entry_gap
 
     def update_trailing(self, gap_float: float, strategy: "Strategy", sl_offset: float) -> bool:
         """
         Update trailing SL jika gap bergerak ke arah profit.
-        Return True jika SL berhasil digeser (untuk logging).
+        Return True jika SL berhasil digeser.
         S1: profit = gap mengecil → best_gap turun → SL = best_gap + sl_offset
         S2: profit = gap mengecil (kurang negatif) → best_gap naik → SL = best_gap - sl_offset
         """
@@ -217,7 +212,12 @@ def save_history() -> None:
 
 
 def load_history() -> None:
-    """Load price_history dari Upstash Redis saat startup."""
+    """
+    Load price_history dari Upstash Redis saat startup.
+    - Tidak pernah wipe in-memory history jika Redis gagal/kosong.
+    - Parse ke variabel temp dulu, baru assign ke global supaya
+      partial failure tidak corrupt data yang sudah ada.
+    """
     global price_history
     if not UPSTASH_REDIS_URL:
         logger.info("Redis not configured, starting fresh")
@@ -235,8 +235,7 @@ def load_history() -> None:
         if not isinstance(data, list) or len(data) == 0:
             logger.info("Redis history empty or invalid format — keeping existing in-memory history")
             return
-        # Parse ke variabel temp dulu, baru assign ke global
-        # supaya partial failure tidak corrupt price_history yang sudah ada
+        # Parse ke temp dulu, baru assign ke global
         parsed = []
         for p in data:
             parsed.append(PricePoint(
@@ -247,6 +246,7 @@ def load_history() -> None:
         price_history = parsed
         logger.info(f"Loaded {len(price_history)} points from Redis")
     except Exception as e:
+        # PENTING: tidak assign price_history = [] di sini
         logger.warning(f"Failed to load history from Redis: {e} — keeping existing in-memory history")
 
 
@@ -515,6 +515,36 @@ def _show_sltp_status(reply_chat: str) -> None:
 
 
 # =============================================================================
+# PnL Helper
+# =============================================================================
+def _compute_pnl_string() -> str:
+    """Hitung estimasi PnL berdasarkan pergerakan gap sejak entry."""
+    if sltp.entry_gap is None or scan_stats["last_gap"] is None:
+        return ""
+    if active_strategy is None:
+        return ""
+
+    current_gap = float(scan_stats["last_gap"])
+    entry_gap = sltp.entry_gap
+
+    # S1: profit = gap mengecil (entry_gap - current_gap)
+    # S2: profit = gap membesar ke negatif (current_gap - entry_gap, tapi gap negatif)
+    if active_strategy == Strategy.S1:
+        pnl = entry_gap - current_gap
+    else:
+        pnl = current_gap - entry_gap
+
+    sign = "+" if pnl >= 0 else ""
+    emoji = "📈" if pnl >= 0 else "📉"
+    return (
+        f"*Estimasi PnL (gap-based):*\n"
+        f"┌─────────────────────\n"
+        f"│ {emoji} Gap PnL: {sign}{pnl:.2f}%\n"
+        f"└─────────────────────\n\n"
+    )
+
+
+# =============================================================================
 # SL/TP Evaluation
 # =============================================================================
 def evaluate_sltp(
@@ -774,6 +804,11 @@ def handle_peak_command(args: list, reply_chat: str) -> None:
 
 
 def handle_lookback_command(args: list, reply_chat: str) -> None:
+    """
+    FIX: Tidak lagi wipe price_history atau Redis.
+    Hanya update setting dan prune data yang sudah di luar window baru.
+    Data yang masih dalam window baru tetap dipertahankan.
+    """
     global price_history
     if not args:
         send_reply(
@@ -793,9 +828,9 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
             return
         old_lookback = settings["lookback_hours"]
         settings["lookback_hours"] = new_lookback
-        # Prune history ke lookback baru — jangan wipe, data lama tetap dipakai
+        # Prune history ke window baru — data yang masih dalam window tetap aman
         prune_history(datetime.now(timezone.utc))
-        save_history()
+        save_history()  # Simpan ke Redis hasil setelah prune (tidak wipe)
         hours_kept = len(price_history) * settings["scan_interval"] / 3600
         send_reply(
             f"Ufufufu... Lookback sudah Akeno ubah dari *{old_lookback}h* jadi *{new_lookback}h*~\n\n"
@@ -803,6 +838,7 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
             f"_Data lama yang masih dalam window tetap Akeno jaga~ (◕‿◕)_",
             reply_chat
         )
+        logger.info(f"Lookback changed from {old_lookback}h to {new_lookback}h, history pruned to {len(price_history)} points")
     except ValueError:
         send_reply("Ara ara~ angkanya tidak valid, sayangku. (◕ω◕)", reply_chat)
 
@@ -1289,7 +1325,6 @@ def evaluate_and_transition(
             elif peak_gap - gap_float >= peak_reversal:
                 active_strategy = Strategy.S1
                 current_mode = Mode.TRACK
-                # Simpan entry snapshot + auto-set SL/TP
                 now = datetime.now(timezone.utc)
                 sltp.set_entry_snapshot(gap_float, btc_price, eth_price, now)
                 sltp.auto_set(gap_float, Strategy.S1, settings["tp_offset"], settings["sl_offset"])
@@ -1314,7 +1349,6 @@ def evaluate_and_transition(
             elif gap_float - peak_gap >= peak_reversal:
                 active_strategy = Strategy.S2
                 current_mode = Mode.TRACK
-                # Simpan entry snapshot + auto-set SL/TP
                 now = datetime.now(timezone.utc)
                 sltp.set_entry_snapshot(gap_float, btc_price, eth_price, now)
                 sltp.auto_set(gap_float, Strategy.S2, settings["tp_offset"], settings["sl_offset"])
