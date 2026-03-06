@@ -225,20 +225,29 @@ def load_history() -> None:
     try:
         result = _redis_request("GET", f"/get/{REDIS_KEY}")
         if not result or result.get("result") is None:
-            logger.info("No history in Redis, starting fresh")
+            logger.info("No history in Redis — keeping existing in-memory history")
             return
-        data = json.loads(result["result"])
-        price_history = [
-            PricePoint(
+        raw = result.get("result")
+        if not raw:
+            logger.info("Redis returned empty value — keeping existing in-memory history")
+            return
+        data = json.loads(raw)
+        if not isinstance(data, list) or len(data) == 0:
+            logger.info("Redis history empty or invalid format — keeping existing in-memory history")
+            return
+        # Parse ke variabel temp dulu, baru assign ke global
+        # supaya partial failure tidak corrupt price_history yang sudah ada
+        parsed = []
+        for p in data:
+            parsed.append(PricePoint(
                 timestamp=datetime.fromisoformat(p["timestamp"]),
                 btc=Decimal(p["btc"]),
                 eth=Decimal(p["eth"]),
-            )
-            for p in data
-        ]
+            ))
+        price_history = parsed
         logger.info(f"Loaded {len(price_history)} points from Redis")
     except Exception as e:
-        logger.warning(f"Failed to load history from Redis: {e} — keeping existing history")
+        logger.warning(f"Failed to load history from Redis: {e} — keeping existing in-memory history")
 
 
 # =============================================================================
@@ -784,13 +793,14 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
             return
         old_lookback = settings["lookback_hours"]
         settings["lookback_hours"] = new_lookback
-        price_history = []
-        save_history()  # Timpa Redis dengan list kosong
+        # Prune history ke lookback baru — jangan wipe, data lama tetap dipakai
+        prune_history(datetime.now(timezone.utc))
+        save_history()
+        hours_kept = len(price_history) * settings["scan_interval"] / 3600
         send_reply(
             f"Ufufufu... Lookback sudah Akeno ubah dari *{old_lookback}h* jadi *{new_lookback}h*~\n\n"
-            f"⚠️ Ara ara, history harus Akeno bersihkan dulu ya... "
-            f"Butuh *{new_lookback} jam* untuk kumpulkan data lagi. "
-            f"Tunggu Akeno sebentar~ (◕‿◕)",
+            f"📊 History dipangkas, tersisa *{hours_kept:.1f}h* data ({len(price_history)} points).\n"
+            f"_Data lama yang masih dalam window tetap Akeno jaga~ (◕‿◕)_",
             reply_chat
         )
     except ValueError:
