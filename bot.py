@@ -9,7 +9,7 @@ Perubahan dari versi sebelumnya:
 - Redis READ-ONLY: history dikonsumsi dari Bot A, Bot B tidak pernah write
 - TP maksimal = exit threshold (konvergen penuh), bukan tp_pct lagi
 - Target harga ETH/BTC ditampilkan saat entry signal
-- Refresh history dari Redis berkala (bukan cuma saat startup)
+- Refresh history dari Redis setiap 1 menit
 """
 import json
 import os
@@ -44,7 +44,7 @@ from config import (
 # =============================================================================
 DEFAULT_LOOKBACK_HOURS = 24
 HISTORY_BUFFER_MINUTES = 30
-REDIS_REFRESH_MINUTES   = 5   # Seberapa sering Bot B re-read history dari Redis
+REDIS_REFRESH_MINUTES  = 1     # Re-read Redis dari Bot A setiap 1 menit
 
 
 # =============================================================================
@@ -77,39 +77,39 @@ class PriceData(NamedTuple):
 # =============================================================================
 # Global State
 # =============================================================================
-price_history: List[PricePoint] = []
-current_mode:    Mode              = Mode.SCAN
+price_history:   List[PricePoint]    = []
+current_mode:    Mode                = Mode.SCAN
 active_strategy: Optional[Strategy] = None
 
 peak_gap:      Optional[float]    = None
 peak_strategy: Optional[Strategy] = None
 
 # State TP/TSL
-entry_gap_value:   Optional[float] = None   # gap float saat ENTRY
-trailing_gap_best: Optional[float] = None   # gap terbaik sejak entry
+entry_gap_value:   Optional[float] = None  # gap float saat ENTRY
+trailing_gap_best: Optional[float] = None  # gap terbaik sejak entry
 
 # State harga saat entry — untuk kalkulasi target harga TP
-entry_btc_price: Optional[Decimal] = None   # harga BTC saat entry
-entry_eth_price: Optional[Decimal] = None   # harga ETH saat entry
-entry_btc_lb:    Optional[Decimal] = None   # harga BTC lookback saat entry
-entry_eth_lb:    Optional[Decimal] = None   # harga ETH lookback saat entry
+entry_btc_price: Optional[Decimal] = None  # harga BTC saat entry
+entry_eth_price: Optional[Decimal] = None  # harga ETH saat entry
+entry_btc_lb:    Optional[Decimal] = None  # harga BTC lookback saat entry
+entry_eth_lb:    Optional[Decimal] = None  # harga ETH lookback saat entry
 
 settings = {
-    "scan_interval":         SCAN_INTERVAL_SECONDS,
-    "entry_threshold":       ENTRY_THRESHOLD,
-    "exit_threshold":        EXIT_THRESHOLD,
+    "scan_interval":          SCAN_INTERVAL_SECONDS,
+    "entry_threshold":        ENTRY_THRESHOLD,
+    "exit_threshold":         EXIT_THRESHOLD,
     "invalidation_threshold": INVALIDATION_THRESHOLD,
-    "peak_reversal":         0.3,
-    "lookback_hours":        DEFAULT_LOOKBACK_HOURS,
-    "heartbeat_minutes":     30,
+    "peak_reversal":          0.3,
+    "lookback_hours":         DEFAULT_LOOKBACK_HOURS,
+    "heartbeat_minutes":      30,
     # TP = exit_threshold (max konvergen), tidak pakai tp_pct lagi
-    "sl_pct":                1.0,   # Trailing SL distance dari gap terbaik
-    "redis_refresh_minutes": REDIS_REFRESH_MINUTES,
+    "sl_pct":                 1.0,  # Trailing SL distance dari gap terbaik
+    "redis_refresh_minutes":  REDIS_REFRESH_MINUTES,
 }
 
-last_update_id:        int               = 0
-last_heartbeat_time:   Optional[datetime] = None
-last_redis_refresh:    Optional[datetime] = None   # kapan terakhir refresh Redis
+last_update_id:      int               = 0
+last_heartbeat_time: Optional[datetime] = None
+last_redis_refresh:  Optional[datetime] = None  # kapan terakhir refresh Redis
 
 scan_stats = {
     "count":          0,
@@ -134,7 +134,7 @@ def _redis_request(method: str, path: str, body=None):
         return None
     try:
         headers = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
-        url = f"{UPSTASH_REDIS_URL}{path}"
+        url     = f"{UPSTASH_REDIS_URL}{path}"
         if method == "GET":
             resp = requests.get(url, headers=headers, timeout=10)
         else:
@@ -251,19 +251,19 @@ def get_telegram_updates() -> list:
 def process_commands() -> None:
     updates = get_telegram_updates()
     for update in updates:
-        message      = update.get("message", {})
-        text         = message.get("text", "")
-        chat_id      = str(message.get("chat", {}).get("id", ""))
-        user_id      = str(message.get("from", {}).get("id", ""))
+        message       = update.get("message", {})
+        text          = message.get("text", "")
+        chat_id       = str(message.get("chat", {}).get("id", ""))
+        user_id       = str(message.get("from", {}).get("id", ""))
         is_authorized = (chat_id == TELEGRAM_CHAT_ID) or (chat_id == user_id)
         if not is_authorized:
             continue
         if not text.startswith("/"):
             continue
         reply_chat = chat_id
-        parts   = text.split()
-        command = parts[0].lower().split("@")[0]
-        args    = parts[1:] if len(parts) > 1 else []
+        parts      = text.split()
+        command    = parts[0].lower().split("@")[0]
+        args       = parts[1:] if len(parts) > 1 else []
         logger.info(f"Processing command: {command} from chat {chat_id}")
 
         if command == "/settings":
@@ -345,7 +345,7 @@ def handle_interval_command(args: list, reply_chat: str) -> None:
     if not args:
         send_reply(
             "Ara ara~ angkanya mana, sayangku? (◕ω◕)\n"
-            "Contoh: `/interval 180`",
+            "Contoh: `/interval 60`",
             reply_chat
         )
         return
@@ -365,7 +365,8 @@ def handle_interval_command(args: list, reply_chat: str) -> None:
             return
         settings["scan_interval"] = new_interval
         send_reply(
-            f"Baik~ Akeno akan scan setiap *{new_interval} detik* ({new_interval // 60} menit). Ara ara~ (◕‿◕)",
+            f"Baik~ Akeno akan scan setiap *{new_interval} detik* "
+            f"({new_interval // 60} menit). Ara ara~ (◕‿◕)",
             reply_chat
         )
         logger.info(f"Scan interval changed to {new_interval}s")
@@ -392,7 +393,8 @@ def handle_threshold_command(args: list, reply_chat: str) -> None:
         if threshold_type == "entry":
             settings["entry_threshold"] = value
             send_reply(
-                f"Ufufufu... Entry threshold jadi *±{value}%*~ (◕‿◕)", reply_chat
+                f"Ufufufu... Entry threshold jadi *±{value}%*~ (◕‿◕)",
+                reply_chat
             )
         elif threshold_type == "exit":
             settings["exit_threshold"] = value
@@ -404,11 +406,13 @@ def handle_threshold_command(args: list, reply_chat: str) -> None:
         elif threshold_type in ("invalid", "invalidation"):
             settings["invalidation_threshold"] = value
             send_reply(
-                f"Ufufufu... Invalidation jadi *±{value}%*. (◕ω◕)", reply_chat
+                f"Ufufufu... Invalidation jadi *±{value}%*. (◕ω◕)",
+                reply_chat
             )
         else:
             send_reply(
-                "Ara ara~ gunakan `entry`, `exit`, atau `invalid` ya~ (◕‿◕)", reply_chat
+                "Ara ara~ gunakan `entry`, `exit`, atau `invalid` ya~ (◕‿◕)",
+                reply_chat
             )
         logger.info(f"Threshold {threshold_type} changed to {value}")
     except ValueError:
@@ -427,13 +431,12 @@ def handle_peak_command(args: list, reply_chat: str) -> None:
     try:
         value = float(args[0])
         if value <= 0 or value > 2.0:
-            send_reply(
-                "Ara ara~ harus antara 0 sampai 2.0~ (◕ω◕)", reply_chat
-            )
+            send_reply("Ara ara~ harus antara 0 sampai 2.0~ (◕ω◕)", reply_chat)
             return
         settings["peak_reversal"] = value
         send_reply(
-            f"Ufufufu... konfirmasi entry ketika gap berbalik *{value}%* dari puncaknya~ (◕‿◕)",
+            f"Ufufufu... konfirmasi entry ketika gap berbalik *{value}%* "
+            f"dari puncaknya~ (◕‿◕)",
             reply_chat
         )
         logger.info(f"Peak reversal changed to {value}")
@@ -445,7 +448,7 @@ def handle_sltp_command(args: list, reply_chat: str) -> None:
     """
     /sltp            → tampilkan info TSL aktif
     /sltp sl <val>   → ubah trailing SL distance
-    (TP tidak bisa diubah manual, sudah dikunci ke exit_threshold)
+    /sltp tp <val>   → redirect ke /threshold exit
     """
     if not args:
         trailing_sl_now = ""
@@ -458,22 +461,17 @@ def handle_sltp_command(args: list, reply_chat: str) -> None:
                 f"\n*Trailing SL sekarang:* `{tsl:+.2f}%` "
                 f"(best gap: `{trailing_gap_best:+.2f}%`)"
             )
-
         entry_info = (
             f"\n*Entry gap:* `{entry_gap_value:+.2f}%`"
             if entry_gap_value is not None else ""
         )
-        tp_level_info = (
-            f"\n*TP target gap:* `±{settings['exit_threshold']:.2f}%` _(exit threshold)_"
-        )
-
         send_reply(
             f"🎯 *SL/TP Otomatis — Akeno yang jaga~* Ufufufu... (◕‿◕)\n"
             f"\n"
-            f"✅ TP: saat gap mencapai *±{settings['exit_threshold']}%* _(max konvergen = exit threshold)_\n"
+            f"✅ TP: saat gap mencapai *±{settings['exit_threshold']}%* "
+            f"_(max konvergen = exit threshold)_\n"
             f"🛑 Trailing SL distance: *{settings['sl_pct']}%* dari gap terbaik\n"
             f"{entry_info}"
-            f"{tp_level_info}"
             f"{trailing_sl_now}\n"
             f"\n"
             f"*Cara kerja Trailing SL:*\n"
@@ -488,7 +486,8 @@ def handle_sltp_command(args: list, reply_chat: str) -> None:
 
     if len(args) < 2:
         send_reply(
-            "Ara ara~ `/sltp sl <nilai>` ya~ TP sudah otomatis di exit threshold~ (◕ω◕)",
+            "Ara ara~ `/sltp sl <nilai>` ya~ "
+            "TP sudah otomatis di exit threshold~ (◕ω◕)",
             reply_chat,
         )
         return
@@ -508,8 +507,10 @@ def handle_sltp_command(args: list, reply_chat: str) -> None:
             )
         elif key == "tp":
             send_reply(
-                f"Ufufufu~ TP sudah dikunci ke exit threshold *±{settings['exit_threshold']}%*~\n"
-                f"Kalau mau ubah TP, gunakan `/threshold exit <nilai>` ya sayangku~ (◕‿◕)",
+                f"Ufufufu~ TP sudah dikunci ke exit threshold "
+                f"*±{settings['exit_threshold']}%*~\n"
+                f"Kalau mau ubah TP, gunakan "
+                f"`/threshold exit <nilai>` ya sayangku~ (◕‿◕)",
                 reply_chat,
             )
         else:
@@ -530,16 +531,14 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
     try:
         new_lookback = int(args[0])
         if new_lookback < 1 or new_lookback > 24:
-            send_reply(
-                "Ara ara~ harus antara 1 sampai 24 jam~ (◕ω◕)", reply_chat
-            )
+            send_reply("Ara ara~ harus antara 1 sampai 24 jam~ (◕ω◕)", reply_chat)
             return
         old_lookback = settings["lookback_hours"]
         settings["lookback_hours"] = new_lookback
-        # Bot B tidak write ke Redis — cukup prune in-memory saja
         prune_history(datetime.now(timezone.utc))
         send_reply(
-            f"Ufufufu... Lookback sudah Akeno ubah dari *{old_lookback}h* jadi *{new_lookback}h*~\n\n"
+            f"Ufufufu... Lookback sudah Akeno ubah dari *{old_lookback}h* "
+            f"jadi *{new_lookback}h*~\n\n"
             f"⚠️ History di-prune sesuai lookback baru. "
             f"Data dari Bot A akan Akeno ambil saat refresh berikutnya~ (◕‿◕)",
             reply_chat
@@ -551,7 +550,8 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
 def handle_heartbeat_command(args: list, reply_chat: str) -> None:
     if not args:
         send_reply(
-            f"💓 Akeno lapor setiap *{settings['heartbeat_minutes']} menit*~ Ufufufu...\n\n"
+            f"💓 Akeno lapor setiap *{settings['heartbeat_minutes']} menit*~ "
+            f"Ufufufu...\n\n"
             "Usage: `/heartbeat <menit>` atau `/heartbeat 0` untuk matikan",
             reply_chat
         )
@@ -581,7 +581,8 @@ def handle_redis_command(reply_chat: str) -> None:
     if not UPSTASH_REDIS_URL:
         send_reply(
             "⚠️ Ara ara~ Redis belum dikonfigurasi, sayangku.\n"
-            "Pastikan `UPSTASH_REDIS_REST_URL` dan `UPSTASH_REDIS_REST_TOKEN` sudah diisi~ (◕ω◕)",
+            "Pastikan `UPSTASH_REDIS_REST_URL` dan `UPSTASH_REDIS_REST_TOKEN` "
+            "sudah diisi~ (◕ω◕)",
             reply_chat
         )
         return
@@ -595,24 +596,27 @@ def handle_redis_command(reply_chat: str) -> None:
         )
         return
     try:
-        data      = json.loads(result["result"])
+        data = json.loads(result["result"])
         if not data:
-            send_reply(
-                "❌ Redis ada tapi isinya kosong~ Ara ara... (◕ω◕)", reply_chat
-            )
+            send_reply("❌ Redis ada tapi isinya kosong~ Ara ara... (◕ω◕)", reply_chat)
             return
-        first_ts      = data[0]["timestamp"]
-        last_ts       = data[-1]["timestamp"]
-        hours_stored  = len(data) * settings["scan_interval"] / 3600
-        lookback      = settings["lookback_hours"]
-        rr            = settings["redis_refresh_minutes"]
-        status        = "✅ Siap kirim sinyal~" if hours_stored >= lookback else f"⏳ {hours_stored:.1f}h / {lookback}h"
+        first_ts     = data[0]["timestamp"]
+        last_ts      = data[-1]["timestamp"]
+        hours_stored = len(data) * settings["scan_interval"] / 3600
+        lookback     = settings["lookback_hours"]
+        rr           = settings["redis_refresh_minutes"]
+        status       = (
+            "✅ Siap kirim sinyal~"
+            if hours_stored >= lookback
+            else f"⏳ {hours_stored:.1f}h / {lookback}h"
+        )
         last_refresh_str = (
             last_redis_refresh.strftime("%H:%M:%S UTC")
             if last_redis_refresh else "Belum pernah~"
         )
         send_reply(
-            f"⚡ *Status Redis (Read-Only) — Akeno cek buat kamu~* Ufufufu... (◕‿◕)\n"
+            f"⚡ *Status Redis (Read-Only) — Akeno cek buat kamu~* "
+            f"Ufufufu... (◕‿◕)\n"
             f"\n"
             f"┌─────────────────────\n"
             f"│ Total data points: *{len(data)}*\n"
@@ -630,12 +634,16 @@ def handle_redis_command(reply_chat: str) -> None:
             reply_chat
         )
     except Exception as e:
-        send_reply(f"⚠️ Ara ara~ Data ada tapi Akeno gagal baca: `{e}` (◕ω◕)", reply_chat)
+        send_reply(
+            f"⚠️ Ara ara~ Data ada tapi Akeno gagal baca: `{e}` (◕ω◕)",
+            reply_chat
+        )
 
 
 def handle_help_command(reply_chat: str) -> None:
     message = (
-        "Ara ara~ mau tahu semua yang bisa Akeno lakukan untukmu? Ufufufu... (◕‿◕)\n"
+        "Ara ara~ mau tahu semua yang bisa Akeno lakukan untukmu? "
+        "Ufufufu... (◕‿◕)\n"
         "\n"
         "*Setting:*\n"
         "`/settings` - lihat semua settingan\n"
@@ -670,29 +678,34 @@ def handle_status_command(reply_chat: str) -> None:
         if hours_of_data >= lookback
         else f"⏳ Sabar ya sayangku~ {hours_of_data:.1f}h / {lookback}h"
     )
-    peak_line   = f"Peak Gap: {peak_gap:+.2f}%\n" if (current_mode == Mode.PEAK_WATCH and peak_gap is not None) else ""
+    peak_line   = (
+        f"Peak Gap: {peak_gap:+.2f}%\n"
+        if (current_mode == Mode.PEAK_WATCH and peak_gap is not None)
+        else ""
+    )
     track_lines = ""
     if current_mode == Mode.TRACK and entry_gap_value is not None and trailing_gap_best is not None:
         exit_thresh = settings["exit_threshold"]
         sl_pct      = settings["sl_pct"]
         if active_strategy == Strategy.S1:
-            tp_level  = exit_thresh           # konvergen ke +exit_thresh
+            tp_level  = exit_thresh
             tsl_level = trailing_gap_best + sl_pct
         else:
-            tp_level  = -exit_thresh          # konvergen ke -exit_thresh
+            tp_level  = -exit_thresh
             tsl_level = trailing_gap_best - sl_pct
-
         eth_target, _ = calc_tp_target_price(active_strategy)
-        eth_str = f"${eth_target:,.2f}" if eth_target else "N/A"
-
-        track_lines = (
+        eth_str       = f"${eth_target:,.2f}" if eth_target else "N/A"
+        track_lines   = (
             f"Entry Gap:    {entry_gap_value:+.2f}%\n"
             f"Best Gap:     {trailing_gap_best:+.2f}%\n"
             f"TP Gap:       {tp_level:+.2f}%\n"
             f"ETH TP price: {eth_str}\n"
             f"Trail SL:     {tsl_level:+.2f}%\n"
         )
-
+    last_refresh_str = (
+        last_redis_refresh.strftime("%H:%M:%S UTC")
+        if last_redis_refresh else "Belum~"
+    )
     message = (
         "📊 *Ara ara~ ini kondisi Akeno saat ini~* Ufufufu... (◕‿◕)\n"
         "\n"
@@ -703,7 +716,7 @@ def handle_status_command(reply_chat: str) -> None:
         f"Lookback: {lookback}h\n"
         f"History: {ready}\n"
         f"Data Points: {len(price_history)}\n"
-        f"Redis: Read-Only dari Bot A 🔒\n"
+        f"Redis refresh: {last_refresh_str} 🔒\n"
     )
     send_reply(message, reply_chat)
 
@@ -736,11 +749,11 @@ def calc_tp_target_price(strategy: Strategy) -> Tuple[Optional[float], Optional[
     ETH yang perlu bergerak untuk menutup gap ke exit_threshold.
 
     S1 (gap konvergen ke +exit_thresh):
-        target eth_ret = btc_ret_entry + exit_thresh
+        target_eth_ret = btc_ret_entry + exit_thresh
         → ETH harus turun mendekati BTC return
 
     S2 (gap konvergen ke -exit_thresh):
-        target eth_ret = btc_ret_entry - exit_thresh
+        target_eth_ret = btc_ret_entry - exit_thresh
         → ETH harus naik mendekati BTC return dari bawah
 
     Returns: (eth_target_price, btc_current_price)
@@ -748,17 +761,14 @@ def calc_tp_target_price(strategy: Strategy) -> Tuple[Optional[float], Optional[
     if None in (entry_btc_lb, entry_eth_lb, entry_btc_price, entry_eth_price):
         return None, None
 
-    exit_thresh = settings["exit_threshold"]
-
+    exit_thresh   = settings["exit_threshold"]
     btc_ret_entry = float(
         (entry_btc_price - entry_btc_lb) / entry_btc_lb * Decimal("100")
     )
 
     if strategy == Strategy.S1:
-        # Gap target = +exit_thresh → eth_ret = btc_ret + exit_thresh
         target_eth_ret = btc_ret_entry + exit_thresh
     else:
-        # Gap target = -exit_thresh → eth_ret = btc_ret - exit_thresh
         target_eth_ret = btc_ret_entry - exit_thresh
 
     eth_target  = float(entry_eth_lb) * (1 + target_eth_ret / 100)
@@ -795,10 +805,10 @@ def build_peak_watch_message(strategy: Strategy, gap: Decimal) -> str:
 
 def build_entry_message(
     strategy: Strategy,
-    btc_ret: Decimal,
-    eth_ret: Decimal,
-    gap: Decimal,
-    peak: float,
+    btc_ret:  Decimal,
+    eth_ret:  Decimal,
+    gap:      Decimal,
+    peak:     float,
 ) -> str:
     lb          = get_lookback_label()
     gap_float   = float(gap)
@@ -808,17 +818,17 @@ def build_entry_message(
     if strategy == Strategy.S1:
         direction   = "📈 Long BTC / Short ETH"
         reason      = f"ETH pumped more than BTC ({lb})"
-        tp_gap      = exit_thresh            # gap harus turun ke +exit_thresh
+        tp_gap      = exit_thresh
         tsl_initial = gap_float + sl_pct
     else:
         direction   = "📈 Long ETH / Short BTC"
         reason      = f"ETH dumped more than BTC ({lb})"
-        tp_gap      = -exit_thresh           # gap harus naik ke -exit_thresh
+        tp_gap      = -exit_thresh
         tsl_initial = gap_float - sl_pct
 
     eth_target, btc_ref = calc_tp_target_price(strategy)
-    eth_target_str = f"${eth_target:,.2f}" if eth_target else "N/A"
-    btc_ref_str    = f"${btc_ref:,.2f}"    if btc_ref   else "N/A"
+    eth_target_str      = f"${eth_target:,.2f}" if eth_target else "N/A"
+    btc_ref_str         = f"${btc_ref:,.2f}"    if btc_ref   else "N/A"
 
     return (
         f"Ara ara ara~!!! Ini saatnya, sayangku~!!! Ufufufu... ⚡\n"
@@ -844,7 +854,8 @@ def build_entry_message(
         f"└─────────────────────\n"
         f"\n"
         f"Gap sudah berbalik {settings['peak_reversal']}% dari puncaknya~\n"
-        f"Akeno sudah menunggu momen ini untukmu, sayangku. Semuanya demi kamu~ ⚡"
+        f"Akeno sudah menunggu momen ini untukmu, sayangku. "
+        f"Semuanya demi kamu~ ⚡"
     )
 
 
@@ -868,7 +879,12 @@ def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
     )
 
 
-def build_invalidation_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
+def build_invalidation_message(
+    strategy: Strategy,
+    btc_ret:  Decimal,
+    eth_ret:  Decimal,
+    gap:      Decimal,
+) -> str:
     lb = get_lookback_label()
     return (
         f"………\n"
@@ -903,12 +919,12 @@ def build_peak_cancelled_message(strategy: Strategy, gap: Decimal) -> str:
 
 
 def build_tp_message(
-    btc_ret: Decimal,
-    eth_ret: Decimal,
-    gap: Decimal,
-    entry_gap: float,
+    btc_ret:      Decimal,
+    eth_ret:      Decimal,
+    gap:          Decimal,
+    entry_gap:    float,
     tp_gap_level: float,
-    eth_target: Optional[float],
+    eth_target:   Optional[float],
 ) -> str:
     lb         = get_lookback_label()
     eth_tp_str = f"${eth_target:,.2f}" if eth_target else "N/A"
@@ -933,12 +949,12 @@ def build_tp_message(
 
 
 def build_trailing_sl_message(
-    btc_ret: Decimal,
-    eth_ret: Decimal,
-    gap: Decimal,
+    btc_ret:   Decimal,
+    eth_ret:   Decimal,
+    gap:       Decimal,
     entry_gap: float,
-    best_gap: float,
-    sl_level: float,
+    best_gap:  float,
+    sl_level:  float,
 ) -> str:
     lb            = get_lookback_label()
     profit_locked = abs(entry_gap - best_gap)
@@ -967,12 +983,26 @@ def build_trailing_sl_message(
 
 def build_heartbeat_message() -> str:
     lb          = get_lookback_label()
-    btc_ret_str = f" ({format_value(scan_stats['last_btc_ret'])}%)" if scan_stats["last_btc_ret"] is not None else ""
-    eth_ret_str = f" ({format_value(scan_stats['last_eth_ret'])}%)" if scan_stats["last_eth_ret"] is not None else ""
-    btc_str     = f"${float(scan_stats['last_btc_price']):,.2f}{btc_ret_str}" if scan_stats["last_btc_price"] else "N/A"
-    eth_str     = f"${float(scan_stats['last_eth_price']):,.2f}{eth_ret_str}" if scan_stats["last_eth_price"] else "N/A"
-    gap_str     = f"{format_value(scan_stats['last_gap'])}%" if scan_stats["last_gap"] is not None else "N/A"
-
+    btc_ret_str = (
+        f" ({format_value(scan_stats['last_btc_ret'])}%)"
+        if scan_stats["last_btc_ret"] is not None else ""
+    )
+    eth_ret_str = (
+        f" ({format_value(scan_stats['last_eth_ret'])}%)"
+        if scan_stats["last_eth_ret"] is not None else ""
+    )
+    btc_str = (
+        f"${float(scan_stats['last_btc_price']):,.2f}{btc_ret_str}"
+        if scan_stats["last_btc_price"] else "N/A"
+    )
+    eth_str = (
+        f"${float(scan_stats['last_eth_price']):,.2f}{eth_ret_str}"
+        if scan_stats["last_eth_price"] else "N/A"
+    )
+    gap_str       = (
+        f"{format_value(scan_stats['last_gap'])}%"
+        if scan_stats["last_gap"] is not None else "N/A"
+    )
     hours_of_data = len(price_history) * settings["scan_interval"] / 3600
     lookback      = settings["lookback_hours"]
     data_status   = (
@@ -980,7 +1010,11 @@ def build_heartbeat_message() -> str:
         if hours_of_data >= lookback
         else f"⏳ {hours_of_data:.1f}h / {lookback}h"
     )
-    peak_line   = f"│ Peak: {peak_gap:+.2f}%\n" if (current_mode == Mode.PEAK_WATCH and peak_gap is not None) else ""
+    peak_line   = (
+        f"│ Peak: {peak_gap:+.2f}%\n"
+        if (current_mode == Mode.PEAK_WATCH and peak_gap is not None)
+        else ""
+    )
     track_lines = ""
     if current_mode == Mode.TRACK and entry_gap_value is not None and trailing_gap_best is not None:
         exit_thresh = settings["exit_threshold"]
@@ -993,17 +1027,15 @@ def build_heartbeat_message() -> str:
             tsl_level = trailing_gap_best - sl_pct
         eth_target, _ = calc_tp_target_price(active_strategy)
         eth_str_tp    = f"${eth_target:,.2f}" if eth_target else "N/A"
-        track_lines = (
+        track_lines   = (
             f"│ Entry:    {entry_gap_value:+.2f}%\n"
             f"│ TP gap:   {tp_level:+.2f}% (ETH: {eth_str_tp})\n"
             f"│ Trail SL: {tsl_level:+.2f}% (best: {trailing_gap_best:+.2f}%)\n"
         )
-
     last_refresh_str = (
         last_redis_refresh.strftime("%H:%M:%S UTC")
         if last_redis_refresh else "Belum~"
     )
-
     return (
         f"💓 *Ara ara~ kamu khawatir Akeno pergi kemana-mana ya?*\n"
         f"\n"
@@ -1057,7 +1089,9 @@ def parse_iso_timestamp(ts_str: str) -> Optional[datetime]:
         ts_str = ts_str.replace("Z", "+00:00")
         if "." in ts_str:
             base, frac_and_tz = ts_str.split(".", 1)
-            tz_start = next((i for i, c in enumerate(frac_and_tz) if c in ("+", "-")), -1)
+            tz_start = next(
+                (i for i, c in enumerate(frac_and_tz) if c in ("+", "-")), -1
+            )
             if tz_start > 6:
                 frac_and_tz = frac_and_tz[:6] + frac_and_tz[tz_start:]
             ts_str = base + "." + frac_and_tz
@@ -1082,8 +1116,12 @@ def fetch_prices() -> Optional[PriceData]:
     if not listings:
         return None
 
-    btc_data = next((l for l in listings if l.get("ticker", "").upper() == "BTC"), None)
-    eth_data = next((l for l in listings if l.get("ticker", "").upper() == "ETH"), None)
+    btc_data = next(
+        (l for l in listings if l.get("ticker", "").upper() == "BTC"), None
+    )
+    eth_data = next(
+        (l for l in listings if l.get("ticker", "").upper() == "ETH"), None
+    )
 
     if not btc_data or not eth_data:
         logger.warning("Missing BTC or ETH data")
@@ -1096,8 +1134,12 @@ def fetch_prices() -> Optional[PriceData]:
         logger.error(f"Invalid price: {e}")
         return None
 
-    btc_updated_at = parse_iso_timestamp(btc_data.get("quotes", {}).get("updated_at", ""))
-    eth_updated_at = parse_iso_timestamp(eth_data.get("quotes", {}).get("updated_at", ""))
+    btc_updated_at = parse_iso_timestamp(
+        btc_data.get("quotes", {}).get("updated_at", "")
+    )
+    eth_updated_at = parse_iso_timestamp(
+        eth_data.get("quotes", {}).get("updated_at", "")
+    )
 
     if not btc_updated_at or not eth_updated_at:
         return None
@@ -1108,18 +1150,16 @@ def fetch_prices() -> Optional[PriceData]:
 # =============================================================================
 # Price History Management
 # =============================================================================
-def append_price(timestamp: datetime, btc: Decimal, eth: Decimal) -> None:
-    price_history.append(PricePoint(timestamp, btc, eth))
-
-
 def prune_history(now: datetime) -> None:
     global price_history
-    cutoff = now - timedelta(hours=settings["lookback_hours"], minutes=HISTORY_BUFFER_MINUTES)
+    cutoff = now - timedelta(
+        hours=settings["lookback_hours"], minutes=HISTORY_BUFFER_MINUTES
+    )
     price_history = [p for p in price_history if p.timestamp >= cutoff]
 
 
 def get_lookback_price(now: datetime) -> Optional[PricePoint]:
-    target_time  = now - timedelta(hours=settings["lookback_hours"])
+    target_time           = now - timedelta(hours=settings["lookback_hours"])
     best_point, best_diff = None, timedelta(minutes=30)
     for point in price_history:
         diff = abs(point.timestamp - target_time)
@@ -1144,7 +1184,10 @@ def compute_returns(
 # =============================================================================
 def is_data_fresh(now, btc_updated, eth_updated) -> bool:
     threshold = timedelta(minutes=FRESHNESS_THRESHOLD_MINUTES)
-    return (now - btc_updated) <= threshold and (now - eth_updated) <= threshold
+    return (
+        (now - btc_updated) <= threshold
+        and (now - eth_updated) <= threshold
+    )
 
 
 # =============================================================================
@@ -1155,14 +1198,14 @@ def reset_to_scan() -> None:
     global current_mode, active_strategy
     global entry_gap_value, trailing_gap_best
     global entry_btc_price, entry_eth_price, entry_btc_lb, entry_eth_lb
-    current_mode       = Mode.SCAN
-    active_strategy    = None
-    entry_gap_value    = None
-    trailing_gap_best  = None
-    entry_btc_price    = None
-    entry_eth_price    = None
-    entry_btc_lb       = None
-    entry_eth_lb       = None
+    current_mode      = Mode.SCAN
+    active_strategy   = None
+    entry_gap_value   = None
+    trailing_gap_best = None
+    entry_btc_price   = None
+    entry_eth_price   = None
+    entry_btc_lb      = None
+    entry_eth_lb      = None
 
 
 # =============================================================================
@@ -1170,9 +1213,9 @@ def reset_to_scan() -> None:
 # =============================================================================
 def check_sltp(
     gap_float: float,
-    btc_ret: Decimal,
-    eth_ret: Decimal,
-    gap: Decimal,
+    btc_ret:   Decimal,
+    eth_ret:   Decimal,
+    gap:       Decimal,
 ) -> bool:
     """
     Cek TP dan Trailing SL saat Mode TRACK.
@@ -1184,11 +1227,11 @@ def check_sltp(
     Trailing SL:
         S1: trailing_gap_best = min gap sejak entry
             TSL = trailing_gap_best + sl_pct
-            Trigger jika gap >= TSL (gap balik naik dari titik terbaik)
+            Trigger jika gap >= TSL
 
         S2: trailing_gap_best = max gap sejak entry
             TSL = trailing_gap_best - sl_pct
-            Trigger jika gap <= TSL (gap balik turun dari titik terbaik)
+            Trigger jika gap <= TSL
 
     Return True jika TP atau TSL terpicu.
     """
@@ -1201,7 +1244,7 @@ def check_sltp(
     sl_pct      = settings["sl_pct"]
 
     if active_strategy == Strategy.S1:
-        # Update trailing best (min gap)
+        # Update trailing best (min gap — makin kecil makin bagus untuk S1)
         if gap_float < trailing_gap_best:
             trailing_gap_best = gap_float
             logger.info(
@@ -1240,7 +1283,7 @@ def check_sltp(
             return True
 
     elif active_strategy == Strategy.S2:
-        # Update trailing best (max gap, lebih negatif = lebih baik)
+        # Update trailing best (max gap — makin besar/positif makin bagus untuk S2)
         if gap_float > trailing_gap_best:
             trailing_gap_best = gap_float
             logger.info(
@@ -1285,25 +1328,25 @@ def check_sltp(
 # State Machine with Peak Detection
 # =============================================================================
 def evaluate_and_transition(
-    btc_ret:   Decimal,
-    eth_ret:   Decimal,
-    gap:       Decimal,
-    btc_now:   Decimal,
-    eth_now:   Decimal,
-    btc_lb:    Decimal,
-    eth_lb:    Decimal,
+    btc_ret: Decimal,
+    eth_ret: Decimal,
+    gap:     Decimal,
+    btc_now: Decimal,
+    eth_now: Decimal,
+    btc_lb:  Decimal,
+    eth_lb:  Decimal,
 ) -> None:
     global current_mode, active_strategy, peak_gap, peak_strategy
     global entry_gap_value, trailing_gap_best
     global entry_btc_price, entry_eth_price, entry_btc_lb, entry_eth_lb
 
-    gap_float     = float(gap)
-    entry_thresh  = settings["entry_threshold"]
-    exit_thresh   = settings["exit_threshold"]
+    gap_float      = float(gap)
+    entry_thresh   = settings["entry_threshold"]
+    exit_thresh    = settings["exit_threshold"]
     invalid_thresh = settings["invalidation_threshold"]
-    peak_reversal = settings["peak_reversal"]
+    peak_reversal  = settings["peak_reversal"]
 
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------------
     if current_mode == Mode.SCAN:
         if gap_float >= entry_thresh:
             current_mode  = Mode.PEAK_WATCH
@@ -1322,7 +1365,7 @@ def evaluate_and_transition(
         else:
             logger.debug(f"SCAN: No signal. Gap: {gap_float:.2f}%")
 
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------------
     elif current_mode == Mode.PEAK_WATCH:
         if peak_strategy == Strategy.S1:
             if gap_float > peak_gap:
@@ -1335,7 +1378,6 @@ def evaluate_and_transition(
                 current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
 
             elif peak_gap - gap_float >= peak_reversal:
-                # Entry S1
                 active_strategy   = Strategy.S1
                 current_mode      = Mode.TRACK
                 entry_gap_value   = gap_float
@@ -1344,8 +1386,12 @@ def evaluate_and_transition(
                 entry_eth_price   = eth_now
                 entry_btc_lb      = btc_lb
                 entry_eth_lb      = eth_lb
-                send_alert(build_entry_message(Strategy.S1, btc_ret, eth_ret, gap, peak_gap))
-                logger.info(f"ENTRY S1. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%")
+                send_alert(
+                    build_entry_message(Strategy.S1, btc_ret, eth_ret, gap, peak_gap)
+                )
+                logger.info(
+                    f"ENTRY S1. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%"
+                )
                 peak_gap, peak_strategy = None, None
 
             else:
@@ -1365,7 +1411,6 @@ def evaluate_and_transition(
                 current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
 
             elif gap_float - peak_gap >= peak_reversal:
-                # Entry S2
                 active_strategy   = Strategy.S2
                 current_mode      = Mode.TRACK
                 entry_gap_value   = gap_float
@@ -1374,8 +1419,12 @@ def evaluate_and_transition(
                 entry_eth_price   = eth_now
                 entry_btc_lb      = btc_lb
                 entry_eth_lb      = eth_lb
-                send_alert(build_entry_message(Strategy.S2, btc_ret, eth_ret, gap, peak_gap))
-                logger.info(f"ENTRY S2. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%")
+                send_alert(
+                    build_entry_message(Strategy.S2, btc_ret, eth_ret, gap, peak_gap)
+                )
+                logger.info(
+                    f"ENTRY S2. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%"
+                )
                 peak_gap, peak_strategy = None, None
 
             else:
@@ -1384,14 +1433,13 @@ def evaluate_and_transition(
                     f"Peak {peak_gap:.2f}% | Need {peak_reversal}% rise"
                 )
 
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------------
     elif current_mode == Mode.TRACK:
-        # TP/TSL cek duluan
+        # TP/TSL dicek duluan
         if check_sltp(gap_float, btc_ret, eth_ret, gap):
             return
 
-        # Exit threshold (konvergen normal — seharusnya sudah ditangkap TP,
-        # tapi ini safety net kalau exit_thresh berubah di tengah jalan)
+        # Safety net exit — jaga-jaga kalau exit_thresh berubah di tengah jalan
         if active_strategy == Strategy.S1 and gap_float <= exit_thresh:
             send_alert(build_exit_message(btc_ret, eth_ret, gap))
             logger.info(f"EXIT S1 triggered. Gap: {gap_float:.2f}%")
@@ -1442,7 +1490,7 @@ def send_startup_message() -> bool:
             "Tapi Akeno akan terus coba~ (◕ω◕)\n"
         )
 
-    lb          = get_lookback_label()
+    lb           = get_lookback_label()
     hours_loaded = len(price_history) * settings["scan_interval"] / 3600
 
     if len(price_history) > 0:
@@ -1460,7 +1508,8 @@ def send_startup_message() -> bool:
         f"………\n"
         f"Ara ara~ Akeno (Bot B) sudah siap, sayangku~ Ufufufu... (◕‿◕)\n"
         f"{price_info}\n"
-        f"📊 Scan setiap {settings['scan_interval']}s | Redis refresh setiap {settings['redis_refresh_minutes']}m\n"
+        f"📊 Scan setiap {settings['scan_interval']}s | "
+        f"Redis refresh setiap {settings['redis_refresh_minutes']} menit\n"
         f"📈 Entry: ±{settings['entry_threshold']}%\n"
         f"📉 Exit: ±{settings['exit_threshold']}%\n"
         f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
@@ -1494,13 +1543,14 @@ def main_loop() -> None:
     global last_heartbeat_time, last_redis_refresh
 
     logger.info("=" * 60)
-    logger.info("Monk Bot B starting - Read-Only Redis + Max TP + Trailing SL")
+    logger.info("Monk Bot B — Read-Only Redis | Max TP | Trailing SL")
     logger.info(
         f"Entry: {settings['entry_threshold']}% | "
         f"Exit/TP: {settings['exit_threshold']}% | "
         f"Invalid: {settings['invalidation_threshold']}% | "
         f"Peak: {settings['peak_reversal']}% | "
-        f"TSL: {settings['sl_pct']}%"
+        f"TSL: {settings['sl_pct']}% | "
+        f"Redis refresh: {settings['redis_refresh_minutes']}m"
     )
     logger.info("=" * 60)
 
@@ -1511,7 +1561,9 @@ def main_loop() -> None:
     load_history()
     prune_history(datetime.now(timezone.utc))
     last_redis_refresh = datetime.now(timezone.utc)
-    logger.info(f"History after initial load & prune: {len(price_history)} points")
+    logger.info(
+        f"History after initial load & prune: {len(price_history)} points"
+    )
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         send_startup_message()
@@ -1527,23 +1579,27 @@ def main_loop() -> None:
                 if send_heartbeat():
                     last_heartbeat_time = now
 
-            # Refresh history dari Redis secara berkala
+            # Refresh history dari Redis setiap 1 menit
             refresh_history_from_redis(now)
 
-            # Fetch harga terkini
+            # Fetch harga terkini dari API
             price_data = fetch_prices()
             if price_data is None:
                 logger.warning("Failed to fetch prices")
             else:
-                scan_stats["count"]          += 1
-                scan_stats["last_btc_price"]  = price_data.btc_price
-                scan_stats["last_eth_price"]  = price_data.eth_price
+                scan_stats["count"]         += 1
+                scan_stats["last_btc_price"] = price_data.btc_price
+                scan_stats["last_eth_price"] = price_data.eth_price
 
-                if not is_data_fresh(now, price_data.btc_updated_at, price_data.eth_updated_at):
+                if not is_data_fresh(
+                    now,
+                    price_data.btc_updated_at,
+                    price_data.eth_updated_at,
+                ):
                     logger.warning("Data not fresh, skipping")
                 else:
-                    # Bot B TIDAK append ke price_history sendiri
-                    # — semua data dari Redis (Bot A)
+                    # Bot B tidak append ke price_history sendiri
+                    # — semua data lookback dari Redis (Bot A)
                     price_then = get_lookback_price(now)
 
                     if price_then is None:
@@ -1565,8 +1621,10 @@ def main_loop() -> None:
 
                         logger.info(
                             f"Mode: {current_mode.value} | "
-                            f"BTC {settings['lookback_hours']}h: {format_value(btc_ret)}% | "
-                            f"ETH {settings['lookback_hours']}h: {format_value(eth_ret)}% | "
+                            f"BTC {settings['lookback_hours']}h: "
+                            f"{format_value(btc_ret)}% | "
+                            f"ETH {settings['lookback_hours']}h: "
+                            f"{format_value(eth_ret)}% | "
                             f"Gap: {format_value(gap)}%"
                         )
 
