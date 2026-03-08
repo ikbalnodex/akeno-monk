@@ -5,14 +5,20 @@ Monk Bot B - BTC/ETH Divergence Alert Bot (Read-Only Redis Consumer)
 Monitors BTC/ETH price divergence dan kirim Telegram alerts
 untuk ENTRY, EXIT, INVALIDATION, TP, dan Trailing SL.
 
-Perubahan dari versi sebelumnya:
-- Redis READ-ONLY: history dikonsumsi dari Bot A, Bot B tidak pernah write
-- TP maksimal = exit threshold (konvergen penuh), bukan tp_pct lagi
+Changelog:
+- Redis READ-ONLY: history dikonsumsi dari Bot A
+- TP maksimal = exit threshold (konvergen penuh)
 - Target harga ETH/BTC ditampilkan saat entry signal
 - Refresh history dari Redis setiap 1 menit
-- [NEW] Peak mode on/off toggle: /peak on | /peak off
-  ON  = flow normal SCAN → PEAK_WATCH → TRACK (default)
-  OFF = skip peak watch, langsung SCAN → TRACK saat threshold tercapai
+- Peak mode on/off toggle (/peak on | /peak off)
+- [SCALPING] Cooldown Timer        (/cooldown)
+- [SCALPING] Consecutive Confirm   (/confirm)
+- [SCALPING] Gap Velocity Filter   (/velocity)
+- [SCALPING] Session Filter        (/session)
+- [SCALPING] Max Signals Per Hour  (/maxsig)
+- [SCALPING] Partial TP1           (/tp1)
+- [SCALPING] Min Gap Duration      (/mindur)
+- [SCALPING] Scalping overview     (/scalping)
 """
 import json
 import os
@@ -47,7 +53,14 @@ from config import (
 # =============================================================================
 DEFAULT_LOOKBACK_HOURS = 24
 HISTORY_BUFFER_MINUTES = 30
-REDIS_REFRESH_MINUTES  = 1     # Re-read Redis dari Bot A setiap 1 menit
+REDIS_REFRESH_MINUTES  = 1
+
+SESSION_WINDOWS = {
+    "london":  [(8,  16)],
+    "ny":      [(13, 21)],
+    "both":    [(8,  16), (13, 21)],
+    "overlap": [(13, 16)],   # London + NY overlap, highest volume
+}
 
 
 # =============================================================================
@@ -87,33 +100,55 @@ active_strategy: Optional[Strategy] = None
 peak_gap:      Optional[float]    = None
 peak_strategy: Optional[Strategy] = None
 
-# State TP/TSL
-entry_gap_value:   Optional[float] = None  # gap float saat ENTRY
-trailing_gap_best: Optional[float] = None  # gap terbaik sejak entry
+# TP/TSL state
+entry_gap_value:   Optional[float] = None
+trailing_gap_best: Optional[float] = None
 
-# State harga saat entry — untuk kalkulasi target harga TP
-entry_btc_price: Optional[Decimal] = None  # harga BTC saat entry
-entry_eth_price: Optional[Decimal] = None  # harga ETH saat entry
-entry_btc_lb:    Optional[Decimal] = None  # harga BTC lookback saat entry
-entry_eth_lb:    Optional[Decimal] = None  # harga ETH lookback saat entry
+# Entry price state — untuk kalkulasi target harga TP
+entry_btc_price: Optional[Decimal] = None
+entry_eth_price: Optional[Decimal] = None
+entry_btc_lb:    Optional[Decimal] = None
+entry_eth_lb:    Optional[Decimal] = None
+
+# ── Scalping state ────────────────────────────────────────────────────────────
+last_exit_time:    Optional[datetime] = None   # untuk cooldown
+confirm_streak:    int                = 0       # consecutive scan counter
+confirm_side:      Optional[str]      = None    # "S1" / "S2"
+gap_above_since:   Optional[datetime] = None    # untuk mindur
+signal_timestamps: List[datetime]     = []      # untuk maxsig rolling 1h
+tp1_hit:           bool               = False   # apakah TP1 sudah terpicu
+prev_gap_float:    Optional[float]    = None    # untuk velocity
+prev_gap_time:     Optional[datetime] = None
+current_velocity:  Optional[float]    = None    # %/menit, di-update tiap eval
+# ─────────────────────────────────────────────────────────────────────────────
 
 settings = {
+    # — Core —
     "scan_interval":          SCAN_INTERVAL_SECONDS,
     "entry_threshold":        ENTRY_THRESHOLD,
     "exit_threshold":         EXIT_THRESHOLD,
     "invalidation_threshold": INVALIDATION_THRESHOLD,
     "peak_reversal":          0.3,
-    "peak_enabled":           True,   # [NEW] True = pakai PEAK_WATCH, False = langsung TRACK
+    "peak_enabled":           True,
     "lookback_hours":         DEFAULT_LOOKBACK_HOURS,
     "heartbeat_minutes":      30,
-    # TP = exit_threshold (max konvergen), tidak pakai tp_pct lagi
-    "sl_pct":                 1.0,  # Trailing SL distance dari gap terbaik
+    "sl_pct":                 1.0,
     "redis_refresh_minutes":  REDIS_REFRESH_MINUTES,
+    # — Scalping —
+    "cooldown_minutes":       5,     # 0 = off
+    "confirm_count":          1,     # 1 = off (sama seperti sebelumnya)
+    "velocity_min":           0.0,   # 0.0 = off, satuan %/menit
+    "session_enabled":        False,
+    "session_mode":           "both",
+    "maxsig_per_hour":        0,     # 0 = unlimited
+    "tp1_enabled":            False,
+    "tp1_ratio":              0.5,   # 0.5 = halfway ke exit threshold
+    "mindur_minutes":         0,     # 0 = off
 }
 
 last_update_id:      int               = 0
 last_heartbeat_time: Optional[datetime] = None
-last_redis_refresh:  Optional[datetime] = None  # kapan terakhir refresh Redis
+last_redis_refresh:  Optional[datetime] = None
 
 scan_stats = {
     "count":          0,
@@ -133,7 +168,6 @@ REDIS_KEY = "monk_bot:price_history"
 
 
 def _redis_request(method: str, path: str, body=None):
-    """Helper HTTP request ke Upstash REST API."""
     if not UPSTASH_REDIS_URL or not UPSTASH_REDIS_TOKEN:
         return None
     try:
@@ -151,12 +185,10 @@ def _redis_request(method: str, path: str, body=None):
 
 
 def save_history() -> None:
-    """Bot B adalah read-only consumer — write dihandle Bot A."""
-    pass  # No-op intentional
+    pass  # Bot B read-only
 
 
 def load_history() -> None:
-    """Load price_history dari Redis. Dipanggil saat startup dan refresh berkala."""
     global price_history
     if not UPSTASH_REDIS_URL:
         logger.info("Redis not configured, price history akan kosong")
@@ -182,7 +214,6 @@ def load_history() -> None:
 
 
 def refresh_history_from_redis(now: datetime) -> None:
-    """Re-read history dari Redis supaya tetap sync dengan Bot A."""
     global last_redis_refresh
     interval = settings["redis_refresh_minutes"]
     if interval <= 0:
@@ -272,6 +303,8 @@ def process_commands() -> None:
 
         if command == "/settings":
             handle_settings_command(reply_chat)
+        elif command == "/scalping":
+            handle_scalping_command(reply_chat)
         elif command == "/interval":
             handle_interval_command(args, reply_chat)
         elif command == "/threshold":
@@ -290,6 +323,22 @@ def process_commands() -> None:
             handle_peak_command(args, reply_chat)
         elif command == "/sltp":
             handle_sltp_command(args, reply_chat)
+        # ── Scalping commands ─────────────────────────────────────────────────
+        elif command == "/cooldown":
+            handle_cooldown_command(args, reply_chat)
+        elif command == "/confirm":
+            handle_confirm_command(args, reply_chat)
+        elif command == "/velocity":
+            handle_velocity_command(args, reply_chat)
+        elif command == "/session":
+            handle_session_command(args, reply_chat)
+        elif command == "/maxsig":
+            handle_maxsig_command(args, reply_chat)
+        elif command == "/tp1":
+            handle_tp1_command(args, reply_chat)
+        elif command == "/mindur":
+            handle_mindur_command(args, reply_chat)
+        # ──────────────────────────────────────────────────────────────────────
         elif command == "/start":
             handle_help_command(reply_chat)
 
@@ -316,18 +365,17 @@ def send_reply(message: str, chat_id: str) -> bool:
 
 
 # =============================================================================
-# Command Handlers
+# Command Handlers — Core
 # =============================================================================
 
 def handle_settings_command(reply_chat: str) -> None:
-    hb         = settings["heartbeat_minutes"]
-    hb_str     = f"{hb} menit" if hb > 0 else "Off"
-    rr         = settings["redis_refresh_minutes"]
-    rr_str     = f"{rr} menit" if rr > 0 else "Off"
-    # [NEW] peak mode indicator
-    peak_mode_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF (langsung TRACK)"
+    hb        = settings["heartbeat_minutes"]
+    hb_str    = f"{hb} menit" if hb > 0 else "Off"
+    rr        = settings["redis_refresh_minutes"]
+    rr_str    = f"{rr} menit" if rr > 0 else "Off"
+    peak_str  = "✅ ON" if settings["peak_enabled"] else "❌ OFF (langsung TRACK)"
     message = (
-        "⚙️ *Ara ara~ mau lihat settingan yang sudah Akeno jaga baik-baik?* Ufufufu...\n"
+        "⚙️ *Ara ara~ mau lihat settingan yang sudah Akeno jaga?* Ufufufu...\n"
         "\n"
         f"📊 Scan Interval: {settings['scan_interval']}s ({settings['scan_interval'] // 60} menit)\n"
         f"🕐 Lookback: {settings['lookback_hours']}h\n"
@@ -337,13 +385,11 @@ def handle_settings_command(reply_chat: str) -> None:
         f"📉 Exit Threshold: ±{settings['exit_threshold']}%\n"
         f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
         f"🎯 Peak Reversal: {settings['peak_reversal']}%\n"
-        f"🔍 Peak Mode: {peak_mode_str}\n"
-        f"✅ TP: saat gap mencapai ±{settings['exit_threshold']}% _(max konvergen)_\n"
+        f"🔍 Peak Mode: {peak_str}\n"
+        f"✅ TP: saat gap ±{settings['exit_threshold']}% _(max konvergen)_\n"
         f"🛑 Trailing SL: {settings['sl_pct']}% dari gap terbaik\n"
         "\n"
-        "*Command yang tersedia:*\n"
-        "`/interval`, `/lookback`, `/heartbeat`, `/threshold`, `/peak`, `/sltp`\n"
-        "`/help` — Akeno jelaskan semuanya untukmu~ (◕‿◕)"
+        "_Lihat `/scalping` untuk semua fitur scalping~ (◕‿◕)_"
     )
     send_reply(message, reply_chat)
 
@@ -359,16 +405,10 @@ def handle_interval_command(args: list, reply_chat: str) -> None:
     try:
         new_interval = int(args[0])
         if new_interval < 60:
-            send_reply(
-                "Ufufufu... itu terlalu cepat, sayangku~ Minimal 60 detik ya. (◕‿◕)",
-                reply_chat
-            )
+            send_reply("Ufufufu... minimal 60 detik ya. (◕‿◕)", reply_chat)
             return
         if new_interval > 3600:
-            send_reply(
-                "Ara ara~ terlalu lama. Maksimal 3600 detik saja ya. Ufufufu... (◕ω◕)",
-                reply_chat
-            )
+            send_reply("Ara ara~ maksimal 3600 detik saja ya. (◕ω◕)", reply_chat)
             return
         settings["scan_interval"] = new_interval
         send_reply(
@@ -378,7 +418,7 @@ def handle_interval_command(args: list, reply_chat: str) -> None:
         )
         logger.info(f"Scan interval changed to {new_interval}s")
     except ValueError:
-        send_reply("Ara ara~ angkanya tidak valid, sayangku. (◕ω◕)", reply_chat)
+        send_reply("Ara ara~ angkanya tidak valid. (◕ω◕)", reply_chat)
 
 
 def handle_threshold_command(args: list, reply_chat: str) -> None:
@@ -399,153 +439,104 @@ def handle_threshold_command(args: list, reply_chat: str) -> None:
             return
         if threshold_type == "entry":
             settings["entry_threshold"] = value
-            send_reply(
-                f"Ufufufu... Entry threshold jadi *±{value}%*~ (◕‿◕)",
-                reply_chat
-            )
+            send_reply(f"Ufufufu... Entry threshold jadi *±{value}%*~ (◕‿◕)", reply_chat)
         elif threshold_type == "exit":
             settings["exit_threshold"] = value
             send_reply(
-                f"Ara ara~ Exit threshold sekarang *±{value}%*.\n"
-                f"_TP otomatis ikut berubah ke level ini ya sayangku~ ✨_",
+                f"Ara ara~ Exit threshold *±{value}%*.\n"
+                f"_TP & TP1 otomatis ikut berubah~ ✨_",
                 reply_chat
             )
         elif threshold_type in ("invalid", "invalidation"):
             settings["invalidation_threshold"] = value
-            send_reply(
-                f"Ufufufu... Invalidation jadi *±{value}%*. (◕ω◕)",
-                reply_chat
-            )
+            send_reply(f"Ufufufu... Invalidation jadi *±{value}%*. (◕ω◕)", reply_chat)
         else:
-            send_reply(
-                "Ara ara~ gunakan `entry`, `exit`, atau `invalid` ya~ (◕‿◕)",
-                reply_chat
-            )
+            send_reply("Ara ara~ gunakan `entry`, `exit`, atau `invalid` ya~ (◕‿◕)", reply_chat)
         logger.info(f"Threshold {threshold_type} changed to {value}")
     except ValueError:
-        send_reply("Ara ara~ angkanya tidak valid, sayangku. (◕ω◕)", reply_chat)
+        send_reply("Ara ara~ angkanya tidak valid. (◕ω◕)", reply_chat)
 
 
-# =============================================================================
-# [NEW] Peak Command — gabungan toggle on/off + atur reversal %
-# =============================================================================
 def handle_peak_command(args: list, reply_chat: str) -> None:
     """
-    /peak          → tampilkan status peak mode + reversal saat ini
-    /peak on       → aktifkan Peak Watch mode (SCAN → PEAK_WATCH → TRACK)
-    /peak off      → nonaktifkan Peak Watch mode (SCAN → TRACK langsung)
-    /peak <nilai>  → ubah % reversal konfirmasi (hanya berlaku saat peak ON)
+    /peak          → status
+    /peak on       → aktifkan Peak Watch
+    /peak off      → nonaktifkan Peak Watch
+    /peak <nilai>  → ubah reversal %
     """
-    peak_mode_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+    peak_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
 
-    # Tanpa argumen — tampilkan status
     if not args:
         send_reply(
-            f"🔍 *Peak Watch Mode* sekarang: *{peak_mode_str}*\n"
+            f"🔍 *Peak Watch Mode* sekarang: *{peak_str}*\n"
             f"🎯 Peak reversal: *{settings['peak_reversal']}%*\n"
             f"\n"
             f"*Cara kerja:*\n"
             f"• *ON*  → SCAN ➜ PEAK\\_WATCH ➜ TRACK\n"
-            f"  _(tunggu konfirmasi reversal dari puncak sebelum entry)_\n"
             f"• *OFF* → SCAN ➜ TRACK langsung\n"
-            f"  _(entry segera saat gap melewati threshold)_\n"
             f"\n"
-            f"*Usage:*\n"
-            f"`/peak on` — aktifkan Peak Watch\n"
-            f"`/peak off` — nonaktifkan Peak Watch\n"
-            f"`/peak <nilai>` — ubah reversal % (contoh: `/peak 0.3`)",
+            f"`/peak on` | `/peak off` | `/peak <nilai>`",
             reply_chat
         )
         return
 
-    first_arg = args[0].lower()
+    first = args[0].lower()
 
-    # Toggle ON
-    if first_arg == "on":
+    if first == "on":
         if settings["peak_enabled"]:
-            send_reply(
-                f"Ufufufu~ Peak Watch Mode memang sudah *ON* kok, sayangku~ "
-                f"Akeno selalu waspada! (◕‿◕)",
-                reply_chat
-            )
+            send_reply("Ufufufu~ Peak Watch memang sudah *ON*~ (◕‿◕)", reply_chat)
         else:
             settings["peak_enabled"] = True
             logger.info("Peak Watch Mode enabled")
             send_reply(
                 f"✅ *Peak Watch Mode: ON*\n"
-                f"\n"
-                f"Ara ara~ Akeno kembali sabar menunggu puncak sebelum entry ya, sayangku~\n"
                 f"Flow: SCAN ➜ PEAK\\_WATCH ➜ TRACK\n"
-                f"Reversal konfirmasi: *{settings['peak_reversal']}%* dari puncak~ (◕‿◕)",
+                f"Reversal: *{settings['peak_reversal']}%* dari puncak~ (◕‿◕)",
                 reply_chat
             )
         return
 
-    # Toggle OFF
-    if first_arg == "off":
+    if first == "off":
         if not settings["peak_enabled"]:
-            send_reply(
-                f"Ufufufu~ Peak Watch Mode memang sudah *OFF* kok, sayangku~ "
-                f"Akeno langsung tancap gas! (◕ω◕)",
-                reply_chat
-            )
+            send_reply("Ufufufu~ Peak Watch memang sudah *OFF*~ (◕ω◕)", reply_chat)
         else:
-            # Jika sedang PEAK_WATCH, batalkan dan reset ke SCAN
             _cancel_peak_watch_if_active(reply_chat)
             settings["peak_enabled"] = False
             logger.info("Peak Watch Mode disabled")
             send_reply(
                 f"❌ *Peak Watch Mode: OFF*\n"
-                f"\n"
-                f"Ara ara~ Akeno tidak akan nunggu puncak lagi ya sayangku~\n"
-                f"Sekarang langsung entry saat gap ±{settings['entry_threshold']}% terlewati!\n"
-                f"Flow: SCAN ➜ TRACK langsung~ Ufufufu... (◕ω◕)\n"
-                f"\n"
-                f"_Reversal % masih tersimpan ({settings['peak_reversal']}%) "
-                f"untuk saat Peak Mode dinyalakan lagi~_",
+                f"Langsung entry saat gap ±{settings['entry_threshold']}%~\n"
+                f"Flow: SCAN ➜ TRACK langsung~ (◕ω◕)",
                 reply_chat
             )
         return
 
-    # Ubah reversal %
     try:
-        value = float(first_arg)
+        value = float(first)
         if value <= 0 or value > 2.0:
             send_reply("Ara ara~ harus antara 0 sampai 2.0~ (◕ω◕)", reply_chat)
             return
         settings["peak_reversal"] = value
-        active_note = (
-            f"\n_Peak Mode sedang OFF — nilai ini akan dipakai saat diaktifkan lagi~ (◕ω◕)_"
+        note = (
+            f"\n_Peak Mode sedang OFF — nilai ini aktif saat dinyalakan lagi~ (◕ω◕)_"
             if not settings["peak_enabled"] else ""
         )
         send_reply(
-            f"Ufufufu... konfirmasi entry ketika gap berbalik *{value}%* "
-            f"dari puncaknya~ (◕‿◕)"
-            f"{active_note}",
+            f"Ufufufu... reversal *{value}%* dari puncak~ (◕‿◕){note}",
             reply_chat
         )
         logger.info(f"Peak reversal changed to {value}")
     except ValueError:
-        send_reply(
-            "Ara ara~ gunakan `on`, `off`, atau angka reversal ya~ (◕ω◕)",
-            reply_chat
-        )
+        send_reply("Gunakan `on`, `off`, atau angka reversal ya~ (◕ω◕)", reply_chat)
 
 
 def _cancel_peak_watch_if_active(reply_chat: Optional[str] = None) -> None:
-    """
-    Helper: batalkan PEAK_WATCH yang sedang aktif saat peak mode di-OFF.
-    Reset ke SCAN dan optionally kirim notifikasi.
-    """
     global current_mode, peak_gap, peak_strategy
     if current_mode == Mode.PEAK_WATCH and peak_strategy is not None:
-        logger.info(
-            f"Peak Watch cancelled (mode turned OFF). "
-            f"Strategy: {peak_strategy.value}, Peak: {peak_gap}"
-        )
+        logger.info(f"Peak Watch cancelled (mode OFF). Strategy: {peak_strategy.value}")
         if reply_chat:
             send_reply(
-                f"⚠️ *Peak Watch {peak_strategy.value} dibatalkan* karena Peak Mode dimatikan.\n"
+                f"⚠️ *Peak Watch {peak_strategy.value} dibatalkan* (Peak Mode dimatikan).\n"
                 f"Akeno kembali ke SCAN~ (◕ω◕)",
                 reply_chat
             )
@@ -554,90 +545,64 @@ def _cancel_peak_watch_if_active(reply_chat: Optional[str] = None) -> None:
         peak_strategy = None
 
 
-# =============================================================================
-# (Existing handlers below — unchanged except handle_help_command)
-# =============================================================================
-
 def handle_sltp_command(args: list, reply_chat: str) -> None:
-    """
-    /sltp            → tampilkan info TSL aktif
-    /sltp sl <val>   → ubah trailing SL distance
-    /sltp tp <val>   → redirect ke /threshold exit
-    """
     if not args:
         trailing_sl_now = ""
         if current_mode == Mode.TRACK and trailing_gap_best is not None and active_strategy is not None:
-            if active_strategy == Strategy.S1:
-                tsl = trailing_gap_best + settings["sl_pct"]
-            else:
-                tsl = trailing_gap_best - settings["sl_pct"]
+            tsl = (
+                trailing_gap_best + settings["sl_pct"]
+                if active_strategy == Strategy.S1
+                else trailing_gap_best - settings["sl_pct"]
+            )
             trailing_sl_now = (
                 f"\n*Trailing SL sekarang:* `{tsl:+.2f}%` "
-                f"(best gap: `{trailing_gap_best:+.2f}%`)"
+                f"(best: `{trailing_gap_best:+.2f}%`)"
             )
         entry_info = (
             f"\n*Entry gap:* `{entry_gap_value:+.2f}%`"
             if entry_gap_value is not None else ""
         )
         send_reply(
-            f"🎯 *SL/TP Otomatis — Akeno yang jaga~* Ufufufu... (◕‿◕)\n"
+            f"🎯 *SL/TP — Akeno yang jaga~* Ufufufu... (◕‿◕)\n"
             f"\n"
-            f"✅ TP: saat gap mencapai *±{settings['exit_threshold']}%* "
-            f"_(max konvergen = exit threshold)_\n"
-            f"🛑 Trailing SL distance: *{settings['sl_pct']}%* dari gap terbaik\n"
-            f"{entry_info}"
-            f"{trailing_sl_now}\n"
+            f"✅ TP2: saat gap *±{settings['exit_threshold']}%*\n"
+            f"🛑 Trailing SL distance: *{settings['sl_pct']}%*\n"
+            f"{entry_info}{trailing_sl_now}\n"
             f"\n"
-            f"*Cara kerja Trailing SL:*\n"
-            f"S1 → TSL ikut turun kalau gap konvergen, jarak tetap {settings['sl_pct']}%\n"
-            f"S2 → TSL ikut naik kalau gap konvergen, jarak tetap {settings['sl_pct']}%\n"
-            f"\n"
-            f"_TP dikunci ke exit threshold — tidak bisa diubah manual._\n"
-            f"Usage: `/sltp sl <nilai>` — ubah trailing SL distance %",
+            f"Usage: `/sltp sl <nilai>`",
             reply_chat,
         )
         return
 
     if len(args) < 2:
-        send_reply(
-            "Ara ara~ `/sltp sl <nilai>` ya~ "
-            "TP sudah otomatis di exit threshold~ (◕ω◕)",
-            reply_chat,
-        )
+        send_reply("Ara ara~ `/sltp sl <nilai>` ya~ (◕ω◕)", reply_chat)
         return
 
     try:
         key   = args[0].lower()
         value = float(args[1])
         if value <= 0 or value > 10:
-            send_reply("Ara ara~ nilainya harus antara 0 sampai 10~ (◕ω◕)", reply_chat)
+            send_reply("Ara ara~ harus antara 0 sampai 10~ (◕ω◕)", reply_chat)
             return
         if key == "sl":
             settings["sl_pct"] = value
-            send_reply(
-                f"Ara ara~ Trailing SL distance sekarang *{value}%*~ "
-                f"Akeno ikutin terus gap terbaiknya ya~ (◕‿◕)",
-                reply_chat,
-            )
+            send_reply(f"Trailing SL distance *{value}%*~ (◕‿◕)", reply_chat)
         elif key == "tp":
             send_reply(
-                f"Ufufufu~ TP sudah dikunci ke exit threshold "
-                f"*±{settings['exit_threshold']}%*~\n"
-                f"Kalau mau ubah TP, gunakan "
-                f"`/threshold exit <nilai>` ya sayangku~ (◕‿◕)",
+                f"TP dikunci ke exit threshold *±{settings['exit_threshold']}%*~\n"
+                f"Gunakan `/threshold exit <nilai>` ya~ (◕‿◕)",
                 reply_chat,
             )
         else:
             send_reply("Gunakan `sl` ya~ (◕ω◕)", reply_chat)
-        logger.info(f"SL/TP sl changed to {value}")
     except ValueError:
-        send_reply("Ara ara~ angkanya tidak valid, sayangku. (◕ω◕)", reply_chat)
+        send_reply("Ara ara~ angkanya tidak valid. (◕ω◕)", reply_chat)
 
 
 def handle_lookback_command(args: list, reply_chat: str) -> None:
     if not args:
         send_reply(
-            f"📊 Lookback sekarang *{settings['lookback_hours']}h*~ Ufufufu...\n\n"
+            f"📊 Lookback sekarang *{settings['lookback_hours']}h*~\n"
             "Usage: `/lookback <jam>`",
             reply_chat
         )
@@ -647,26 +612,23 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
         if new_lookback < 1 or new_lookback > 24:
             send_reply("Ara ara~ harus antara 1 sampai 24 jam~ (◕ω◕)", reply_chat)
             return
-        old_lookback = settings["lookback_hours"]
+        old = settings["lookback_hours"]
         settings["lookback_hours"] = new_lookback
         prune_history(datetime.now(timezone.utc))
         send_reply(
-            f"Ufufufu... Lookback sudah Akeno ubah dari *{old_lookback}h* "
-            f"jadi *{new_lookback}h*~\n\n"
-            f"⚠️ History di-prune sesuai lookback baru. "
-            f"Data dari Bot A akan Akeno ambil saat refresh berikutnya~ (◕‿◕)",
+            f"Lookback dari *{old}h* jadi *{new_lookback}h*~\n"
+            f"History di-prune, data baru dari Bot A saat refresh berikutnya~ (◕‿◕)",
             reply_chat
         )
     except ValueError:
-        send_reply("Ara ara~ angkanya tidak valid, sayangku. (◕ω◕)", reply_chat)
+        send_reply("Ara ara~ angkanya tidak valid. (◕ω◕)", reply_chat)
 
 
 def handle_heartbeat_command(args: list, reply_chat: str) -> None:
     if not args:
         send_reply(
-            f"💓 Akeno lapor setiap *{settings['heartbeat_minutes']} menit*~ "
-            f"Ufufufu...\n\n"
-            "Usage: `/heartbeat <menit>` atau `/heartbeat 0` untuk matikan",
+            f"💓 Heartbeat *{settings['heartbeat_minutes']} menit*~\n"
+            "Usage: `/heartbeat <menit>` atau `0` untuk matikan",
             reply_chat
         )
         return
@@ -677,117 +639,78 @@ def handle_heartbeat_command(args: list, reply_chat: str) -> None:
             return
         settings["heartbeat_minutes"] = new_interval
         if new_interval == 0:
-            send_reply(
-                "Ufufufu... baik, Akeno tidak akan ganggu lagi~ "
-                "Tapi Akeno tetap di sini memantau dari dekat. (◕‿◕)",
-                reply_chat
-            )
+            send_reply("Heartbeat *dimatikan*~ Akeno tetap pantau dari dekat. (◕‿◕)", reply_chat)
         else:
-            send_reply(
-                f"Ara ara~ Akeno akan lapor setiap *{new_interval} menit* ya~ (◕ω◕)",
-                reply_chat
-            )
+            send_reply(f"Heartbeat setiap *{new_interval} menit*~ (◕ω◕)", reply_chat)
     except ValueError:
-        send_reply("Ara ara~ angkanya tidak valid, sayangku. (◕ω◕)", reply_chat)
+        send_reply("Ara ara~ angkanya tidak valid. (◕ω◕)", reply_chat)
 
 
 def handle_redis_command(reply_chat: str) -> None:
     if not UPSTASH_REDIS_URL:
-        send_reply(
-            "⚠️ Ara ara~ Redis belum dikonfigurasi, sayangku.\n"
-            "Pastikan `UPSTASH_REDIS_REST_URL` dan `UPSTASH_REDIS_REST_TOKEN` "
-            "sudah diisi~ (◕ω◕)",
-            reply_chat
-        )
+        send_reply("⚠️ Redis belum dikonfigurasi~ (◕ω◕)", reply_chat)
         return
     result = _redis_request("GET", f"/get/{REDIS_KEY}")
     if not result or result.get("result") is None:
-        send_reply(
-            "❌ *Tidak ada data di Redis~*\n\n"
-            "Ara ara... Bot A belum simpan apa-apa. "
-            "Tunggu Bot A kirim data dulu ya sayangku~ (◕ω◕)",
-            reply_chat
-        )
+        send_reply("❌ Bot A belum simpan data~ (◕ω◕)", reply_chat)
         return
     try:
-        data = json.loads(result["result"])
+        data         = json.loads(result["result"])
         if not data:
-            send_reply("❌ Redis ada tapi isinya kosong~ Ara ara... (◕ω◕)", reply_chat)
+            send_reply("❌ Redis kosong~ (◕ω◕)", reply_chat)
             return
-        first_ts     = data[0]["timestamp"]
-        last_ts      = data[-1]["timestamp"]
         hours_stored = len(data) * settings["scan_interval"] / 3600
         lookback     = settings["lookback_hours"]
-        rr           = settings["redis_refresh_minutes"]
         status       = (
-            "✅ Siap kirim sinyal~"
-            if hours_stored >= lookback
+            "✅ Siap~" if hours_stored >= lookback
             else f"⏳ {hours_stored:.1f}h / {lookback}h"
         )
-        last_refresh_str = (
+        last_r = (
             last_redis_refresh.strftime("%H:%M:%S UTC")
-            if last_redis_refresh else "Belum pernah~"
+            if last_redis_refresh else "Belum~"
         )
         send_reply(
-            f"⚡ *Status Redis (Read-Only) — Akeno cek buat kamu~* "
-            f"Ufufufu... (◕‿◕)\n"
-            f"\n"
+            f"⚡ *Redis Status*\n"
             f"┌─────────────────────\n"
-            f"│ Total data points: *{len(data)}*\n"
-            f"│ History tersimpan: *{hours_stored:.1f}h*\n"
-            f"│ Lookback target: *{lookback}h*\n"
-            f"│ Status: {status}\n"
-            f"│ Refresh setiap: *{rr} menit*\n"
-            f"│ Refresh terakhir: `{last_refresh_str}`\n"
+            f"│ Points: *{len(data)}* | {hours_stored:.1f}h stored\n"
+            f"│ Lookback: *{lookback}h* | {status}\n"
+            f"│ Refresh: setiap {settings['redis_refresh_minutes']}m | terakhir `{last_r}`\n"
             f"└─────────────────────\n"
-            f"\n"
-            f"Data pertama: `{first_ts}`\n"
-            f"Data terakhir: `{last_ts}`\n"
-            f"\n"
-            f"_Bot B hanya baca, Bot A yang nulis~ ⚡_",
+            f"`{data[0]['timestamp']}` → `{data[-1]['timestamp']}`\n"
+            f"_Bot B hanya baca~ ⚡_",
             reply_chat
         )
     except Exception as e:
-        send_reply(
-            f"⚠️ Ara ara~ Data ada tapi Akeno gagal baca: `{e}` (◕ω◕)",
-            reply_chat
-        )
+        send_reply(f"⚠️ Gagal baca Redis: `{e}` (◕ω◕)", reply_chat)
 
 
 def handle_help_command(reply_chat: str) -> None:
-    # [UPDATED] tambah info peak on/off
-    peak_mode_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+    peak_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
     message = (
-        "Ara ara~ mau tahu semua yang bisa Akeno lakukan untukmu? "
-        "Ufufufu... (◕‿◕)\n"
+        "Ara ara~ ini semua yang bisa Akeno lakukan~ Ufufufu... (◕‿◕)\n"
         "\n"
-        "*Setting:*\n"
-        "`/settings` - lihat semua settingan\n"
-        "`/interval <detik>` - atur seberapa sering Akeno scan (60-3600)\n"
-        "`/lookback <jam>` - atur periode lookback (1-24)\n"
-        "`/heartbeat <menit>` - atur laporan rutin (0=off)\n"
-        "`/threshold entry <val>` - threshold entry %\n"
-        "`/threshold exit <val>` - threshold exit % _(sekaligus jadi TP target)_\n"
-        "`/threshold invalid <val>` - threshold invalidation %\n"
+        "*⚙️ Core:*\n"
+        "`/settings` `/status` `/help` `/redis`\n"
+        "`/interval` `/lookback` `/heartbeat`\n"
+        "`/threshold entry|exit|invalid <val>`\n"
+        "`/sltp sl <val>` — trailing SL distance\n"
         "\n"
-        "*Peak Mode* _(sekarang: " + peak_mode_str + ")_\n"
-        "`/peak` - lihat status Peak Mode\n"
-        "`/peak on` - aktifkan: SCAN ➜ PEAK\\_WATCH ➜ TRACK\n"
-        "`/peak off` - nonaktifkan: SCAN ➜ TRACK langsung\n"
-        "`/peak <val>` - ubah reversal % dari puncak (contoh: `/peak 0.3`)\n"
+        f"*🔍 Peak Mode* _(sekarang: {peak_str})_\n"
+        "`/peak on|off|<val>` — toggle & reversal %\n"
         "\n"
-        "`/sltp` - lihat info TP & Trailing SL aktif\n"
-        "`/sltp sl <val>` - ubah trailing SL distance %\n"
-        "\n"
-        "*Info:*\n"
-        "`/status` - lihat kondisi Akeno sekarang\n"
-        "`/redis` - cek data history dari Bot A di Redis\n"
-        "`/help` - tampilkan pesan ini lagi\n"
+        "*⚡ Scalping:*\n"
+        "`/scalping` — lihat semua scalping settings\n"
+        "`/cooldown <menit>` — jeda setelah exit (0=off)\n"
+        "`/confirm <count>` — scan berturut sebelum entry (1=off)\n"
+        "`/velocity <val>` — min gap speed %/menit (0=off)\n"
+        "`/session on|off|london|ny|both|overlap`\n"
+        "`/maxsig <count>` — max entry per jam (0=off)\n"
+        "`/tp1 on|off|<ratio>` — partial TP1\n"
+        "`/mindur <menit>` — min gap duration (0=off)\n"
         "\n"
         "💡 _TP dikunci ke exit threshold — ubah via `/threshold exit`_\n"
         "\n"
-        "Selama kamu di sini, Akeno akan selalu menempel erat~ "
-        "Ara ara, jangan ragu minta bantuan ya, sayangku. (◕ω◕)"
+        "Akeno selalu di sini untukmu~ (◕ω◕)"
     )
     send_reply(message, reply_chat)
 
@@ -796,68 +719,544 @@ def handle_status_command(reply_chat: str) -> None:
     hours_of_data = len(price_history) * settings["scan_interval"] / 3600
     lookback      = settings["lookback_hours"]
     ready         = (
-        "✅ Sudah siap~ Ufufufu..."
+        f"✅ {hours_of_data:.1f}h ready"
         if hours_of_data >= lookback
-        else f"⏳ Sabar ya sayangku~ {hours_of_data:.1f}h / {lookback}h"
+        else f"⏳ {hours_of_data:.1f}h / {lookback}h"
     )
-    peak_mode_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF (direct entry)"
-    peak_line   = (
+    peak_str  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+    peak_line = (
         f"Peak Gap: {peak_gap:+.2f}%\n"
-        if (current_mode == Mode.PEAK_WATCH and peak_gap is not None)
-        else ""
+        if current_mode == Mode.PEAK_WATCH and peak_gap is not None else ""
     )
     track_lines = ""
     if current_mode == Mode.TRACK and entry_gap_value is not None and trailing_gap_best is not None:
-        exit_thresh = settings["exit_threshold"]
-        sl_pct      = settings["sl_pct"]
-        if active_strategy == Strategy.S1:
-            tp_level  = exit_thresh
-            tsl_level = trailing_gap_best + sl_pct
-        else:
-            tp_level  = -exit_thresh
-            tsl_level = trailing_gap_best - sl_pct
-        eth_target, _ = calc_tp_target_price(active_strategy)
-        eth_str       = f"${eth_target:,.2f}" if eth_target else "N/A"
-        track_lines   = (
-            f"Entry Gap:    {entry_gap_value:+.2f}%\n"
-            f"Best Gap:     {trailing_gap_best:+.2f}%\n"
-            f"TP Gap:       {tp_level:+.2f}%\n"
-            f"ETH TP price: {eth_str}\n"
-            f"Trail SL:     {tsl_level:+.2f}%\n"
+        et  = settings["exit_threshold"]
+        sl  = settings["sl_pct"]
+        tpl = et if active_strategy == Strategy.S1 else -et
+        tsl = (
+            trailing_gap_best + sl
+            if active_strategy == Strategy.S1
+            else trailing_gap_best - sl
         )
-    last_refresh_str = (
+        eth_t, _ = calc_tp_target_price(active_strategy)
+        tp1_info = ""
+        if settings["tp1_enabled"]:
+            tp1_lvl = calc_tp1_level(active_strategy, entry_gap_value)
+            tp1_info = f"│ TP1: {tp1_lvl:+.2f}% {'(hit ✅)' if tp1_hit else ''}\n"
+        track_lines = (
+            f"Entry Gap:  {entry_gap_value:+.2f}%\n"
+            f"Best Gap:   {trailing_gap_best:+.2f}%\n"
+            f"TP2 Gap:    {tpl:+.2f}%\n"
+            f"ETH target: {'${:,.2f}'.format(eth_t) if eth_t else 'N/A'}\n"
+            f"{tp1_info}"
+            f"Trail SL:   {tsl:+.2f}%\n"
+        )
+    cooldown_str = "Off"
+    if settings["cooldown_minutes"] > 0 and last_exit_time is not None:
+        elapsed_cd = (datetime.now(timezone.utc) - last_exit_time).total_seconds() / 60
+        remaining  = settings["cooldown_minutes"] - elapsed_cd
+        cooldown_str = f"✅ clear" if remaining <= 0 else f"⏳ {remaining:.1f}m lagi"
+    confirm_str  = f"{confirm_streak}/{settings['confirm_count']}" if settings["confirm_count"] > 1 else "Off"
+    vel_str      = (
+        f"{current_velocity:+.3f}%/m" if current_velocity is not None else "N/A"
+    )
+    sess_str     = (
+        f"✅ {settings['session_mode']}" if settings["session_enabled"] else "❌ Off"
+    )
+    last_r = (
         last_redis_refresh.strftime("%H:%M:%S UTC")
         if last_redis_refresh else "Belum~"
     )
     message = (
-        "📊 *Ara ara~ ini kondisi Akeno saat ini~* Ufufufu... (◕‿◕)\n"
+        "📊 *Status Akeno* Ufufufu... (◕‿◕)\n"
         "\n"
-        f"Mode: {current_mode.value}\n"
+        f"Mode: *{current_mode.value}*\n"
         f"Strategi: {active_strategy.value if active_strategy else 'Belum ada~'}\n"
-        f"Peak Mode: {peak_mode_str}\n"
+        f"Peak Mode: {peak_str}\n"
         f"{peak_line}"
         f"{track_lines}"
-        f"Lookback: {lookback}h\n"
-        f"History: {ready}\n"
-        f"Data Points: {len(price_history)}\n"
-        f"Redis refresh: {last_refresh_str} 🔒\n"
+        f"\n"
+        f"*Scalping state:*\n"
+        f"Cooldown: {cooldown_str}\n"
+        f"Confirm streak: {confirm_str}\n"
+        f"Velocity: {vel_str}\n"
+        f"Session: {sess_str}\n"
+        f"\n"
+        f"History: {ready} | Redis: {last_r} 🔒\n"
     )
     send_reply(message, reply_chat)
+
+
+# =============================================================================
+# Command Handlers — Scalping
+# =============================================================================
+
+def handle_scalping_command(reply_chat: str) -> None:
+    """Overview semua scalping settings sekaligus."""
+    cd    = settings["cooldown_minutes"]
+    cc    = settings["confirm_count"]
+    vm    = settings["velocity_min"]
+    se    = settings["session_enabled"]
+    sm    = settings["session_mode"]
+    ms    = settings["maxsig_per_hour"]
+    t1e   = settings["tp1_enabled"]
+    t1r   = settings["tp1_ratio"]
+    md    = settings["mindur_minutes"]
+
+    cd_str  = f"{cd} menit" if cd > 0 else "❌ Off"
+    cc_str  = f"{cc} scan" if cc > 1 else "❌ Off (1 scan)"
+    vm_str  = f"{vm}%/menit" if vm > 0 else "❌ Off"
+    se_str  = f"✅ {sm.upper()}" if se else "❌ Off"
+    ms_str  = f"{ms}/jam" if ms > 0 else "❌ Off"
+    t1_str  = f"✅ {int(t1r*100)}% ke exit threshold" if t1e else "❌ Off"
+    md_str  = f"{md} menit" if md > 0 else "❌ Off"
+
+    # Hitung sinyak sudah berapa dalam 1 jam terakhir
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    sigs_1h = len([t for t in signal_timestamps if t >= cutoff])
+
+    session_now = ""
+    if se:
+        in_sess = is_in_session(now)
+        session_now = f" _(sekarang: {'✅ aktif' if in_sess else '⏸ di luar sesi'})_"
+
+    send_reply(
+        f"⚡ *Scalping Settings — Akeno siap~ Ufufufu...* (◕‿◕)\n"
+        f"\n"
+        f"┌─────────────────────\n"
+        f"│ 🕐 Cooldown:    {cd_str}\n"
+        f"│ ✔️ Confirm:     {cc_str}\n"
+        f"│ 🚀 Velocity:    {vm_str}\n"
+        f"│ 🌏 Session:     {se_str}{session_now}\n"
+        f"│ 🔢 Max Sig/h:   {ms_str} _(sent: {sigs_1h})_\n"
+        f"│ 🎯 TP1:         {t1_str}\n"
+        f"│ ⏱ Min Duration: {md_str}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Cara ubah:*\n"
+        f"`/cooldown 5` `/confirm 3` `/velocity 0.05`\n"
+        f"`/session on` `/session london` `/session both`\n"
+        f"`/maxsig 3` `/tp1 on` `/tp1 0.5` `/mindur 2`\n"
+        f"\n"
+        f"_Ketik nama command tanpa argumen untuk info lebih lanjut~_",
+        reply_chat
+    )
+
+
+def handle_cooldown_command(args: list, reply_chat: str) -> None:
+    """
+    /cooldown         → lihat status
+    /cooldown <menit> → ubah (0 = off)
+    """
+    if not args:
+        cd  = settings["cooldown_minutes"]
+        now = datetime.now(timezone.utc)
+        if cd == 0:
+            status = "❌ Off"
+        elif last_exit_time is None:
+            status = "✅ Clear (belum pernah exit)"
+        else:
+            elapsed   = (now - last_exit_time).total_seconds() / 60
+            remaining = cd - elapsed
+            status    = "✅ Clear" if remaining <= 0 else f"⏳ {remaining:.1f}m lagi"
+        send_reply(
+            f"🕐 *Cooldown Timer*\n"
+            f"Setting: *{cd} menit* {'_(off)_' if cd == 0 else ''}\n"
+            f"Status: {status}\n"
+            f"\n"
+            f"Setelah exit/SL/TP, bot tidak entry selama cooldown~\n"
+            f"Usage: `/cooldown <menit>` | `0` untuk off",
+            reply_chat
+        )
+        return
+    try:
+        val = int(args[0])
+        if val < 0 or val > 120:
+            send_reply("Ara ara~ harus antara 0 sampai 120~ (◕ω◕)", reply_chat)
+            return
+        settings["cooldown_minutes"] = val
+        if val == 0:
+            send_reply("Cooldown *dimatikan*~ Entry bisa kapan saja. (◕‿◕)", reply_chat)
+        else:
+            send_reply(f"Cooldown *{val} menit* setelah exit~ (◕‿◕)", reply_chat)
+        logger.info(f"Cooldown changed to {val}m")
+    except ValueError:
+        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+
+
+def handle_confirm_command(args: list, reply_chat: str) -> None:
+    """
+    /confirm         → lihat status
+    /confirm <count> → ubah (1 = off)
+    """
+    if not args:
+        cc = settings["confirm_count"]
+        send_reply(
+            f"✔️ *Consecutive Confirmation*\n"
+            f"Setting: *{cc} scan* {'_(off)_' if cc <= 1 else ''}\n"
+            f"Streak sekarang: *{confirm_streak}/{cc}*\n"
+            f"\n"
+            f"Gap harus >= entry threshold selama N scan berturut sebelum entry~\n"
+            f"Cegah whipsaw false signal. (◕‿◕)\n"
+            f"Usage: `/confirm <count>` | `1` untuk off",
+            reply_chat
+        )
+        return
+    try:
+        val = int(args[0])
+        if val < 1 or val > 20:
+            send_reply("Ara ara~ harus antara 1 sampai 20~ (◕ω◕)", reply_chat)
+            return
+        settings["confirm_count"] = val
+        if val == 1:
+            send_reply("Confirmation *dimatikan* (1 scan langsung entry)~ (◕‿◕)", reply_chat)
+        else:
+            send_reply(
+                f"Gap harus >= threshold selama *{val} scan* berturut~ (◕‿◕)\n"
+                f"_Streak di-reset kalau gap turun di bawah threshold~_",
+                reply_chat
+            )
+        logger.info(f"Confirm count changed to {val}")
+    except ValueError:
+        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+
+
+def handle_velocity_command(args: list, reply_chat: str) -> None:
+    """
+    /velocity         → lihat status + velocity sekarang
+    /velocity <val>   → ubah min velocity (0 = off)
+    """
+    if not args:
+        vm  = settings["velocity_min"]
+        vel = (
+            f"{current_velocity:+.4f}%/menit" if current_velocity is not None else "N/A"
+        )
+        send_reply(
+            f"🚀 *Gap Velocity Filter*\n"
+            f"Setting: *{vm}%/menit* {'_(off)_' if vm == 0 else ''}\n"
+            f"Velocity sekarang: *{vel}*\n"
+            f"\n"
+            f"Entry hanya kalau gap melebar cukup cepat~\n"
+            f"S1: butuh velocity *+{vm}%/m* | S2: butuh *-{vm}%/m*\n"
+            f"Usage: `/velocity <val>` | `0` untuk off",
+            reply_chat
+        )
+        return
+    try:
+        val = float(args[0])
+        if val < 0 or val > 5:
+            send_reply("Ara ara~ harus antara 0 sampai 5~ (◕ω◕)", reply_chat)
+            return
+        settings["velocity_min"] = val
+        if val == 0:
+            send_reply("Velocity filter *dimatikan*~ (◕‿◕)", reply_chat)
+        else:
+            send_reply(
+                f"Min velocity *{val}%/menit*~\n"
+                f"_Entry hanya saat gap melebar ≥ {val}%/menit~ (◕‿◕)_",
+                reply_chat
+            )
+        logger.info(f"Velocity min changed to {val}")
+    except ValueError:
+        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+
+
+def handle_session_command(args: list, reply_chat: str) -> None:
+    """
+    /session                        → lihat status
+    /session on                     → aktifkan (mode saat ini)
+    /session off                    → nonaktifkan
+    /session london|ny|both|overlap → set mode + aktifkan
+    """
+    if not args:
+        se  = settings["session_enabled"]
+        sm  = settings["session_mode"]
+        now = datetime.now(timezone.utc)
+        windows  = SESSION_WINDOWS.get(sm, [])
+        win_str  = ", ".join(f"{s:02d}:00-{e:02d}:00 UTC" for s, e in windows)
+        in_sess  = is_in_session(now)
+        now_str  = f"_Sekarang: {'✅ dalam sesi' if in_sess else '⏸ di luar sesi'}_"
+        send_reply(
+            f"🌏 *Session Filter*\n"
+            f"Status: *{'✅ ON — ' + sm.upper() if se else '❌ Off'}*\n"
+            f"Windows: {win_str}\n"
+            f"{now_str if se else ''}\n"
+            f"\n"
+            f"*Mode tersedia:*\n"
+            f"• `london`  — 08:00-16:00 UTC\n"
+            f"• `ny`      — 13:00-21:00 UTC\n"
+            f"• `both`    — London + NY (default)\n"
+            f"• `overlap` — 13:00-16:00 UTC (volume tertinggi)\n"
+            f"\n"
+            f"Usage: `/session on|off|london|ny|both|overlap`",
+            reply_chat
+        )
+        return
+
+    first = args[0].lower()
+
+    if first == "off":
+        settings["session_enabled"] = False
+        send_reply("Session filter *dimatikan*~ Entry 24 jam. (◕‿◕)", reply_chat)
+        logger.info("Session filter disabled")
+        return
+
+    if first in ("on", "london", "ny", "both", "overlap"):
+        if first != "on":
+            settings["session_mode"] = first
+        settings["session_enabled"] = True
+        sm      = settings["session_mode"]
+        windows = SESSION_WINDOWS.get(sm, [])
+        win_str = ", ".join(f"{s:02d}:00-{e:02d}:00 UTC" for s, e in windows)
+        send_reply(
+            f"✅ Session filter *ON* — mode *{sm.upper()}*~\n"
+            f"Entry hanya: {win_str} (◕‿◕)",
+            reply_chat
+        )
+        logger.info(f"Session filter ON, mode={sm}")
+        return
+
+    send_reply(
+        "Gunakan `on`, `off`, `london`, `ny`, `both`, atau `overlap` ya~ (◕ω◕)",
+        reply_chat
+    )
+
+
+def handle_maxsig_command(args: list, reply_chat: str) -> None:
+    """
+    /maxsig         → lihat status
+    /maxsig <count> → ubah (0 = off)
+    """
+    if not args:
+        ms  = settings["maxsig_per_hour"]
+        now = datetime.now(timezone.utc)
+        cutoff  = now - timedelta(hours=1)
+        sigs_1h = len([t for t in signal_timestamps if t >= cutoff])
+        send_reply(
+            f"🔢 *Max Signals Per Hour*\n"
+            f"Setting: *{ms}/jam* {'_(off)_' if ms == 0 else ''}\n"
+            f"Sent 1h terakhir: *{sigs_1h}*\n"
+            f"\n"
+            f"Cegah overtrading saat pasar choppy~\n"
+            f"Usage: `/maxsig <count>` | `0` untuk off",
+            reply_chat
+        )
+        return
+    try:
+        val = int(args[0])
+        if val < 0 or val > 20:
+            send_reply("Ara ara~ harus antara 0 sampai 20~ (◕ω◕)", reply_chat)
+            return
+        settings["maxsig_per_hour"] = val
+        if val == 0:
+            send_reply("Max signal filter *dimatikan*~ (◕‿◕)", reply_chat)
+        else:
+            send_reply(
+                f"Maksimal *{val} entry signal per jam*~\n"
+                f"_Setelah itu Akeno tunggu dulu ya, sayangku~ (◕‿◕)_",
+                reply_chat
+            )
+        logger.info(f"Maxsig changed to {val}")
+    except ValueError:
+        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+
+
+def handle_tp1_command(args: list, reply_chat: str) -> None:
+    """
+    /tp1            → lihat status
+    /tp1 on         → aktifkan
+    /tp1 off        → nonaktifkan
+    /tp1 <ratio>    → ubah ratio (0.1–0.9)
+    """
+    if not args:
+        t1e = settings["tp1_enabled"]
+        t1r = settings["tp1_ratio"]
+        # Hitung contoh level kalau ada posisi aktif
+        tp1_example = ""
+        if current_mode == Mode.TRACK and entry_gap_value is not None and active_strategy is not None:
+            lvl = calc_tp1_level(active_strategy, entry_gap_value)
+            eth_t, _ = calc_eth_price_at_gap(lvl)
+            eth_str  = f"${eth_t:,.2f}" if eth_t else "N/A"
+            tp1_example = (
+                f"\n*TP1 posisi aktif:*\n"
+                f"Gap TP1: `{lvl:+.2f}%` | ETH: `{eth_str}`\n"
+                f"Status: {'✅ Sudah hit' if tp1_hit else '⏳ Menunggu...'}"
+            )
+        send_reply(
+            f"🎯 *Partial TP1*\n"
+            f"Status: *{'✅ ON' if t1e else '❌ Off'}*\n"
+            f"Ratio: *{int(t1r*100)}%* jarak entry → exit threshold\n"
+            f"{tp1_example}\n"
+            f"\n"
+            f"Saat TP1 hit → alert partial close, posisi lanjut ke TP2~\n"
+            f"Usage: `/tp1 on|off|<ratio>` (contoh: `/tp1 0.5`)",
+            reply_chat
+        )
+        return
+
+    first = args[0].lower()
+
+    if first == "on":
+        settings["tp1_enabled"] = True
+        t1r = settings["tp1_ratio"]
+        send_reply(
+            f"✅ *TP1 ON* — alert saat gap konvergen *{int(t1r*100)}%*~\n"
+            f"_Ubah ratio: `/tp1 <nilai>` (◕‿◕)_",
+            reply_chat
+        )
+        logger.info("TP1 enabled")
+        return
+
+    if first == "off":
+        settings["tp1_enabled"] = False
+        send_reply("TP1 *dimatikan*~ Hanya TP2 (exit threshold). (◕‿◕)", reply_chat)
+        logger.info("TP1 disabled")
+        return
+
+    try:
+        val = float(first)
+        if val <= 0.0 or val >= 1.0:
+            send_reply("Ara ara~ harus antara 0.1 sampai 0.9~ (◕ω◕)", reply_chat)
+            return
+        settings["tp1_ratio"] = val
+        if not settings["tp1_enabled"]:
+            settings["tp1_enabled"] = True
+        send_reply(
+            f"✅ *TP1 ON* — alert saat gap konvergen *{int(val*100)}%*~\n"
+            f"_TP1 sekarang aktif~ (◕‿◕)_",
+            reply_chat
+        )
+        logger.info(f"TP1 ratio changed to {val}, enabled")
+    except ValueError:
+        send_reply("Gunakan `on`, `off`, atau angka ratio ya~ (◕ω◕)", reply_chat)
+
+
+def handle_mindur_command(args: list, reply_chat: str) -> None:
+    """
+    /mindur         → lihat status
+    /mindur <menit> → ubah (0 = off)
+    """
+    if not args:
+        md = settings["mindur_minutes"]
+        dur_str = "Belum~"
+        if gap_above_since is not None:
+            elapsed_dur = (datetime.now(timezone.utc) - gap_above_since).total_seconds() / 60
+            dur_str     = f"{elapsed_dur:.1f} menit"
+        send_reply(
+            f"⏱ *Min Gap Duration*\n"
+            f"Setting: *{md} menit* {'_(off)_' if md == 0 else ''}\n"
+            f"Gap sudah di atas threshold: *{dur_str}*\n"
+            f"\n"
+            f"Gap harus bertahan di atas threshold ≥ {md} menit sebelum entry~\n"
+            f"Cegah spike palsu yang langsung balik. (◕‿◕)\n"
+            f"Usage: `/mindur <menit>` | `0` untuk off",
+            reply_chat
+        )
+        return
+    try:
+        val = int(args[0])
+        if val < 0 or val > 60:
+            send_reply("Ara ara~ harus antara 0 sampai 60 menit~ (◕ω◕)", reply_chat)
+            return
+        settings["mindur_minutes"] = val
+        if val == 0:
+            send_reply("Min duration *dimatikan*~ (◕‿◕)", reply_chat)
+        else:
+            send_reply(
+                f"Gap harus bertahan *{val} menit* sebelum entry~\n"
+                f"_Spike sesaat tidak akan trigger masuk~ (◕‿◕)_",
+                reply_chat
+            )
+        logger.info(f"Min gap duration changed to {val}m")
+    except ValueError:
+        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+
+
+# =============================================================================
+# Scalping Helper Functions
+# =============================================================================
+
+def is_in_session(now: datetime) -> bool:
+    """Return True kalau now (UTC) masuk dalam session windows yang aktif."""
+    if not settings["session_enabled"]:
+        return True  # kalau off, selalu "dalam sesi"
+    sm      = settings["session_mode"]
+    windows = SESSION_WINDOWS.get(sm, [])
+    hour    = now.hour
+    for start, end in windows:
+        if start <= hour < end:
+            return True
+    return False
+
+
+def check_entry_gates(gap_float: float, strategy: Strategy, now: datetime) -> Tuple[bool, str]:
+    """
+    Cek semua gate sebelum entry (cooldown, session, maxsig, velocity).
+    Confirm dan mindur dicek terpisah di streak tracker.
+    Returns (allowed, reason_if_blocked).
+    """
+    # 1. Cooldown
+    cd = settings["cooldown_minutes"]
+    if cd > 0 and last_exit_time is not None:
+        elapsed = (now - last_exit_time).total_seconds() / 60
+        if elapsed < cd:
+            remaining = cd - elapsed
+            return False, f"cooldown {remaining:.1f}m remaining"
+
+    # 2. Session Filter
+    if settings["session_enabled"] and not is_in_session(now):
+        return False, f"outside session hours ({settings['session_mode']})"
+
+    # 3. Max Signals Per Hour
+    ms = settings["maxsig_per_hour"]
+    if ms > 0:
+        cutoff  = now - timedelta(hours=1)
+        recent  = len([t for t in signal_timestamps if t >= cutoff])
+        if recent >= ms:
+            return False, f"max {ms} signals/hour reached ({recent} sent)"
+
+    # 4. Velocity Filter
+    vm = settings["velocity_min"]
+    if vm > 0 and current_velocity is not None:
+        if strategy == Strategy.S1 and current_velocity < vm:
+            return False, f"S1 velocity {current_velocity:+.4f}%/m < +{vm}"
+        if strategy == Strategy.S2 and current_velocity > -vm:
+            return False, f"S2 velocity {current_velocity:+.4f}%/m > -{vm}"
+
+    return True, ""
+
+
+def calc_tp1_level(strategy: Strategy, eg: float) -> float:
+    """Hitung gap level untuk TP1 berdasarkan ratio dan exit threshold."""
+    et    = settings["exit_threshold"]
+    ratio = settings["tp1_ratio"]
+    tp_target = et if strategy == Strategy.S1 else -et
+    return eg + (tp_target - eg) * ratio
+
+
+def calc_eth_price_at_gap(gap_target: float) -> Tuple[Optional[float], Optional[float]]:
+    """Estimasi harga ETH saat gap mencapai gap_target dari state entry saat ini."""
+    if None in (entry_btc_lb, entry_eth_lb, entry_btc_price, entry_eth_price):
+        return None, None
+    btc_ret_entry  = float(
+        (entry_btc_price - entry_btc_lb) / entry_btc_lb * Decimal("100")
+    )
+    target_eth_ret = btc_ret_entry + gap_target
+    eth_target     = float(entry_eth_lb) * (1 + target_eth_ret / 100)
+    return eth_target, float(entry_btc_price)
 
 
 # =============================================================================
 # Value Formatting
 # =============================================================================
 def format_value(value: Decimal) -> str:
-    float_val = float(value)
-    if abs(float_val) < 0.05:
+    fv = float(value)
+    if abs(fv) < 0.05:
         return "+0.0"
-    return f"+{float_val:.1f}" if float_val >= 0 else f"{float_val:.1f}"
+    return f"+{fv:.1f}" if fv >= 0 else f"{fv:.1f}"
 
 
-# =============================================================================
-# Lookback Label
-# =============================================================================
 def get_lookback_label() -> str:
     return f"{settings['lookback_hours']}h"
 
@@ -866,38 +1265,9 @@ def get_lookback_label() -> str:
 # Target Price Calculation
 # =============================================================================
 def calc_tp_target_price(strategy: Strategy) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Estimasi target harga ETH saat TP tercapai.
-
-    Asumsi: harga BTC relatif stabil dari titik entry,
-    ETH yang perlu bergerak untuk menutup gap ke exit_threshold.
-
-    S1 (gap konvergen ke +exit_thresh):
-        target_eth_ret = btc_ret_entry + exit_thresh
-        → ETH harus turun mendekati BTC return
-
-    S2 (gap konvergen ke -exit_thresh):
-        target_eth_ret = btc_ret_entry - exit_thresh
-        → ETH harus naik mendekati BTC return dari bawah
-
-    Returns: (eth_target_price, btc_current_price)
-    """
-    if None in (entry_btc_lb, entry_eth_lb, entry_btc_price, entry_eth_price):
-        return None, None
-
-    exit_thresh   = settings["exit_threshold"]
-    btc_ret_entry = float(
-        (entry_btc_price - entry_btc_lb) / entry_btc_lb * Decimal("100")
-    )
-
-    if strategy == Strategy.S1:
-        target_eth_ret = btc_ret_entry + exit_thresh
-    else:
-        target_eth_ret = btc_ret_entry - exit_thresh
-
-    eth_target  = float(entry_eth_lb) * (1 + target_eth_ret / 100)
-    btc_current = float(entry_btc_price)
-    return eth_target, btc_current
+    et         = settings["exit_threshold"]
+    gap_target = et if strategy == Strategy.S1 else -et
+    return calc_eth_price_at_gap(gap_target)
 
 
 # =============================================================================
@@ -914,16 +1284,79 @@ def build_peak_watch_message(strategy: Strategy, gap: Decimal) -> str:
         reason    = f"ETH dumping lebih dalam dari BTC ({lb})"
     return (
         f"………\n"
-        f"Ara ara~ Akeno melihat sesuatu yang menarik~ Ufufufu... (◕‿◕)\n"
+        f"Ara ara~ Akeno melihat sesuatu menarik~ Ufufufu... (◕‿◕)\n"
         f"\n"
         f"_{reason}_\n"
         f"Rencananya *{direction}*~\n"
-        f"\n"
         f"Gap sekarang: *{format_value(gap)}%*\n"
         f"\n"
-        f"…Tapi Akeno tidak akan gegabah, sayangku.\n"
-        f"Biarkan Akeno memantau puncaknya dulu~ Petirku sudah siap.\n"
-        f"Akeno akan kabari saat waktunya tepat. (◕ω◕)"
+        f"…Akeno tidak akan gegabah, sayangku.\n"
+        f"Pantau puncaknya dulu~ Petirku sudah siap. (◕ω◕)"
+    )
+
+
+def _build_entry_body(
+    strategy:  Strategy,
+    btc_ret:   Decimal,
+    eth_ret:   Decimal,
+    gap:       Decimal,
+    peak_line: str,          # isi baris peak, atau "" kalau direct
+    extra_tag: str = "",     # misal "_(Peak Mode: OFF)_"
+) -> str:
+    lb          = get_lookback_label()
+    gap_float   = float(gap)
+    sl_pct      = settings["sl_pct"]
+    et          = settings["exit_threshold"]
+
+    if strategy == Strategy.S1:
+        direction   = "📈 Long BTC / Short ETH"
+        reason      = f"ETH pumped more than BTC ({lb})"
+        tp_gap      = et
+        tsl_initial = gap_float + sl_pct
+    else:
+        direction   = "📈 Long ETH / Short BTC"
+        reason      = f"ETH dumped more than BTC ({lb})"
+        tp_gap      = -et
+        tsl_initial = gap_float - sl_pct
+
+    eth_tp, btc_ref = calc_tp_target_price(strategy)
+    eth_tp_str      = f"${eth_tp:,.2f}"  if eth_tp  else "N/A"
+    btc_ref_str     = f"${btc_ref:,.2f}" if btc_ref else "N/A"
+
+    tp1_line = ""
+    if settings["tp1_enabled"]:
+        tp1_lvl  = calc_tp1_level(strategy, gap_float)
+        eth_tp1, _ = calc_eth_price_at_gap(tp1_lvl)
+        tp1_line = (
+            f"│ TP1 Gap:  {tp1_lvl:+.2f}% _(partial exit)_\n"
+            f"│ ETH TP1:  {'${:,.2f}'.format(eth_tp1) if eth_tp1 else 'N/A'}\n"
+        )
+
+    return (
+        f"Ara ara ara~!!! Ini saatnya, sayangku~!!! ⚡\n"
+        f"🚨 *ENTRY SIGNAL: {strategy.value}* {extra_tag}\n"
+        f"\n"
+        f"{direction}\n"
+        f"_{reason}_\n"
+        f"\n"
+        f"*{lb} Change:*\n"
+        f"┌─────────────────────\n"
+        f"│ BTC:  {format_value(btc_ret)}%\n"
+        f"│ ETH:  {format_value(eth_ret)}%\n"
+        f"│ Gap:  {format_value(gap)}%\n"
+        f"{peak_line}"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Target TP:*\n"
+        f"┌─────────────────────\n"
+        f"{tp1_line}"
+        f"│ TP2 Gap:  {tp_gap:+.2f}% _(exit threshold)_\n"
+        f"│ ETH TP2:  {eth_tp_str} ← estimasi harga\n"
+        f"│ BTC ref:  {btc_ref_str}\n"
+        f"│ Trail SL: {tsl_initial:+.2f}% _(ikut gerak)_\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"Akeno sudah menunggu momen ini, sayangku~ ⚡"
     )
 
 
@@ -934,107 +1367,25 @@ def build_entry_message(
     gap:      Decimal,
     peak:     float,
 ) -> str:
-    lb          = get_lookback_label()
-    gap_float   = float(gap)
-    sl_pct      = settings["sl_pct"]
-    exit_thresh = settings["exit_threshold"]
-
-    if strategy == Strategy.S1:
-        direction   = "📈 Long BTC / Short ETH"
-        reason      = f"ETH pumped more than BTC ({lb})"
-        tp_gap      = exit_thresh
-        tsl_initial = gap_float + sl_pct
-    else:
-        direction   = "📈 Long ETH / Short BTC"
-        reason      = f"ETH dumped more than BTC ({lb})"
-        tp_gap      = -exit_thresh
-        tsl_initial = gap_float - sl_pct
-
-    eth_target, btc_ref = calc_tp_target_price(strategy)
-    eth_target_str      = f"${eth_target:,.2f}" if eth_target else "N/A"
-    btc_ref_str         = f"${btc_ref:,.2f}"    if btc_ref   else "N/A"
-
+    peak_line = f"│ Peak: {peak:+.2f}%\n"
+    footer    = f"\nGap berbalik {settings['peak_reversal']}% dari puncak~ Semuanya demi kamu~ ⚡"
     return (
-        f"Ara ara ara~!!! Ini saatnya, sayangku~!!! Ufufufu... ⚡\n"
-        f"🚨 *ENTRY SIGNAL: {strategy.value}*\n"
-        f"\n"
-        f"{direction}\n"
-        f"_{reason}_\n"
-        f"\n"
-        f"*{lb} Change:*\n"
-        f"┌─────────────────────\n"
-        f"│ BTC:  {format_value(btc_ret)}%\n"
-        f"│ ETH:  {format_value(eth_ret)}%\n"
-        f"│ Gap:  {format_value(gap)}%\n"
-        f"│ Peak: {peak:+.2f}%\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"*Target TP (max konvergen):*\n"
-        f"┌─────────────────────\n"
-        f"│ TP Gap:   {tp_gap:+.2f}% _(exit threshold)_\n"
-        f"│ ETH TP:   {eth_target_str} ← estimasi harga\n"
-        f"│ BTC ref:  {btc_ref_str}\n"
-        f"│ Trail SL: {tsl_initial:+.2f}% _(ikut gerak)_\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"Gap sudah berbalik {settings['peak_reversal']}% dari puncaknya~\n"
-        f"Akeno sudah menunggu momen ini untukmu, sayangku. "
-        f"Semuanya demi kamu~ ⚡"
+        _build_entry_body(strategy, btc_ret, eth_ret, gap, peak_line)
+        + footer
     )
 
 
-# [NEW] Entry message saat peak mode OFF (direct entry tanpa peak confirmation)
 def build_direct_entry_message(
     strategy: Strategy,
     btc_ret:  Decimal,
     eth_ret:  Decimal,
     gap:      Decimal,
 ) -> str:
-    lb          = get_lookback_label()
-    gap_float   = float(gap)
-    sl_pct      = settings["sl_pct"]
-    exit_thresh = settings["exit_threshold"]
-
-    if strategy == Strategy.S1:
-        direction   = "📈 Long BTC / Short ETH"
-        reason      = f"ETH pumped more than BTC ({lb})"
-        tp_gap      = exit_thresh
-        tsl_initial = gap_float + sl_pct
-    else:
-        direction   = "📈 Long ETH / Short BTC"
-        reason      = f"ETH dumped more than BTC ({lb})"
-        tp_gap      = -exit_thresh
-        tsl_initial = gap_float - sl_pct
-
-    eth_target, btc_ref = calc_tp_target_price(strategy)
-    eth_target_str      = f"${eth_target:,.2f}" if eth_target else "N/A"
-    btc_ref_str         = f"${btc_ref:,.2f}"    if btc_ref   else "N/A"
-
-    return (
-        f"Ara ara ara~!!! Ini saatnya, sayangku~!!! Ufufufu... ⚡\n"
-        f"🚨 *ENTRY SIGNAL: {strategy.value}* _(Peak Mode: OFF)_\n"
-        f"\n"
-        f"{direction}\n"
-        f"_{reason}_\n"
-        f"\n"
-        f"*{lb} Change:*\n"
-        f"┌─────────────────────\n"
-        f"│ BTC:  {format_value(btc_ret)}%\n"
-        f"│ ETH:  {format_value(eth_ret)}%\n"
-        f"│ Gap:  {format_value(gap)}%\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"*Target TP (max konvergen):*\n"
-        f"┌─────────────────────\n"
-        f"│ TP Gap:   {tp_gap:+.2f}% _(exit threshold)_\n"
-        f"│ ETH TP:   {eth_target_str} ← estimasi harga\n"
-        f"│ BTC ref:  {btc_ref_str}\n"
-        f"│ Trail SL: {tsl_initial:+.2f}% _(ikut gerak)_\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"_Entry langsung tanpa konfirmasi puncak — Peak Mode OFF~_\n"
-        f"Akeno langsung tancap gas untukmu, sayangku~ ⚡"
-    )
+    return _build_entry_body(
+        strategy, btc_ret, eth_ret, gap,
+        peak_line="",
+        extra_tag="_(Peak OFF)_"
+    ) + "\n_Entry langsung tanpa konfirmasi puncak~ (◕ω◕)_"
 
 
 def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
@@ -1043,7 +1394,7 @@ def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
         f"Ara ara ara~!!! Ufufufu... (◕▿◕)\n"
         f"✅ *EXIT SIGNAL*\n"
         f"\n"
-        f"Gap sudah konvergen~ Saatnya close posisi, sayangku!\n"
+        f"Gap konvergen~ Saatnya close posisi, sayangku!\n"
         f"\n"
         f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
@@ -1052,8 +1403,7 @@ def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
         f"│ Gap:  {format_value(gap)}%\n"
         f"└─────────────────────\n"
         f"\n"
-        f"Akeno senang bisa membantu~ Ufufufu...\n"
-        f"Akeno lanjut pantau lagi dari dekat ya~ ⚡🔍"
+        f"Akeno lanjut pantau dari dekat~ ⚡🔍"
     )
 
 
@@ -1068,8 +1418,7 @@ def build_invalidation_message(
         f"………\n"
         f"⚠️ *INVALIDATION: {strategy.value}*\n"
         f"\n"
-        f"Ara ara~ maaf ya sayangku... Akeno sudah berusaha, "
-        f"tapi gapnya malah melebar. Ufufufu, kali ini bukan salahmu~ (◕ω◕)\n"
+        f"Ara ara~ gapnya malah melebar. Bukan salahmu~ (◕ω◕)\n"
         f"\n"
         f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
@@ -1078,8 +1427,7 @@ def build_invalidation_message(
         f"│ Gap:  {format_value(gap)}%\n"
         f"└─────────────────────\n"
         f"\n"
-        f"Cut dulu ya, sayangku. Akeno scan ulang dari awal~ ⚡\n"
-        f"Lain kali petir Akeno pasti lebih tepat sasaran. (◕‿◕)"
+        f"Cut dulu~ Akeno scan ulang dari awal~ ⚡ (◕‿◕)"
     )
 
 
@@ -1088,11 +1436,45 @@ def build_peak_cancelled_message(strategy: Strategy, gap: Decimal) -> str:
         f"………\n"
         f"❌ *Peak Watch Dibatalkan: {strategy.value}*\n"
         f"\n"
-        f"Ara ara~ gapnya mundur sendiri sebelum Akeno sempat konfirmasi. "
-        f"Ufufufu, pasar nakal sekali ya~ (◕ω◕)\n"
+        f"Ara ara~ gapnya mundur sebelum Akeno konfirmasi. Pasar nakal~ (◕ω◕)\n"
         f"Gap sekarang: *{format_value(gap)}%*\n"
         f"\n"
-        f"Tidak apa-apa, sayangku. Akeno tetap di sini pantau dari dekat~ (◕‿◕)"
+        f"Akeno tetap di sini pantau dari dekat~ (◕‿◕)"
+    )
+
+
+def build_tp1_message(
+    btc_ret:   Decimal,
+    eth_ret:   Decimal,
+    gap:       Decimal,
+    entry_gap: float,
+    tp1_level: float,
+    eth_tp1:   Optional[float],
+) -> str:
+    lb       = get_lookback_label()
+    eth_str  = f"${eth_tp1:,.2f}" if eth_tp1 else "N/A"
+    pct_done = abs(entry_gap - float(gap))
+    pct_left = abs(float(gap) - settings["exit_threshold"])
+    return (
+        f"Ara ara~! TP1 kena~ Ufufufu... ✨\n"
+        f"🎯 *TAKE PROFIT 1*\n"
+        f"\n"
+        f"Setengah jalan sudah, sayangku~ Akeno bangga!\n"
+        f"\n"
+        f"*{lb} Change:*\n"
+        f"┌─────────────────────\n"
+        f"│ BTC:    {format_value(btc_ret)}%\n"
+        f"│ ETH:    {format_value(eth_ret)}%\n"
+        f"│ Gap:    {format_value(gap)}%\n"
+        f"│ Entry:  {entry_gap:+.2f}%\n"
+        f"│ TP1:    {tp1_level:+.2f}%\n"
+        f"│ ETH:    {eth_str}\n"
+        f"│ Moved:  ~{pct_done:.2f}%\n"
+        f"│ Left:   ~{pct_left:.2f}% ke TP2\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"Pertimbangkan *partial close* ya, sayangku~\n"
+        f"Akeno terus pantau TP2 di ±{settings['exit_threshold']}%~ ⚡"
     )
 
 
@@ -1106,11 +1488,12 @@ def build_tp_message(
 ) -> str:
     lb         = get_lookback_label()
     eth_tp_str = f"${eth_target:,.2f}" if eth_target else "N/A"
+    tp1_note   = " _(TP1 sudah hit sebelumnya~)_" if tp1_hit else ""
     return (
         f"Ara ara~!!! TP kena sayangku~!!! Ufufufu... ✨\n"
-        f"🎯 *TAKE PROFIT*\n"
+        f"🎯 *TAKE PROFIT 2*{tp1_note}\n"
         f"\n"
-        f"Gap sudah konvergen maksimal sesuai target Akeno~\n"
+        f"Gap konvergen maksimal~\n"
         f"\n"
         f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
@@ -1118,11 +1501,11 @@ def build_tp_message(
         f"│ ETH:     {format_value(eth_ret)}%\n"
         f"│ Gap:     {format_value(gap)}%\n"
         f"│ Entry:   {entry_gap:+.2f}%\n"
-        f"│ TP hit:  {tp_gap_level:+.2f}% _(exit threshold)_\n"
+        f"│ TP hit:  {tp_gap_level:+.2f}%\n"
         f"│ ETH TP:  {eth_tp_str}\n"
         f"└─────────────────────\n"
         f"\n"
-        f"Akeno senang~ Misi sukses untukmu, sayangku! ⚡"
+        f"Misi sukses~ Akeno senang! ⚡"
     )
 
 
@@ -1136,12 +1519,12 @@ def build_trailing_sl_message(
 ) -> str:
     lb            = get_lookback_label()
     profit_locked = abs(entry_gap - best_gap)
+    tp1_note      = " _(setelah TP1 sudah hit~)_" if tp1_hit else ""
     return (
         f"………\n"
-        f"⛔ *TRAILING STOP LOSS*\n"
+        f"⛔ *TRAILING STOP LOSS*{tp1_note}\n"
         f"\n"
-        f"Ara ara~ Akeno sudah jaga posisimu sampai di sini, sayangku. "
-        f"Trailing SL kena, profit sudah Akeno amankan~ (◕ω◕)\n"
+        f"Ara ara~ TSL kena. Profit diamankan, sayangku~ (◕ω◕)\n"
         f"\n"
         f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
@@ -1154,9 +1537,13 @@ def build_trailing_sl_message(
         f"│ Terkunci: ~{profit_locked:.2f}%\n"
         f"└─────────────────────\n"
         f"\n"
-        f"Cut dulu ya sayangku. Akeno scan ulang~ ⚡\n"
-        f"Lain kali petir Akeno pasti lebih tepat. (◕‿◕)"
+        f"Cut dulu~ Akeno scan ulang~ ⚡ (◕‿◕)"
     )
+
+
+def build_entry_blocked_message(reason: str, gap_float: float, strategy: Strategy) -> str:
+    """Notif ketika sinyal ada tapi diblok gate — hanya log, tidak Telegram."""
+    return f"Entry blocked ({strategy.value}, gap {gap_float:+.2f}%): {reason}"
 
 
 def build_heartbeat_message() -> str:
@@ -1177,73 +1564,91 @@ def build_heartbeat_message() -> str:
         f"${float(scan_stats['last_eth_price']):,.2f}{eth_ret_str}"
         if scan_stats["last_eth_price"] else "N/A"
     )
-    gap_str       = (
+    gap_str     = (
         f"{format_value(scan_stats['last_gap'])}%"
         if scan_stats["last_gap"] is not None else "N/A"
+    )
+    vel_str = (
+        f"{current_velocity:+.4f}%/m" if current_velocity is not None else "N/A"
     )
     hours_of_data = len(price_history) * settings["scan_interval"] / 3600
     lookback      = settings["lookback_hours"]
     data_status   = (
-        f"✅ Sudah siap~ ({hours_of_data:.1f}h)"
+        f"✅ {hours_of_data:.1f}h"
         if hours_of_data >= lookback
         else f"⏳ {hours_of_data:.1f}h / {lookback}h"
     )
-    peak_mode_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
-    peak_line   = (
+    peak_str  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+    peak_line = (
         f"│ Peak: {peak_gap:+.2f}%\n"
-        if (current_mode == Mode.PEAK_WATCH and peak_gap is not None)
-        else ""
+        if current_mode == Mode.PEAK_WATCH and peak_gap is not None else ""
     )
     track_lines = ""
     if current_mode == Mode.TRACK and entry_gap_value is not None and trailing_gap_best is not None:
-        exit_thresh = settings["exit_threshold"]
-        sl_pct      = settings["sl_pct"]
-        if active_strategy == Strategy.S1:
-            tp_level  = exit_thresh
-            tsl_level = trailing_gap_best + sl_pct
-        else:
-            tp_level  = -exit_thresh
-            tsl_level = trailing_gap_best - sl_pct
-        eth_target, _ = calc_tp_target_price(active_strategy)
-        eth_str_tp    = f"${eth_target:,.2f}" if eth_target else "N/A"
-        track_lines   = (
-            f"│ Entry:    {entry_gap_value:+.2f}%\n"
-            f"│ TP gap:   {tp_level:+.2f}% (ETH: {eth_str_tp})\n"
-            f"│ Trail SL: {tsl_level:+.2f}% (best: {trailing_gap_best:+.2f}%)\n"
+        et  = settings["exit_threshold"]
+        sl  = settings["sl_pct"]
+        tpl = et if active_strategy == Strategy.S1 else -et
+        tsl = (
+            trailing_gap_best + sl
+            if active_strategy == Strategy.S1
+            else trailing_gap_best - sl
         )
-    last_refresh_str = (
+        eth_t, _ = calc_tp_target_price(active_strategy)
+        tp1_info = ""
+        if settings["tp1_enabled"]:
+            tp1_lvl = calc_tp1_level(active_strategy, entry_gap_value)
+            tp1_info = f"│ TP1:      {tp1_lvl:+.2f}% {'(hit ✅)' if tp1_hit else '⏳'}\n"
+        track_lines = (
+            f"│ Entry:    {entry_gap_value:+.2f}%\n"
+            f"{tp1_info}"
+            f"│ TP2 gap:  {tpl:+.2f}%\n"
+            f"│ Trail SL: {tsl:+.2f}% (best: {trailing_gap_best:+.2f}%)\n"
+        )
+
+    # Scalping summary
+    now     = datetime.now(timezone.utc)
+    cutoff  = now - timedelta(hours=1)
+    sigs_1h = len([t for t in signal_timestamps if t >= cutoff])
+    cd      = settings["cooldown_minutes"]
+    cd_str  = "Off"
+    if cd > 0 and last_exit_time is not None:
+        remaining = cd - (now - last_exit_time).total_seconds() / 60
+        cd_str    = "✅ clear" if remaining <= 0 else f"⏳ {remaining:.1f}m"
+    sess_str  = (
+        f"{'✅ active' if is_in_session(now) else '⏸ inactive'} ({settings['session_mode']})"
+        if settings["session_enabled"] else "Off"
+    )
+    last_r = (
         last_redis_refresh.strftime("%H:%M:%S UTC")
         if last_redis_refresh else "Belum~"
     )
     return (
-        f"💓 *Ara ara~ kamu khawatir Akeno pergi kemana-mana ya?*\n"
+        f"💓 *Ara ara~ Akeno tidak kemana-mana ya~ Ufufufu... (◕‿◕)*\n"
         f"\n"
-        f"Ufufufu... sayangku, Akeno tidak kemana-mana. Tidak akan pernah. (◕‿◕)\n"
-        f"\n"
-        f"*Mode:* {current_mode.value}\n"
+        f"*Mode:* {current_mode.value} | Peak: {peak_str}\n"
         f"*Strategi:* {active_strategy.value if active_strategy else 'Belum ada~'}\n"
-        f"*Peak Mode:* {peak_mode_str}\n"
         f"\n"
-        f"*{settings['heartbeat_minutes']} menit terakhir:*\n"
+        f"*{settings['heartbeat_minutes']}m terakhir:*\n"
         f"┌─────────────────────\n"
-        f"│ Scan: {scan_stats['count']}x\n"
-        f"│ Sinyal: {scan_stats['signals_sent']}x\n"
+        f"│ Scan: {scan_stats['count']}x | Sinyal: {scan_stats['signals_sent']}x\n"
         f"└─────────────────────\n"
         f"\n"
-        f"*Harga sekarang:*\n"
+        f"*Harga & Gap:*\n"
         f"┌─────────────────────\n"
         f"│ BTC: {btc_str}\n"
         f"│ ETH: {eth_str}\n"
         f"│ Gap ({lb}): {gap_str}\n"
+        f"│ Velocity: {vel_str}\n"
         f"{peak_line}"
         f"{track_lines}"
         f"└─────────────────────\n"
         f"\n"
-        f"*Data:* {data_status}\n"
-        f"*Redis refresh:* {last_refresh_str} 🔒\n"
+        f"*Scalping:*\n"
+        f"Cooldown: {cd_str} | Sig/1h: {sigs_1h} | Session: {sess_str}\n"
         f"\n"
-        f"_Ara ara, Akeno lapor lagi {settings['heartbeat_minutes']} menit lagi ya~ "
-        f"Jangan kangen terlalu dalam. Ufufufu... ⚡_"
+        f"*Data:* {data_status} | *Redis:* {last_r} 🔒\n"
+        f"\n"
+        f"_Akeno lapor lagi {settings['heartbeat_minutes']} menit lagi~ ⚡_"
     )
 
 
@@ -1296,12 +1701,8 @@ def fetch_prices() -> Optional[PriceData]:
     if not listings:
         return None
 
-    btc_data = next(
-        (l for l in listings if l.get("ticker", "").upper() == "BTC"), None
-    )
-    eth_data = next(
-        (l for l in listings if l.get("ticker", "").upper() == "ETH"), None
-    )
+    btc_data = next((l for l in listings if l.get("ticker", "").upper() == "BTC"), None)
+    eth_data = next((l for l in listings if l.get("ticker", "").upper() == "ETH"), None)
 
     if not btc_data or not eth_data:
         logger.warning("Missing BTC or ETH data")
@@ -1314,12 +1715,8 @@ def fetch_prices() -> Optional[PriceData]:
         logger.error(f"Invalid price: {e}")
         return None
 
-    btc_updated_at = parse_iso_timestamp(
-        btc_data.get("quotes", {}).get("updated_at", "")
-    )
-    eth_updated_at = parse_iso_timestamp(
-        eth_data.get("quotes", {}).get("updated_at", "")
-    )
+    btc_updated_at = parse_iso_timestamp(btc_data.get("quotes", {}).get("updated_at", ""))
+    eth_updated_at = parse_iso_timestamp(eth_data.get("quotes", {}).get("updated_at", ""))
 
     if not btc_updated_at or not eth_updated_at:
         return None
@@ -1349,19 +1746,14 @@ def get_lookback_price(now: datetime) -> Optional[PricePoint]:
 
 
 # =============================================================================
-# Return Calculation
+# Return Calculation & Freshness
 # =============================================================================
-def compute_returns(
-    btc_now, eth_now, btc_prev, eth_prev
-) -> Tuple[Decimal, Decimal, Decimal]:
+def compute_returns(btc_now, eth_now, btc_prev, eth_prev) -> Tuple[Decimal, Decimal, Decimal]:
     btc_change = (btc_now - btc_prev) / btc_prev * Decimal("100")
     eth_change = (eth_now - eth_prev) / eth_prev * Decimal("100")
     return btc_change, eth_change, eth_change - btc_change
 
 
-# =============================================================================
-# Freshness Check
-# =============================================================================
 def is_data_fresh(now, btc_updated, eth_updated) -> bool:
     threshold = timedelta(minutes=FRESHNESS_THRESHOLD_MINUTES)
     return (
@@ -1374,10 +1766,13 @@ def is_data_fresh(now, btc_updated, eth_updated) -> bool:
 # State Reset Helper
 # =============================================================================
 def reset_to_scan() -> None:
-    """Reset semua global state ke kondisi SCAN."""
+    """Reset semua global state ke kondisi SCAN, catat waktu exit untuk cooldown."""
     global current_mode, active_strategy
     global entry_gap_value, trailing_gap_best
     global entry_btc_price, entry_eth_price, entry_btc_lb, entry_eth_lb
+    global confirm_streak, confirm_side, gap_above_since, tp1_hit, last_exit_time
+
+    last_exit_time    = datetime.now(timezone.utc)
     current_mode      = Mode.SCAN
     active_strategy   = None
     entry_gap_value   = None
@@ -1386,10 +1781,14 @@ def reset_to_scan() -> None:
     entry_eth_price   = None
     entry_btc_lb      = None
     entry_eth_lb      = None
+    confirm_streak    = 0
+    confirm_side      = None
+    gap_above_since   = None
+    tp1_hit           = False
 
 
 # =============================================================================
-# TP + Trailing SL Checker
+# TP + Trailing SL Checker (termasuk TP1)
 # =============================================================================
 def check_sltp(
     gap_float: float,
@@ -1397,107 +1796,74 @@ def check_sltp(
     eth_ret:   Decimal,
     gap:       Decimal,
 ) -> bool:
-    """
-    Cek TP dan Trailing SL saat Mode TRACK.
-
-    TP = exit_threshold (gap konvergen maksimal):
-        S1: gap <= +exit_threshold
-        S2: gap >= -exit_threshold
-
-    Trailing SL:
-        S1: trailing_gap_best = min gap sejak entry
-            TSL = trailing_gap_best + sl_pct
-            Trigger jika gap >= TSL
-
-        S2: trailing_gap_best = max gap sejak entry
-            TSL = trailing_gap_best - sl_pct
-            Trigger jika gap <= TSL
-
-    Return True jika TP atau TSL terpicu.
-    """
-    global trailing_gap_best
+    global trailing_gap_best, tp1_hit
 
     if entry_gap_value is None or active_strategy is None or trailing_gap_best is None:
         return False
 
-    exit_thresh = settings["exit_threshold"]
-    sl_pct      = settings["sl_pct"]
+    et     = settings["exit_threshold"]
+    sl_pct = settings["sl_pct"]
 
     if active_strategy == Strategy.S1:
-        # Update trailing best (min gap — makin kecil makin bagus untuk S1)
         if gap_float < trailing_gap_best:
             trailing_gap_best = gap_float
-            logger.info(
-                f"TSL S1 updated. Best: {trailing_gap_best:.2f}%, "
-                f"TSL: {trailing_gap_best + sl_pct:.2f}%"
-            )
+            logger.info(f"TSL S1 updated. Best: {trailing_gap_best:.2f}%, TSL: {trailing_gap_best + sl_pct:.2f}%")
 
         tsl_level = trailing_gap_best + sl_pct
 
-        # Cek TP dulu
-        if gap_float <= exit_thresh:
+        # TP1
+        if settings["tp1_enabled"] and not tp1_hit:
+            tp1_level = calc_tp1_level(Strategy.S1, entry_gap_value)
+            if gap_float <= tp1_level:
+                tp1_hit      = True
+                eth_tp1, _  = calc_eth_price_at_gap(tp1_level)
+                send_alert(build_tp1_message(btc_ret, eth_ret, gap, entry_gap_value, tp1_level, eth_tp1))
+                logger.info(f"TP1 S1. Entry: {entry_gap_value:.2f}%, TP1: {tp1_level:.2f}%, Now: {gap_float:.2f}%")
+                # Lanjut tracking ke TP2 — tidak return
+
+        # TP2
+        if gap_float <= et:
             eth_target, _ = calc_tp_target_price(Strategy.S1)
-            send_alert(build_tp_message(
-                btc_ret, eth_ret, gap,
-                entry_gap_value, exit_thresh, eth_target
-            ))
-            logger.info(
-                f"TP S1. Entry: {entry_gap_value:.2f}%, "
-                f"Now: {gap_float:.2f}%, TP: {exit_thresh:.2f}%"
-            )
+            send_alert(build_tp_message(btc_ret, eth_ret, gap, entry_gap_value, et, eth_target))
+            logger.info(f"TP2 S1. Entry: {entry_gap_value:.2f}%, Now: {gap_float:.2f}%")
             reset_to_scan()
             return True
 
-        # Cek TSL
+        # TSL
         if gap_float >= tsl_level:
-            send_alert(build_trailing_sl_message(
-                btc_ret, eth_ret, gap,
-                entry_gap_value, trailing_gap_best, tsl_level
-            ))
-            logger.info(
-                f"TSL S1. Entry: {entry_gap_value:.2f}%, "
-                f"Best: {trailing_gap_best:.2f}%, "
-                f"TSL: {tsl_level:.2f}%, Now: {gap_float:.2f}%"
-            )
+            send_alert(build_trailing_sl_message(btc_ret, eth_ret, gap, entry_gap_value, trailing_gap_best, tsl_level))
+            logger.info(f"TSL S1. Best: {trailing_gap_best:.2f}%, TSL: {tsl_level:.2f}%, Now: {gap_float:.2f}%")
             reset_to_scan()
             return True
 
     elif active_strategy == Strategy.S2:
-        # Update trailing best (max gap — makin besar/positif makin bagus untuk S2)
         if gap_float > trailing_gap_best:
             trailing_gap_best = gap_float
-            logger.info(
-                f"TSL S2 updated. Best: {trailing_gap_best:.2f}%, "
-                f"TSL: {trailing_gap_best - sl_pct:.2f}%"
-            )
+            logger.info(f"TSL S2 updated. Best: {trailing_gap_best:.2f}%, TSL: {trailing_gap_best - sl_pct:.2f}%")
 
         tsl_level = trailing_gap_best - sl_pct
 
-        # Cek TP dulu
-        if gap_float >= -exit_thresh:
+        # TP1
+        if settings["tp1_enabled"] and not tp1_hit:
+            tp1_level = calc_tp1_level(Strategy.S2, entry_gap_value)
+            if gap_float >= tp1_level:
+                tp1_hit     = True
+                eth_tp1, _ = calc_eth_price_at_gap(tp1_level)
+                send_alert(build_tp1_message(btc_ret, eth_ret, gap, entry_gap_value, tp1_level, eth_tp1))
+                logger.info(f"TP1 S2. Entry: {entry_gap_value:.2f}%, TP1: {tp1_level:.2f}%, Now: {gap_float:.2f}%")
+
+        # TP2
+        if gap_float >= -et:
             eth_target, _ = calc_tp_target_price(Strategy.S2)
-            send_alert(build_tp_message(
-                btc_ret, eth_ret, gap,
-                entry_gap_value, -exit_thresh, eth_target
-            ))
-            logger.info(
-                f"TP S2. Entry: {entry_gap_value:.2f}%, "
-                f"Now: {gap_float:.2f}%, TP: {-exit_thresh:.2f}%"
-            )
+            send_alert(build_tp_message(btc_ret, eth_ret, gap, entry_gap_value, -et, eth_target))
+            logger.info(f"TP2 S2. Entry: {entry_gap_value:.2f}%, Now: {gap_float:.2f}%")
             reset_to_scan()
             return True
 
-        # Cek TSL
+        # TSL
         if gap_float <= tsl_level:
-            send_alert(build_trailing_sl_message(
-                btc_ret, eth_ret, gap,
-                entry_gap_value, trailing_gap_best, tsl_level
-            ))
-            logger.info(
-                f"TSL S2. Entry: {entry_gap_value:.2f}%, "
-                f"Best: {trailing_gap_best:.2f}%, "
-                f"TSL: {tsl_level:.2f}%, Now: {gap_float:.2f}%"
-            )
+            send_alert(build_trailing_sl_message(btc_ret, eth_ret, gap, entry_gap_value, trailing_gap_best, tsl_level))
+            logger.info(f"TSL S2. Best: {trailing_gap_best:.2f}%, TSL: {tsl_level:.2f}%, Now: {gap_float:.2f}%")
             reset_to_scan()
             return True
 
@@ -1505,8 +1871,7 @@ def check_sltp(
 
 
 # =============================================================================
-# State Machine with Peak Detection
-# [UPDATED] peak_enabled toggle menentukan apakah PEAK_WATCH digunakan
+# State Machine
 # =============================================================================
 def evaluate_and_transition(
     btc_ret: Decimal,
@@ -1516,79 +1881,123 @@ def evaluate_and_transition(
     eth_now: Decimal,
     btc_lb:  Decimal,
     eth_lb:  Decimal,
+    now:     datetime,
 ) -> None:
     global current_mode, active_strategy, peak_gap, peak_strategy
     global entry_gap_value, trailing_gap_best
     global entry_btc_price, entry_eth_price, entry_btc_lb, entry_eth_lb
+    global confirm_streak, confirm_side, gap_above_since
+    global prev_gap_float, prev_gap_time, current_velocity
+    global signal_timestamps
 
     gap_float      = float(gap)
     entry_thresh   = settings["entry_threshold"]
     exit_thresh    = settings["exit_threshold"]
     invalid_thresh = settings["invalidation_threshold"]
     peak_reversal  = settings["peak_reversal"]
-    peak_enabled   = settings["peak_enabled"]   # [NEW]
+    peak_enabled   = settings["peak_enabled"]
 
-    # -------------------------------------------------------------------------
+    # ── Velocity tracking (update setiap eval, semua mode) ────────────────────
+    if prev_gap_float is not None and prev_gap_time is not None:
+        elapsed_m = (now - prev_gap_time).total_seconds() / 60
+        current_velocity = (
+            (gap_float - prev_gap_float) / elapsed_m
+            if elapsed_m > 0 else 0.0
+        )
+    else:
+        current_velocity = None
+    prev_gap_float = gap_float
+    prev_gap_time  = now
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Clean up signal timestamps (rolling 1h) ───────────────────────────────
+    cutoff_1h = now - timedelta(hours=1)
+    signal_timestamps[:] = [t for t in signal_timestamps if t >= cutoff_1h]
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # =========================================================================
     if current_mode == Mode.SCAN:
+
+        # ── Tentukan kandidat side ────────────────────────────────────────────
         if gap_float >= entry_thresh:
-            if peak_enabled:
-                # [ORIGINAL] masuk PEAK_WATCH dulu
-                current_mode  = Mode.PEAK_WATCH
-                peak_strategy = Strategy.S1
-                peak_gap      = gap_float
-                send_alert(build_peak_watch_message(Strategy.S1, gap))
-                logger.info(f"PEAK WATCH S1 started. Gap: {gap_float:.2f}%")
-            else:
-                # [NEW] langsung TRACK
-                active_strategy   = Strategy.S1
-                current_mode      = Mode.TRACK
-                entry_gap_value   = gap_float
-                trailing_gap_best = gap_float
-                entry_btc_price   = btc_now
-                entry_eth_price   = eth_now
-                entry_btc_lb      = btc_lb
-                entry_eth_lb      = eth_lb
-                send_alert(
-                    build_direct_entry_message(Strategy.S1, btc_ret, eth_ret, gap)
-                )
-                logger.info(
-                    f"DIRECT ENTRY S1 (peak OFF). Gap: {gap_float:.2f}%"
-                )
-
+            candidate = "S1"
         elif gap_float <= -entry_thresh:
-            if peak_enabled:
-                # [ORIGINAL] masuk PEAK_WATCH dulu
-                current_mode  = Mode.PEAK_WATCH
-                peak_strategy = Strategy.S2
-                peak_gap      = gap_float
-                send_alert(build_peak_watch_message(Strategy.S2, gap))
-                logger.info(f"PEAK WATCH S2 started. Gap: {gap_float:.2f}%")
-            else:
-                # [NEW] langsung TRACK
-                active_strategy   = Strategy.S2
-                current_mode      = Mode.TRACK
-                entry_gap_value   = gap_float
-                trailing_gap_best = gap_float
-                entry_btc_price   = btc_now
-                entry_eth_price   = eth_now
-                entry_btc_lb      = btc_lb
-                entry_eth_lb      = eth_lb
-                send_alert(
-                    build_direct_entry_message(Strategy.S2, btc_ret, eth_ret, gap)
-                )
-                logger.info(
-                    f"DIRECT ENTRY S2 (peak OFF). Gap: {gap_float:.2f}%"
-                )
+            candidate = "S2"
+        else:
+            candidate = None
 
+        # ── Update confirm streak & mindur ────────────────────────────────────
+        if candidate is not None:
+            if confirm_side != candidate:
+                # Side baru / berganti arah — reset streak
+                confirm_streak  = 0
+                gap_above_since = now
+                confirm_side    = candidate
+            confirm_streak += 1
+        else:
+            # Gap turun di bawah threshold — reset semua
+            confirm_streak  = 0
+            confirm_side    = None
+            gap_above_since = None
+
+        # ── Cek apakah streak dan durasi terpenuhi ────────────────────────────
+        if candidate is not None:
+            streak_ok = confirm_streak >= settings["confirm_count"]
+            dur_ok    = (
+                settings["mindur_minutes"] <= 0
+                or gap_above_since is None
+                or (now - gap_above_since).total_seconds() / 60 >= settings["mindur_minutes"]
+            )
+
+            if not streak_ok:
+                logger.info(
+                    f"SCAN: Streak {confirm_streak}/{settings['confirm_count']} "
+                    f"({candidate}), gap {gap_float:+.2f}%"
+                )
+            elif not dur_ok:
+                elapsed_dur = (now - gap_above_since).total_seconds() / 60 if gap_above_since else 0
+                logger.info(
+                    f"SCAN: Duration {elapsed_dur:.1f}m / {settings['mindur_minutes']}m "
+                    f"({candidate}), gap {gap_float:+.2f}%"
+                )
+            else:
+                strategy  = Strategy.S1 if candidate == "S1" else Strategy.S2
+                allowed, reason = check_entry_gates(gap_float, strategy, now)
+
+                if not allowed:
+                    logger.info(build_entry_blocked_message(reason, gap_float, strategy))
+                else:
+                    # ✅ Semua gate lolos
+                    confirm_streak  = 0
+                    confirm_side    = None
+                    gap_above_since = None
+
+                    if peak_enabled:
+                        # Masuk PEAK_WATCH
+                        current_mode  = Mode.PEAK_WATCH
+                        peak_strategy = strategy
+                        peak_gap      = gap_float
+                        send_alert(build_peak_watch_message(strategy, gap))
+                        logger.info(f"PEAK WATCH {strategy.value}. Gap: {gap_float:.2f}%")
+                    else:
+                        # Langsung TRACK
+                        active_strategy   = strategy
+                        current_mode      = Mode.TRACK
+                        entry_gap_value   = gap_float
+                        trailing_gap_best = gap_float
+                        entry_btc_price   = btc_now
+                        entry_eth_price   = eth_now
+                        entry_btc_lb      = btc_lb
+                        entry_eth_lb      = eth_lb
+                        signal_timestamps.append(now)
+                        send_alert(build_direct_entry_message(strategy, btc_ret, eth_ret, gap))
+                        logger.info(f"DIRECT ENTRY {strategy.value} (peak OFF). Gap: {gap_float:.2f}%")
         else:
             logger.debug(f"SCAN: No signal. Gap: {gap_float:.2f}%")
 
-    # -------------------------------------------------------------------------
-    # PEAK_WATCH — hanya bisa aktif kalau peak_enabled=True
-    # Jika peak_enabled di-OFF di tengah jalan, _cancel_peak_watch_if_active
-    # sudah handle reset. Block ini tidak akan tercapai saat peak OFF.
-    # -------------------------------------------------------------------------
+    # =========================================================================
     elif current_mode == Mode.PEAK_WATCH:
+
         if peak_strategy == Strategy.S1:
             if gap_float > peak_gap:
                 peak_gap = gap_float
@@ -1598,6 +2007,9 @@ def evaluate_and_transition(
                 send_alert(build_peak_cancelled_message(Strategy.S1, gap))
                 logger.info(f"PEAK WATCH S1 cancelled. Gap: {gap_float:.2f}%")
                 current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
+                confirm_streak = 0
+                confirm_side   = None
+                gap_above_since = None
 
             elif peak_gap - gap_float >= peak_reversal:
                 active_strategy   = Strategy.S1
@@ -1608,12 +2020,9 @@ def evaluate_and_transition(
                 entry_eth_price   = eth_now
                 entry_btc_lb      = btc_lb
                 entry_eth_lb      = eth_lb
-                send_alert(
-                    build_entry_message(Strategy.S1, btc_ret, eth_ret, gap, peak_gap)
-                )
-                logger.info(
-                    f"ENTRY S1. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%"
-                )
+                signal_timestamps.append(now)
+                send_alert(build_entry_message(Strategy.S1, btc_ret, eth_ret, gap, peak_gap))
+                logger.info(f"ENTRY S1. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%")
                 peak_gap, peak_strategy = None, None
 
             else:
@@ -1631,6 +2040,9 @@ def evaluate_and_transition(
                 send_alert(build_peak_cancelled_message(Strategy.S2, gap))
                 logger.info(f"PEAK WATCH S2 cancelled. Gap: {gap_float:.2f}%")
                 current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
+                confirm_streak  = 0
+                confirm_side    = None
+                gap_above_since = None
 
             elif gap_float - peak_gap >= peak_reversal:
                 active_strategy   = Strategy.S2
@@ -1641,12 +2053,9 @@ def evaluate_and_transition(
                 entry_eth_price   = eth_now
                 entry_btc_lb      = btc_lb
                 entry_eth_lb      = eth_lb
-                send_alert(
-                    build_entry_message(Strategy.S2, btc_ret, eth_ret, gap, peak_gap)
-                )
-                logger.info(
-                    f"ENTRY S2. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%"
-                )
+                signal_timestamps.append(now)
+                send_alert(build_entry_message(Strategy.S2, btc_ret, eth_ret, gap, peak_gap))
+                logger.info(f"ENTRY S2. Peak: {peak_gap:.2f}%, Entry: {gap_float:.2f}%")
                 peak_gap, peak_strategy = None, None
 
             else:
@@ -1655,22 +2064,22 @@ def evaluate_and_transition(
                     f"Peak {peak_gap:.2f}% | Need {peak_reversal}% rise"
                 )
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     elif current_mode == Mode.TRACK:
-        # TP/TSL dicek duluan
+
         if check_sltp(gap_float, btc_ret, eth_ret, gap):
             return
 
-        # Safety net exit — jaga-jaga kalau exit_thresh berubah di tengah jalan
+        # Safety net exit
         if active_strategy == Strategy.S1 and gap_float <= exit_thresh:
             send_alert(build_exit_message(btc_ret, eth_ret, gap))
-            logger.info(f"EXIT S1 triggered. Gap: {gap_float:.2f}%")
+            logger.info(f"EXIT S1. Gap: {gap_float:.2f}%")
             reset_to_scan()
             return
 
         if active_strategy == Strategy.S2 and gap_float >= -exit_thresh:
             send_alert(build_exit_message(btc_ret, eth_ret, gap))
-            logger.info(f"EXIT S2 triggered. Gap: {gap_float:.2f}%")
+            logger.info(f"EXIT S2. Gap: {gap_float:.2f}%")
             reset_to_scan()
             return
 
@@ -1689,7 +2098,9 @@ def evaluate_and_transition(
 
         logger.debug(
             f"TRACK {active_strategy.value if active_strategy else 'None'}: "
-            f"Gap {gap_float:.2f}%"
+            f"Gap {gap_float:.2f}% | Vel {current_velocity:+.4f}%/m"
+            if current_velocity is not None
+            else f"TRACK {active_strategy.value if active_strategy else 'None'}: Gap {gap_float:.2f}%"
         )
 
 
@@ -1707,44 +2118,47 @@ def send_startup_message() -> bool:
             f"└─────────────────────\n"
         )
     else:
-        price_info = (
-            "\n⚠️ Ara ara~ Akeno gagal ambil harga tadi... "
-            "Tapi Akeno akan terus coba~ (◕ω◕)\n"
-        )
+        price_info = "\n⚠️ Gagal ambil harga tadi~ Akeno terus coba~ (◕ω◕)\n"
 
     lb           = get_lookback_label()
     hours_loaded = len(price_history) * settings["scan_interval"] / 3600
+    history_info = (
+        f"⚡ History dari Bot A: *{hours_loaded:.1f}h* siap!\n"
+        if len(price_history) > 0
+        else f"⏳ Menunggu Bot A kirim data~ Sinyal setelah {lb} data tersedia~\n"
+    )
 
-    if len(price_history) > 0:
-        history_info = (
-            f"⚡ History dari Bot A sudah ada~ *{hours_loaded:.1f}h* data siap!\n"
-            f"_Akeno tidak perlu mulai dari nol lagi~ Ufufufu... (◕‿◕)_\n"
-        )
-    else:
-        history_info = (
-            f"⏳ Menunggu Bot A kirim data ke Redis~\n"
-            f"_Sinyal akan keluar setelah {lb} data tersedia~_\n"
-        )
+    peak_str    = "✅ ON" if settings["peak_enabled"] else "❌ OFF (direct entry)"
+    cd          = settings["cooldown_minutes"]
+    cc          = settings["confirm_count"]
+    vm          = settings["velocity_min"]
+    se          = settings["session_enabled"]
+    ms          = settings["maxsig_per_hour"]
+    t1e         = settings["tp1_enabled"]
+    md          = settings["mindur_minutes"]
 
-    peak_mode_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF (direct entry)"
+    scalping_lines = (
+        f"🕐 Cooldown: {cd}m | ✔️ Confirm: {cc} scan\n"
+        f"🚀 Velocity: {vm if vm > 0 else 'Off'} | 🌏 Session: {'ON '+settings['session_mode'] if se else 'Off'}\n"
+        f"🔢 MaxSig: {ms if ms > 0 else 'Off'}/h | 🎯 TP1: {'ON '+str(int(settings['tp1_ratio']*100))+'%' if t1e else 'Off'}\n"
+        f"⏱ MinDur: {md if md > 0 else 'Off'}m\n"
+    )
 
     return send_alert(
         f"………\n"
-        f"Ara ara~ Akeno (Bot B) sudah siap, sayangku~ Ufufufu... (◕‿◕)\n"
+        f"Ara ara~ Akeno (Bot B) sudah siap~ Ufufufu... (◕‿◕)\n"
         f"{price_info}\n"
-        f"📊 Scan setiap {settings['scan_interval']}s | "
-        f"Redis refresh setiap {settings['redis_refresh_minutes']} menit\n"
-        f"📈 Entry: ±{settings['entry_threshold']}%\n"
-        f"📉 Exit: ±{settings['exit_threshold']}%\n"
-        f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
-        f"🔍 Peak Mode: {peak_mode_str}\n"
+        f"📊 Scan: {settings['scan_interval']}s | Redis refresh: {settings['redis_refresh_minutes']}m\n"
+        f"📈 Entry: ±{settings['entry_threshold']}% | 📉 Exit: ±{settings['exit_threshold']}%\n"
+        f"⚠️ Invalid: ±{settings['invalidation_threshold']}% | 🔍 Peak: {peak_str}\n"
         f"🎯 Peak reversal: {settings['peak_reversal']}%\n"
-        f"✅ TP: saat gap ±{settings['exit_threshold']}% _(max konvergen)_\n"
-        f"🛑 Trailing SL: {settings['sl_pct']}% distance\n"
-        f"🔒 Redis: Read-Only (Bot A yang write)\n"
+        f"✅ TP2: ±{settings['exit_threshold']}% | 🛑 TSL: {settings['sl_pct']}%\n"
+        f"🔒 Redis: Read-Only\n"
         f"\n"
+        f"*⚡ Scalping:*\n"
+        f"{scalping_lines}\n"
         f"{history_info}\n"
-        f"Ketik `/help` kalau butuh sesuatu. "
+        f"Ketik `/help` atau `/scalping` untuk info lebih lanjut~\n"
         f"Akeno takkan pergi, takkan ninggalin kamu sendirian. ⚡"
     )
 
@@ -1768,28 +2182,29 @@ def main_loop() -> None:
     global last_heartbeat_time, last_redis_refresh
 
     logger.info("=" * 60)
-    logger.info("Monk Bot B — Read-Only Redis | Max TP | Trailing SL")
+    logger.info("Monk Bot B — Read-Only Redis | TP1+TP2 | TSL | Scalping")
     logger.info(
-        f"Entry: {settings['entry_threshold']}% | "
-        f"Exit/TP: {settings['exit_threshold']}% | "
-        f"Invalid: {settings['invalidation_threshold']}% | "
-        f"Peak: {settings['peak_reversal']}% | "
-        f"Peak Mode: {'ON' if settings['peak_enabled'] else 'OFF'} | "
-        f"TSL: {settings['sl_pct']}% | "
-        f"Redis refresh: {settings['redis_refresh_minutes']}m"
+        f"Entry: {settings['entry_threshold']}% | Exit/TP: {settings['exit_threshold']}% | "
+        f"Invalid: {settings['invalidation_threshold']}% | Peak: {settings['peak_reversal']}% | "
+        f"Peak Mode: {'ON' if settings['peak_enabled'] else 'OFF'} | TSL: {settings['sl_pct']}%"
+    )
+    logger.info(
+        f"Scalping — Cooldown: {settings['cooldown_minutes']}m | "
+        f"Confirm: {settings['confirm_count']} | Velocity: {settings['velocity_min']} | "
+        f"Session: {'ON '+settings['session_mode'] if settings['session_enabled'] else 'OFF'} | "
+        f"MaxSig: {settings['maxsig_per_hour']} | "
+        f"TP1: {'ON' if settings['tp1_enabled'] else 'OFF'} | "
+        f"MinDur: {settings['mindur_minutes']}m"
     )
     logger.info("=" * 60)
 
     threading.Thread(target=command_polling_thread, daemon=True).start()
     logger.info("Command listener started")
 
-    # Load history dari Redis (read-only), prune expired
     load_history()
     prune_history(datetime.now(timezone.utc))
     last_redis_refresh = datetime.now(timezone.utc)
-    logger.info(
-        f"History after initial load & prune: {len(price_history)} points"
-    )
+    logger.info(f"History after initial load & prune: {len(price_history)} points")
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         send_startup_message()
@@ -1800,15 +2215,12 @@ def main_loop() -> None:
         try:
             now = datetime.now(timezone.utc)
 
-            # Heartbeat
             if should_send_heartbeat(now):
                 if send_heartbeat():
                     last_heartbeat_time = now
 
-            # Refresh history dari Redis setiap 1 menit
             refresh_history_from_redis(now)
 
-            # Fetch harga terkini dari API
             price_data = fetch_prices()
             if price_data is None:
                 logger.warning("Failed to fetch prices")
@@ -1817,15 +2229,9 @@ def main_loop() -> None:
                 scan_stats["last_btc_price"] = price_data.btc_price
                 scan_stats["last_eth_price"] = price_data.eth_price
 
-                if not is_data_fresh(
-                    now,
-                    price_data.btc_updated_at,
-                    price_data.eth_updated_at,
-                ):
+                if not is_data_fresh(now, price_data.btc_updated_at, price_data.eth_updated_at):
                     logger.warning("Data not fresh, skipping")
                 else:
-                    # Bot B tidak append ke price_history sendiri
-                    # — semua data lookback dari Redis (Bot A)
                     price_then = get_lookback_price(now)
 
                     if price_then is None:
@@ -1847,10 +2253,8 @@ def main_loop() -> None:
 
                         logger.info(
                             f"Mode: {current_mode.value} | "
-                            f"BTC {settings['lookback_hours']}h: "
-                            f"{format_value(btc_ret)}% | "
-                            f"ETH {settings['lookback_hours']}h: "
-                            f"{format_value(eth_ret)}% | "
+                            f"BTC {settings['lookback_hours']}h: {format_value(btc_ret)}% | "
+                            f"ETH {settings['lookback_hours']}h: {format_value(eth_ret)}% | "
                             f"Gap: {format_value(gap)}%"
                         )
 
@@ -1861,6 +2265,7 @@ def main_loop() -> None:
                             price_data.eth_price,
                             price_then.btc,
                             price_then.eth,
+                            now,
                         )
                         if current_mode != prev_mode:
                             scan_stats["signals_sent"] += 1
