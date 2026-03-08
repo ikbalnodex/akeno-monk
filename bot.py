@@ -723,11 +723,109 @@ def handle_status_command(reply_chat: str) -> None:
         if hours_of_data >= lookback
         else f"⏳ {hours_of_data:.1f}h / {lookback}h"
     )
-    peak_str  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
-    peak_line = (
-        f"Peak Gap: {peak_gap:+.2f}%\n"
-        if current_mode == Mode.PEAK_WATCH and peak_gap is not None else ""
-    )
+    now      = datetime.now(timezone.utc)
+    peak_str = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+
+    # ── SCAN mode: tampilkan gap sekarang + progress menuju entry ─────────────
+    scan_lines = ""
+    if current_mode == Mode.SCAN:
+        gap_now  = scan_stats.get("last_gap")
+        btc_now  = scan_stats.get("last_btc_ret")
+        eth_now  = scan_stats.get("last_eth_ret")
+        et       = settings["entry_threshold"]
+
+        gap_str  = format_value(gap_now) + "%" if gap_now is not None else "N/A"
+        btc_str  = format_value(btc_now) + "%" if btc_now is not None else "N/A"
+        eth_str  = format_value(eth_now) + "%" if eth_now is not None else "N/A"
+
+        # Kandidat strategy dari confirm_side
+        if confirm_side == "S1":
+            cand_str = "🔍 Kandidat *S1* (Long BTC / Short ETH)"
+        elif confirm_side == "S2":
+            cand_str = "🔍 Kandidat *S2* (Long ETH / Short BTC)"
+        else:
+            cand_str = "💤 Belum ada kandidat"
+
+        # Confirm progress
+        cc = settings["confirm_count"]
+        if cc > 1 and confirm_side is not None:
+            confirm_bar = "█" * confirm_streak + "░" * (cc - confirm_streak)
+            confirm_info = f"Confirm: `{confirm_bar}` {confirm_streak}/{cc}"
+        else:
+            confirm_info = "Confirm: Off"
+
+        # Min duration progress
+        mindur_info = ""
+        md = settings["mindur_minutes"]
+        if md > 0 and gap_above_since is not None:
+            elapsed_dur = (now - gap_above_since).total_seconds() / 60
+            mindur_info = f"\nMinDur:  {elapsed_dur:.1f}m / {md}m"
+
+        # Gate checks
+        gates = []
+        cd = settings["cooldown_minutes"]
+        if cd > 0:
+            if last_exit_time is None:
+                gates.append("✅ Cooldown clear")
+            else:
+                elapsed_cd = (now - last_exit_time).total_seconds() / 60
+                remaining  = cd - elapsed_cd
+                gates.append(
+                    "✅ Cooldown clear"
+                    if remaining <= 0
+                    else f"⏳ Cooldown {remaining:.1f}m"
+                )
+        if settings["session_enabled"]:
+            in_sess = is_in_session(now)
+            gates.append(
+                f"✅ Session active ({settings['session_mode']})"
+                if in_sess
+                else f"⏸ Session inactive ({settings['session_mode']})"
+            )
+        ms = settings["maxsig_per_hour"]
+        if ms > 0:
+            cutoff  = now - timedelta(hours=1)
+            sigs_1h = len([t for t in signal_timestamps if t >= cutoff])
+            gates.append(
+                f"✅ Sig {sigs_1h}/{ms}/h"
+                if sigs_1h < ms
+                else f"🚫 MaxSig {sigs_1h}/{ms}/h"
+            )
+        vm = settings["velocity_min"]
+        if vm > 0:
+            vel = current_velocity
+            vel_str_g = f"{vel:+.4f}%/m" if vel is not None else "N/A"
+            gates.append(f"🚀 Velocity: {vel_str_g} (min {vm})")
+
+        gate_str = " | ".join(gates) if gates else "—"
+
+        scan_lines = (
+            f"\n"
+            f"*Gap sekarang ({settings['lookback_hours']}h):*\n"
+            f"┌─────────────────────\n"
+            f"│ BTC: {btc_str} | ETH: {eth_str}\n"
+            f"│ Gap: *{gap_str}* (entry ±{et}%)\n"
+            f"└─────────────────────\n"
+            f"{cand_str}\n"
+            f"{confirm_info}{mindur_info}\n"
+            f"{gate_str}\n"
+        )
+
+    # ── PEAK_WATCH mode ───────────────────────────────────────────────────────
+    peak_line = ""
+    if current_mode == Mode.PEAK_WATCH and peak_gap is not None:
+        reversal_done = abs(peak_gap - float(scan_stats["last_gap"])) if scan_stats.get("last_gap") is not None else 0
+        peak_line = (
+            f"\n"
+            f"*Peak Watch {peak_strategy.value if peak_strategy else ''}:*\n"
+            f"┌─────────────────────\n"
+            f"│ Peak:    {peak_gap:+.2f}%\n"
+            f"│ Gap now: {format_value(scan_stats['last_gap'])}%\n"
+            f"│ Reversal: {reversal_done:.2f}% / {settings['peak_reversal']}% needed\n"
+            f"└─────────────────────\n"
+        )
+
+    # ── TRACK mode ────────────────────────────────────────────────────────────
     track_lines = ""
     if current_mode == Mode.TRACK and entry_gap_value is not None and trailing_gap_best is not None:
         et  = settings["exit_threshold"]
@@ -739,47 +837,63 @@ def handle_status_command(reply_chat: str) -> None:
             else trailing_gap_best - sl
         )
         eth_t, _ = calc_tp_target_price(active_strategy)
+        gap_now   = scan_stats.get("last_gap")
+        pnl_str   = ""
+        if gap_now is not None:
+            moved = abs(entry_gap_value - float(gap_now))
+            pnl_str = f"│ Moved:   ~{moved:.2f}%\n"
         tp1_info = ""
         if settings["tp1_enabled"]:
-            tp1_lvl = calc_tp1_level(active_strategy, entry_gap_value)
-            tp1_info = f"│ TP1: {tp1_lvl:+.2f}% {'(hit ✅)' if tp1_hit else ''}\n"
+            tp1_lvl  = calc_tp1_level(active_strategy, entry_gap_value)
+            tp1_info = f"│ TP1:     {tp1_lvl:+.2f}% {'✅ hit' if tp1_hit else '⏳'}\n"
         track_lines = (
-            f"Entry Gap:  {entry_gap_value:+.2f}%\n"
-            f"Best Gap:   {trailing_gap_best:+.2f}%\n"
-            f"TP2 Gap:    {tpl:+.2f}%\n"
-            f"ETH target: {'${:,.2f}'.format(eth_t) if eth_t else 'N/A'}\n"
+            f"\n"
+            f"*Posisi aktif {active_strategy.value}:*\n"
+            f"┌─────────────────────\n"
+            f"│ Entry:   {entry_gap_value:+.2f}%\n"
+            f"│ Gap now: {format_value(scan_stats['last_gap'])}%\n"
+            f"{pnl_str}"
+            f"│ Best:    {trailing_gap_best:+.2f}%\n"
             f"{tp1_info}"
-            f"Trail SL:   {tsl:+.2f}%\n"
+            f"│ TP2:     {tpl:+.2f}%\n"
+            f"│ ETH:     {'${:,.2f}'.format(eth_t) if eth_t else 'N/A'}\n"
+            f"│ TSL:     {tsl:+.2f}%\n"
+            f"└─────────────────────\n"
         )
+
+    # ── Scalping state ringkas ────────────────────────────────────────────────
     cooldown_str = "Off"
-    if settings["cooldown_minutes"] > 0 and last_exit_time is not None:
-        elapsed_cd = (datetime.now(timezone.utc) - last_exit_time).total_seconds() / 60
-        remaining  = settings["cooldown_minutes"] - elapsed_cd
-        cooldown_str = f"✅ clear" if remaining <= 0 else f"⏳ {remaining:.1f}m lagi"
-    confirm_str  = f"{confirm_streak}/{settings['confirm_count']}" if settings["confirm_count"] > 1 else "Off"
-    vel_str      = (
-        f"{current_velocity:+.3f}%/m" if current_velocity is not None else "N/A"
-    )
-    sess_str     = (
-        f"✅ {settings['session_mode']}" if settings["session_enabled"] else "❌ Off"
-    )
+    if settings["cooldown_minutes"] > 0:
+        if last_exit_time is None:
+            cooldown_str = f"✅ clear ({settings['cooldown_minutes']}m)"
+        else:
+            elapsed_cd = (now - last_exit_time).total_seconds() / 60
+            remaining  = settings["cooldown_minutes"] - elapsed_cd
+            cooldown_str = (
+                f"✅ clear ({settings['cooldown_minutes']}m)"
+                if remaining <= 0
+                else f"⏳ {remaining:.1f}m lagi"
+            )
+
+    vel_str  = f"{current_velocity:+.3f}%/m" if current_velocity is not None else "N/A"
+    sess_str = f"✅ {settings['session_mode']}" if settings["session_enabled"] else "❌ Off"
+
     last_r = (
         last_redis_refresh.strftime("%H:%M:%S UTC")
         if last_redis_refresh else "Belum~"
     )
+
     message = (
         "📊 *Status Akeno* Ufufufu... (◕‿◕)\n"
         "\n"
         f"Mode: *{current_mode.value}*\n"
-        f"Strategi: {active_strategy.value if active_strategy else 'Belum ada~'}\n"
+        f"Strategi: {active_strategy.value if active_strategy else '—'}\n"
         f"Peak Mode: {peak_str}\n"
+        f"{scan_lines}"
         f"{peak_line}"
         f"{track_lines}"
-        f"\n"
         f"*Scalping state:*\n"
-        f"Cooldown: {cooldown_str}\n"
-        f"Confirm streak: {confirm_str}\n"
-        f"Velocity: {vel_str}\n"
+        f"Cooldown: {cooldown_str} | Velocity: {vel_str}\n"
         f"Session: {sess_str}\n"
         f"\n"
         f"History: {ready} | Redis: {last_r} 🔒\n"
