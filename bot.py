@@ -133,11 +133,26 @@ scan_stats = {
     "signals_sent":   0,
 }
 
+# Manual position tracker — persisted to Redis, survive restart
+pos_data: dict = {
+    "eth_entry_price": None,  # float
+    "eth_qty":         None,  # float (+long / -short)
+    "eth_leverage":    None,  # float
+    "eth_liq_price":   None,  # float (manual override, opsional)
+    "btc_entry_price": None,
+    "btc_qty":         None,
+    "btc_leverage":    None,
+    "btc_liq_price":   None,
+    "strategy":        None,  # "S1" / "S2"
+    "set_at":          None,  # ISO string
+}
+
 
 # =============================================================================
-# Redis — READ-ONLY
+# Redis — READ-ONLY for history, READ-WRITE for pos_data
 # =============================================================================
-REDIS_KEY = "monk_bot:price_history"
+REDIS_KEY     = "monk_bot:price_history"
+REDIS_KEY_POS = "monk_bot:pos_data"
 
 
 def _redis_request(method: str, path: str, body=None):
@@ -195,6 +210,62 @@ def refresh_history_from_redis(now: datetime) -> None:
     prune_history(now)
     last_redis_refresh = now
     logger.debug(f"Redis refreshed. {len(price_history)} points after prune")
+
+
+def save_pos_data() -> bool:
+    """Simpan pos_data ke Redis supaya survive restart."""
+    if not UPSTASH_REDIS_URL:
+        return False
+    try:
+        payload = json.dumps(pos_data, default=str)
+        # Upstash REST: POST /set/<key> dengan body = value string
+        result  = _redis_request("POST", f"/set/{REDIS_KEY_POS}", body=payload)
+        if result and result.get("result") == "OK":
+            logger.info("pos_data saved to Redis")
+            return True
+        logger.warning(f"save_pos_data unexpected result: {result}")
+        return False
+    except Exception as e:
+        logger.warning(f"save_pos_data failed: {e}")
+        return False
+
+
+def load_pos_data() -> None:
+    """Load pos_data dari Redis saat startup."""
+    global pos_data
+    if not UPSTASH_REDIS_URL:
+        return
+    try:
+        result = _redis_request("GET", f"/get/{REDIS_KEY_POS}")
+        if not result or result.get("result") is None:
+            logger.info("No pos_data in Redis")
+            return
+        data = json.loads(result["result"])
+        # Restore semua field yang valid
+        for k in pos_data:
+            if k in data and data[k] is not None:
+                # Konversi numeric fields
+                if k in ("eth_entry_price", "eth_qty", "eth_leverage", "eth_liq_price",
+                         "btc_entry_price", "btc_qty", "btc_leverage", "btc_liq_price"):
+                    pos_data[k] = float(data[k])
+                else:
+                    pos_data[k] = data[k]
+        logger.info(f"pos_data loaded from Redis: {pos_data.get('strategy')} "
+                    f"ETH@{pos_data.get('eth_entry_price')} BTC@{pos_data.get('btc_entry_price')}")
+    except Exception as e:
+        logger.warning(f"load_pos_data failed: {e}")
+
+
+def clear_pos_data_redis() -> bool:
+    """Hapus pos_data dari Redis."""
+    if not UPSTASH_REDIS_URL:
+        return False
+    try:
+        _redis_request("POST", f"/del/{REDIS_KEY_POS}")
+        return True
+    except Exception as e:
+        logger.warning(f"clear_pos_data_redis failed: {e}")
+        return False
 
 
 # =============================================================================
@@ -303,6 +374,10 @@ def process_commands() -> None:
             "/ratio":     lambda: handle_ratio_command(chat_id),
             "/pnl":       lambda: handle_pnl_command(chat_id),
             "/analysis":  lambda: handle_analysis_command(chat_id),
+            # — Position Health Tracker —
+            "/setpos":    lambda: handle_setpos_command(args, chat_id),
+            "/health":    lambda: handle_health_command(chat_id),
+            "/clearpos":  lambda: handle_clearpos_command(chat_id),
         }
         if command in dispatch:
             dispatch[command]()
@@ -537,6 +612,316 @@ def get_pairs_health(
     elif progress >= 20: return "🔵", f"Mulai bergerak. Progress {progress:.0f}%"
     elif progress >= 0:  return "⚪", f"Belum banyak bergerak. Progress {progress:.0f}%"
     else:                return "🔴", f"Berlawanan arah. Progress {progress:.0f}%"
+
+
+# =============================================================================
+# ─── POSITION HEALTH ENGINE ──────────────────────────────────────────────────
+# =============================================================================
+
+def calc_position_pnl() -> dict:
+    """
+    Hitung P&L, margin, dan kesehatan tiap leg dari pos_data + harga sekarang.
+    Returns empty dict jika data tidak lengkap.
+    """
+    if pos_data["eth_entry_price"] is None or pos_data["btc_entry_price"] is None:
+        return {}
+    btc_now = scan_stats.get("last_btc_price")
+    eth_now = scan_stats.get("last_eth_price")
+    if btc_now is None or eth_now is None:
+        return {}
+    try:
+        eth_entry = pos_data["eth_entry_price"]
+        eth_qty   = pos_data["eth_qty"]           # +long / -short
+        eth_lev   = pos_data["eth_leverage"] or 1.0
+        btc_entry = pos_data["btc_entry_price"]
+        btc_qty   = pos_data["btc_qty"]
+        btc_lev   = pos_data["btc_leverage"] or 1.0
+        eth_p     = float(eth_now)
+        btc_p     = float(btc_now)
+
+        eth_notional   = abs(eth_qty) * eth_entry
+        btc_notional   = abs(btc_qty) * btc_entry
+        eth_margin     = eth_notional / eth_lev
+        btc_margin     = btc_notional / btc_lev
+        total_margin   = eth_margin + btc_margin
+        total_notional = eth_notional + btc_notional
+
+        # PnL signed: long profit saat naik, short profit saat turun
+        eth_pnl = eth_qty * (eth_p - eth_entry)
+        btc_pnl = btc_qty * (btc_p - btc_entry)
+        net_pnl = eth_pnl + btc_pnl
+
+        eth_pnl_pct = eth_pnl / eth_margin * 100 if eth_margin > 0 else 0
+        btc_pnl_pct = btc_pnl / btc_margin * 100 if btc_margin > 0 else 0
+        net_pnl_pct = net_pnl / total_margin * 100 if total_margin > 0 else 0
+
+        total_equity = total_margin + net_pnl
+        margin_ratio = total_equity / total_notional * 100 if total_notional > 0 else 0
+
+        # Maintenance margin ~0.5% dari notional (estimasi)
+        maint_margin    = total_notional * 0.005
+        liq_buffer_usd  = total_equity - maint_margin
+        liq_buffer_pct  = liq_buffer_usd / total_equity * 100 if total_equity > 0 else 0
+
+        # Estimasi liq price per leg kalau tidak diisi manual
+        eth_liq = pos_data["eth_liq_price"]
+        btc_liq = pos_data["btc_liq_price"]
+        if eth_liq is None and eth_qty != 0:
+            eth_liq = eth_entry - (eth_margin / eth_qty)  # long: entry - margin/qty; short: entry + margin/|qty|
+        if btc_liq is None and btc_qty != 0:
+            btc_liq = btc_entry - (btc_margin / btc_qty)
+
+        eth_dist_liq = abs(eth_p - eth_liq) / eth_p * 100 if eth_liq else None
+        btc_dist_liq = abs(btc_p - btc_liq) / btc_p * 100 if btc_liq else None
+        eth_danger   = eth_dist_liq is not None and eth_dist_liq < 10
+        btc_danger   = btc_dist_liq is not None and btc_dist_liq < 10
+
+        if margin_ratio >= 10:   health_e, health_label = "🟢", "SEHAT"
+        elif margin_ratio >= 5:  health_e, health_label = "🟡", "PERHATIKAN"
+        elif margin_ratio >= 3:  health_e, health_label = "🟠", "WASPADA"
+        else:                    health_e, health_label = "🔴", "BAHAYA — Dekat Liquidasi!"
+
+        return {
+            "eth_pnl": eth_pnl, "eth_pnl_pct": eth_pnl_pct,
+            "eth_notional": eth_notional, "eth_margin": eth_margin,
+            "eth_lev": eth_lev, "eth_liq_est": eth_liq,
+            "eth_dist_liq": eth_dist_liq, "eth_danger": eth_danger,
+            "btc_pnl": btc_pnl, "btc_pnl_pct": btc_pnl_pct,
+            "btc_notional": btc_notional, "btc_margin": btc_margin,
+            "btc_lev": btc_lev, "btc_liq_est": btc_liq,
+            "btc_dist_liq": btc_dist_liq, "btc_danger": btc_danger,
+            "net_pnl": net_pnl, "net_pnl_pct": net_pnl_pct,
+            "total_margin": total_margin, "total_notional": total_notional,
+            "total_equity": total_equity, "margin_ratio": margin_ratio,
+            "liq_buffer_usd": liq_buffer_usd, "liq_buffer_pct": liq_buffer_pct,
+            "health_emoji": health_e, "health_label": health_label,
+        }
+    except Exception as e:
+        logger.warning(f"calc_position_pnl error: {e}")
+        return {}
+
+
+def build_position_health_message(h: dict) -> str:
+    now     = datetime.now(timezone.utc)
+    set_at  = pos_data.get("set_at")
+    age_str = ""
+    if set_at:
+        try:
+            sa      = datetime.fromisoformat(set_at) if isinstance(set_at, str) else set_at
+            age_min = int((now - sa).total_seconds() / 60)
+            age_str = f" _(diset {age_min}m lalu)_"
+        except Exception:
+            pass
+
+    strat    = pos_data.get("strategy") or "?"
+    eth_p    = float(scan_stats["last_eth_price"]) if scan_stats.get("last_eth_price") else 0
+    btc_p    = float(scan_stats["last_btc_price"]) if scan_stats.get("last_btc_price") else 0
+    eth_qty  = pos_data["eth_qty"]
+    btc_qty  = pos_data["btc_qty"]
+    eth_dir  = "Long 📈" if eth_qty and eth_qty > 0 else "Short 📉"
+    btc_dir  = "Long 📈" if btc_qty and btc_qty > 0 else "Short 📉"
+
+    def _sign(v): return "+" if v >= 0 else ""
+    def _pnl_emoji(v): return "🟢" if v >= 0 else "🔴"
+
+    eth_liq_s  = f"${h['eth_liq_est']:,.2f}" if h.get("eth_liq_est") else "N/A"
+    btc_liq_s  = f"${h['btc_liq_est']:,.2f}" if h.get("btc_liq_est") else "N/A"
+    eth_dist_s = f"{h['eth_dist_liq']:.1f}% jauh" if h.get("eth_dist_liq") else "N/A"
+    btc_dist_s = f"{h['btc_dist_liq']:.1f}% jauh" if h.get("btc_dist_liq") else "N/A"
+    eth_warn   = " ⚠️" if h.get("eth_danger") else " ✅"
+    btc_warn   = " ⚠️" if h.get("btc_danger") else " ✅"
+
+    mr       = h["margin_ratio"]
+    mr_fill  = min(10, int(mr / 2))
+    mr_bar   = "█" * mr_fill + "░" * (10 - mr_fill)
+    lb_pct   = max(0.0, h["liq_buffer_pct"])
+    lb_fill  = min(10, int(lb_pct / 10))
+    lb_bar   = "█" * lb_fill + "░" * (10 - lb_fill)
+
+    danger_note = ""
+    if h.get("eth_danger") or h.get("btc_danger"):
+        legs = []
+        if h.get("eth_danger"): legs.append("ETH")
+        if h.get("btc_danger"): legs.append("BTC")
+        danger_note = f"\n🚨 *PERINGATAN: {'/'.join(legs)} mendekati liq price!*\n"
+
+    return (
+        f"🏥 *Position Health — {strat}*{age_str}\n"
+        f"💰 ETH: ${eth_p:,.2f} | BTC: ${btc_p:,.2f}\n"
+        f"\n"
+        f"*📊 ETH Leg ({eth_dir}):*\n"
+        f"┌─────────────────────\n"
+        f"│ Entry:     ${pos_data['eth_entry_price']:,.2f}\n"
+        f"│ Qty:       {abs(eth_qty):.4f} ETH\n"
+        f"│ Leverage:  {h['eth_lev']:.0f}x\n"
+        f"│ Notional:  ${h['eth_notional']:,.2f}\n"
+        f"│ Margin:    ${h['eth_margin']:,.2f}\n"
+        f"│ UPnL:      {_pnl_emoji(h['eth_pnl'])} {_sign(h['eth_pnl'])}${h['eth_pnl']:,.2f} ({_sign(h['eth_pnl_pct'])}{h['eth_pnl_pct']:.2f}%)\n"
+        f"│ Liq:       {eth_liq_s}{eth_warn} | {eth_dist_s}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*📊 BTC Leg ({btc_dir}):*\n"
+        f"┌─────────────────────\n"
+        f"│ Entry:     ${pos_data['btc_entry_price']:,.2f}\n"
+        f"│ Qty:       {abs(btc_qty):.6f} BTC\n"
+        f"│ Leverage:  {h['btc_lev']:.0f}x\n"
+        f"│ Notional:  ${h['btc_notional']:,.2f}\n"
+        f"│ Margin:    ${h['btc_margin']:,.2f}\n"
+        f"│ UPnL:      {_pnl_emoji(h['btc_pnl'])} {_sign(h['btc_pnl'])}${h['btc_pnl']:,.2f} ({_sign(h['btc_pnl_pct'])}{h['btc_pnl_pct']:.2f}%)\n"
+        f"│ Liq:       {btc_liq_s}{btc_warn} | {btc_dist_s}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*⚖️ Net Pairs:*\n"
+        f"┌─────────────────────\n"
+        f"│ Notional:  ${h['total_notional']:,.2f}\n"
+        f"│ Margin:    ${h['total_margin']:,.2f}\n"
+        f"│ Equity:    ${h['total_equity']:,.2f}\n"
+        f"│ Net UPnL:  {_pnl_emoji(h['net_pnl'])} {_sign(h['net_pnl'])}${h['net_pnl']:,.2f} ({_sign(h['net_pnl_pct'])}{h['net_pnl_pct']:.2f}%)\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*🛡️ Kesehatan Margin:*\n"
+        f"┌─────────────────────\n"
+        f"│ Margin Ratio: {mr:.2f}%\n"
+        f"│ `{mr_bar}` {h['health_emoji']} *{h['health_label']}*\n"
+        f"│ Liq Buffer:   ${h['liq_buffer_usd']:,.2f} ({lb_pct:.1f}%)\n"
+        f"│ `{lb_bar}` buffer sebelum liq\n"
+        f"└─────────────────────\n"
+        f"{danger_note}\n"
+        f"_💡 Pairs trade: nilai NET yang penting, bukan per leg~_\n"
+        f"_Mentor: ETH -68% tapi net +$239 (◕‿◕)_"
+    )
+
+
+# =============================================================================
+# ─── ENTRY READINESS ENGINE ──────────────────────────────────────────────────
+# =============================================================================
+
+def build_entry_readiness(
+    strategy: Strategy,
+    pct_r:    Optional[int],
+    curr_r:   Optional[float],
+    avg_r:    Optional[float],
+    ext:      dict,
+) -> str:
+    gap_now = scan_stats.get("last_gap")
+    btc_r   = scan_stats.get("last_btc_ret")
+    eth_r   = scan_stats.get("last_eth_ret")
+    et      = settings["entry_threshold"]
+    it      = settings["invalidation_threshold"]
+    gap_f   = float(gap_now) if gap_now is not None else 0.0
+    gap_abs = abs(gap_f)
+
+    checks   = []   # (bool|None, label, detail)
+    warnings = []
+
+    # 1. Gap di threshold?
+    correct_side = (gap_f >= et) if strategy == Strategy.S1 else (gap_f <= -et)
+    if correct_side:
+        checks.append((True,  "Gap di zona entry",
+                        f"Gap {gap_f:+.2f}% melewati ±{et}% threshold"))
+    elif gap_abs >= et:
+        checks.append((False, "Gap sisi berlawanan",
+                        f"Gap {gap_f:+.2f}% — salah sisi untuk {strategy.value}"))
+        warnings.append("Gap di sisi yang salah untuk strategi ini")
+    else:
+        checks.append((False, "Gap belum di threshold",
+                        f"Gap {gap_f:+.2f}% | perlu {et - gap_abs:.2f}% lagi ke ±{et}%"))
+        warnings.append(f"Gap masih {et - gap_abs:.2f}% dari threshold")
+
+    # 2. Ratio conviction
+    if pct_r is not None:
+        if strategy == Strategy.S1:
+            ratio_ok     = pct_r >= 60
+            ratio_strong = pct_r >= 75
+            detail       = f"Percentile {pct_r}th — ETH {'mahal ✅' if ratio_ok else 'belum cukup mahal'} vs BTC"
+        else:
+            ratio_ok     = pct_r <= 40
+            ratio_strong = pct_r <= 25
+            detail       = f"Percentile {pct_r}th — ETH {'murah ✅' if ratio_ok else 'belum cukup murah'} vs BTC"
+        label = "Ratio conviction kuat" if ratio_strong else ("Ratio conviction cukup" if ratio_ok else "Ratio conviction lemah")
+        checks.append((ratio_ok, label, detail))
+        if not ratio_ok:
+            warnings.append("ETH/BTC ratio belum ideal — gap bisa melebar lebih jauh sebelum revert")
+    else:
+        checks.append((None, "Ratio N/A", "Butuh lebih banyak history~"))
+
+    # 3. Driver analysis
+    if btc_r is not None and eth_r is not None:
+        driver, _, driver_ex = analyze_gap_driver(float(btc_r), float(eth_r), gap_f)
+        driver_ok = driver in ("ETH-led", "Mixed")
+        checks.append((driver_ok, f"Driver: {driver}", driver_ex))
+        if driver == "BTC-led":
+            if strategy == Strategy.S1:
+                warnings.append("BTC-led di S1: BTC lemah, bukan ETH terlalu mahal — revert lebih lambat")
+            else:
+                warnings.append("BTC-led di S2: BTC kuat, ETH belum tentu bounce cepat")
+    else:
+        checks.append((None, "Driver belum tersedia", "Tunggu data scan~"))
+
+    # 4. Buffer ke invalidation
+    dist_invalid = (it - gap_f) if strategy == Strategy.S1 else (gap_f - (-it))
+    if dist_invalid >= 1.5:
+        checks.append((True,  "Buffer invalidation aman",
+                        f"{dist_invalid:.2f}% sebelum invalidation ±{it}%"))
+    elif dist_invalid >= 0.5:
+        checks.append((True,  "Buffer invalidation tipis",
+                        f"Hanya {dist_invalid:.2f}% sebelum invalidation ±{it}%"))
+        warnings.append(f"Buffer ke invalidation tipis ({dist_invalid:.2f}%) — sizing kecil disarankan")
+    else:
+        checks.append((False, "Terlalu dekat invalidation",
+                        f"Hanya {dist_invalid:.2f}% dari invalidation ±{it}%"))
+        warnings.append("Terlalu dekat invalidation — risiko SL langsung kena tinggi")
+
+    # 5. Z-score statistik
+    z = ext.get("z_score")
+    if z is not None:
+        if strategy == Strategy.S1:
+            z_ok     = z >= 1.0
+            z_detail = f"Z-score {z:+.2f}σ — ETH {'sudah ✅' if z_ok else 'belum'} cukup mahal secara statistik"
+        else:
+            z_ok     = z <= -1.0
+            z_detail = f"Z-score {z:+.2f}σ — ETH {'sudah ✅' if z_ok else 'belum'} cukup murah secara statistik"
+        checks.append((z_ok, f"Z-score {z:+.2f}σ", z_detail))
+        if abs(z) > 3.0:
+            warnings.append(f"Z-score {z:+.2f}σ sangat ekstrem — bisa ada alasan fundamental, bukan sekadar divergence")
+    else:
+        checks.append((None, "Z-score N/A", "Data kurang~"))
+
+    # Hitung skor
+    true_count  = sum(1 for c in checks if c[0] is True)
+    false_count = sum(1 for c in checks if c[0] is False)
+    total_valid = sum(1 for c in checks if c[0] is not None)
+    score_pct   = true_count / total_valid * 100 if total_valid > 0 else 0
+
+    # Verdict
+    if false_count == 0 and true_count >= 4:
+        v_e, verdict, v_d = "🟢", "READY TO ENTRY", "Semua faktor oke — kondisi optimal~"
+    elif not correct_side or false_count >= 2:
+        v_e, verdict, v_d = "🔴", "JANGAN ENTRY DULU", "Terlalu banyak faktor tidak terpenuhi~"
+    elif false_count <= 1 and true_count >= 3:
+        v_e, verdict, v_d = "🟡", "BISA ENTRY, TAPI HATI-HATI", "1 faktor lemah — pertimbangkan sizing lebih kecil~"
+    else:
+        v_e, verdict, v_d = "🟠", "TUNGGU KONFIRMASI", "Beberapa faktor masih meragukan~"
+
+    checklist = ""
+    for ok, label, detail in checks:
+        icon      = "✅" if ok is True else ("❌" if ok is False else "⚪")
+        checklist += f"{icon} *{label}*\n   _{detail}_\n"
+
+    warn_block = ""
+    if warnings:
+        warn_block = "\n*⚠️ Peringatan:*\n" + "".join(f"• {w}\n" for w in warnings)
+
+    return (
+        f"*── Entry Readiness: {strategy.value} ──*\n"
+        f"{v_e} *{verdict}*\n"
+        f"_{v_d}_\n"
+        f"Score: {true_count}/{total_valid} ✅ ({score_pct:.0f}%)\n"
+        f"\n"
+        f"*Checklist:*\n"
+        f"{checklist}"
+        f"{warn_block}"
+    )
 
 
 # =============================================================================
@@ -1985,9 +2370,152 @@ def handle_redis_command(reply_chat: str) -> None:
         send_reply(f"Gagal baca: `{e}` (◕ω◕)", reply_chat)
 
 
+def handle_setpos_command(args: list, reply_chat: str) -> None:
+    """
+    /setpos <S1|S2> eth <entry> <qty> <lev>x btc <entry> <qty> <lev>x
+
+    qty positif = Long, negatif = Short
+    Angka boleh pakai koma ribuan: 2,011.56 ✅
+
+    Contoh S1 (Long BTC / Short ETH):
+      /setpos S1 eth 2,011.56 -1.4907 50x btc 67,794.76 0.029491 50x
+
+    Contoh S2 (Long ETH / Short BTC):
+      /setpos S2 eth 1,956.40 15.58 10x btc 67,586.10 -0.4439 10x
+    """
+    usage = (
+        "*Usage:*\n"
+        "`/setpos <S1|S2> eth <entry> <qty> <lev>x btc <entry> <qty> <lev>x`\n"
+        "\n"
+        "qty *positif* = Long ↑ | qty *negatif* = Short ↓\n"
+        "\n"
+        "*S1* (Long BTC / Short ETH):\n"
+        "`/setpos S1 eth 2011.56 -1.4907 50x btc 67794.76 0.029491 50x`\n"
+        "\n"
+        "*S2* (Long ETH / Short BTC):\n"
+        "`/setpos S2 eth 1956.40 15.58 10x btc 67586.10 -0.4439 10x`"
+    )
+    if len(args) < 9:
+        send_reply(usage, reply_chat)
+        return
+    try:
+        strat_str = args[0].upper()
+        if strat_str not in ("S1", "S2"):
+            send_reply("Strategi harus *S1* atau *S2*~ (◕ω◕)", reply_chat)
+            return
+        if args[1].lower() != "eth" or args[5].lower() != "btc":
+            send_reply(usage, reply_chat)
+            return
+
+        def _pf(s: str) -> float:
+            return float(s.replace(",", ""))
+
+        eth_entry = _pf(args[2])
+        eth_qty   = _pf(args[3])
+        eth_lev   = _pf(args[4].lower().replace("x", ""))
+        btc_entry = _pf(args[6])
+        btc_qty   = _pf(args[7])
+        btc_lev   = _pf(args[8].lower().replace("x", ""))
+
+        if eth_entry <= 0 or btc_entry <= 0:
+            send_reply("Entry price harus positif~ (◕ω◕)", reply_chat)
+            return
+        if not (1 <= eth_lev <= 200) or not (1 <= btc_lev <= 200):
+            send_reply("Leverage harus antara 1x–200x~ (◕ω◕)", reply_chat)
+            return
+
+        # Optional liq override: /setpos ... ethliq 1431.47 btcliq 85802.45
+        eth_liq, btc_liq = None, None
+        extra = args[9:]
+        for i in range(0, len(extra) - 1, 2):
+            key = extra[i].lower()
+            try:
+                val = _pf(extra[i + 1])
+                if key == "ethliq":   eth_liq = val
+                elif key == "btcliq": btc_liq = val
+            except (ValueError, IndexError):
+                pass
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos_data.update({
+            "eth_entry_price": eth_entry,
+            "eth_qty":         eth_qty,
+            "eth_leverage":    eth_lev,
+            "eth_liq_price":   eth_liq,
+            "btc_entry_price": btc_entry,
+            "btc_qty":         btc_qty,
+            "btc_leverage":    btc_lev,
+            "btc_liq_price":   btc_liq,
+            "strategy":        strat_str,
+            "set_at":          now_iso,
+        })
+
+        # Simpan ke Redis supaya survive restart
+        saved  = save_pos_data()
+        sv_str = "✅ Tersimpan ke Redis~" if saved else "⚠️ Redis tidak tersedia, data hanya di memory~"
+
+        eth_dir = "Long 📈" if eth_qty > 0 else "Short 📉"
+        btc_dir = "Long 📈" if btc_qty > 0 else "Short 📉"
+        liq_note = ""
+        if eth_liq or btc_liq:
+            liq_note = (
+                f"\nLiq price manual:\n"
+                f"ETH: ${eth_liq:,.2f}\n" if eth_liq else ""
+            ) + (f"BTC: ${btc_liq:,.2f}\n" if btc_liq else "")
+
+        logger.info(f"pos_data set: {strat_str} ETH {eth_dir} {eth_qty}@{eth_entry} {eth_lev}x | "
+                    f"BTC {btc_dir} {btc_qty}@{btc_entry} {btc_lev}x")
+        send_reply(
+            f"✅ *Posisi {strat_str} disimpan~* Ufufufu... (◕‿◕)\n"
+            f"\n"
+            f"ETH: *{eth_dir}* {abs(eth_qty):.4f} @ ${eth_entry:,.2f} | {eth_lev:.0f}x\n"
+            f"BTC: *{btc_dir}* {abs(btc_qty):.6f} @ ${btc_entry:,.2f} | {btc_lev:.0f}x\n"
+            f"{liq_note}\n"
+            f"{sv_str}\n"
+            f"\n"
+            f"Ketik `/health` untuk cek kesehatan posisi~",
+            reply_chat,
+        )
+    except (ValueError, IndexError) as e:
+        send_reply(f"Format salah~ (◕ω◕)\n\n{usage}", reply_chat)
+        logger.warning(f"setpos parse error: {e}")
+
+
+def handle_health_command(reply_chat: str) -> None:
+    """Tampilkan health posisi — leverage, margin, UPnL, liq price, pairs net."""
+    if pos_data["eth_entry_price"] is None:
+        send_reply(
+            "Ara ara~ belum ada posisi yang diset~ (◕ω◕)\n\n"
+            "Gunakan `/setpos` dulu ya~\n\n"
+            "*Contoh S1* (Long BTC / Short ETH):\n"
+            "`/setpos S1 eth 2011.56 -1.4907 50x btc 67794.76 0.029491 50x`\n\n"
+            "*Contoh S2* (Long ETH / Short BTC):\n"
+            "`/setpos S2 eth 1956.40 15.58 10x btc 67586.10 -0.4439 10x`",
+            reply_chat,
+        )
+        return
+    if scan_stats.get("last_btc_price") is None:
+        send_reply("Tunggu sebentar~ Akeno belum dapat harga terbaru~ (◕ω◕)", reply_chat)
+        return
+    h = calc_position_pnl()
+    if not h:
+        send_reply("Gagal hitung P&L~ Coba `/setpos` ulang~ (◕ω◕)", reply_chat)
+        return
+    send_reply(build_position_health_message(h), reply_chat)
+
+
+def handle_clearpos_command(reply_chat: str) -> None:
+    """Hapus pos_data dari memory dan Redis."""
+    for k in pos_data:
+        pos_data[k] = None
+    clear_pos_data_redis()
+    send_reply("🗑️ *Data posisi dihapus~* (◕‿◕)\nRedis juga dibersihkan~", reply_chat)
+
+
 def handle_help_command(reply_chat: str) -> None:
     peak_s  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
     cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset"
+    pos_str = pos_data.get("strategy") or "belum diset"
     send_reply(
         "Ara ara~ ini semua yang bisa Akeno lakukan~ Ufufufu... (◕‿◕)\n"
         "\n"
@@ -1995,23 +2523,27 @@ def handle_help_command(reply_chat: str) -> None:
         "`/settings` `/status` `/redis`\n"
         "`/interval` `/lookback` `/heartbeat`\n"
         "`/threshold entry|exit|invalid <val>`\n"
-        "`/sltp sl <val>` — trailing SL distance\n"
-        f"`/peak on|off|<val>` — Peak Watch _(sekarang: {peak_s})_\n"
+        "`/sltp sl <val>` | `/peak on|off|<val>`\n"
+        f"_Peak sekarang: {peak_s}_\n"
         "\n"
-        "*🧠 Swing / Day Trade Analysis:*\n"
-        f"`/capital <usd>` — set modal _(sekarang: {cap_str})_\n"
-        "`/ratio` — ETH/BTC ratio percentile monitor\n"
-        "`/pnl` — net combined P&L posisi aktif\n"
-        "`/analysis` — full market analysis sekarang\n"
+        "*🧠 Analysis:*\n"
+        f"`/capital <usd>` _(sekarang: {cap_str})_\n"
+        "`/ratio` — ratio monitor + conviction + entry readiness\n"
+        "`/pnl` — net P&L posisi bot\n"
+        "`/analysis` — full snapshot\n"
         "\n"
-        "*`/start` `/help`*\n"
+        "*🏥 Position Health Tracker:*\n"
+        f"`/setpos S1|S2 eth <entry> <qty> <lev>x btc <entry> <qty> <lev>x`\n"
+        f"_Posisi: {pos_str}_ | _Tersimpan di Redis~_\n"
+        "`/health` — leverage, margin ratio, UPnL, liq price\n"
+        "`/clearpos` — hapus data posisi\n"
         "\n"
-        "_Entry signal otomatis tampilkan:_\n"
-        "_• Driver analysis (ETH-led vs BTC-led)_\n"
-        "_• Ratio percentile + conviction stars_\n"
-        "_• Dollar-neutral sizing guide_\n"
-        "_• 2 skenario konvergensi (A & B)_\n"
-        "_• TP & TSL dengan estimasi harga ETH~ ⚡_",
+        "*S1* (Long BTC / Short ETH):\n"
+        "`/setpos S1 eth 2011 -1.49 50x btc 67794 0.029 50x`\n"
+        "*S2* (Long ETH / Short BTC):\n"
+        "`/setpos S2 eth 1956 15.58 10x btc 67586 -0.44 10x`\n"
+        "\n"
+        "_Entry signal otomatis: driver, ratio, sizing, skenario, TP/TSL harga~ ⚡_",
         reply_chat,
     )
 
@@ -2034,6 +2566,20 @@ def send_startup_message() -> bool:
     )
     peak_s      = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
     cap_str     = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset (gunakan /capital)"
+
+    # Posisi yang di-restore dari Redis
+    pos_info = ""
+    if pos_data.get("strategy") and pos_data.get("eth_entry_price"):
+        strat    = pos_data["strategy"]
+        eth_dir  = "Long" if (pos_data["eth_qty"] or 0) > 0 else "Short"
+        btc_dir  = "Long" if (pos_data["btc_qty"] or 0) > 0 else "Short"
+        pos_info = (
+            f"\n🏥 *Posisi {strat} di-restore:*\n"
+            f"ETH {eth_dir} @ ${pos_data['eth_entry_price']:,.2f} | "
+            f"BTC {btc_dir} @ ${pos_data['btc_entry_price']:,.2f}\n"
+            f"_Ketik `/health` untuk cek kesehatan~_\n"
+        )
+
     return send_alert(
         f"………\n"
         f"Ara ara~ *Akeno (Bot B) sudah siap~* Ufufufu... (◕‿◕)\n"
@@ -2043,7 +2589,7 @@ def send_startup_message() -> bool:
         f"📈 Entry: ±{settings['entry_threshold']}% | 📉 Exit: ±{settings['exit_threshold']}%\n"
         f"⚠️ Invalid: ±{settings['invalidation_threshold']}% | 🛑 TSL: {settings['sl_pct']}%\n"
         f"🔍 Peak Mode: {peak_s} | 💰 Modal: {cap_str}\n"
-        f"\n"
+        f"{pos_info}\n"
         f"*🧠 Analisis aktif di setiap entry signal:*\n"
         f"• Gap Driver (ETH-led vs BTC-led)\n"
         f"• ETH/BTC Ratio Percentile + Conviction\n"
@@ -2091,6 +2637,11 @@ def main_loop() -> None:
     prune_history(datetime.now(timezone.utc))
     last_redis_refresh = datetime.now(timezone.utc)
     logger.info(f"History loaded: {len(price_history)} points")
+
+    load_pos_data()
+    if pos_data.get("strategy"):
+        logger.info(f"pos_data restored: {pos_data['strategy']} "
+                    f"ETH@{pos_data['eth_entry_price']} BTC@{pos_data['btc_entry_price']}")
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         send_startup_message()
