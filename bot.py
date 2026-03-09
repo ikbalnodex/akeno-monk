@@ -133,18 +133,28 @@ scan_stats = {
     "signals_sent":   0,
 }
 
+# Gap history untuk velocity tracking (ringkasan gap per scan)
+gap_history: List[Tuple[datetime, float]] = []   # (timestamp, gap_value)
+MAX_GAP_HISTORY = 120   # simpan ~2 jam kalau scan setiap 60s
+
 # Manual position tracker — persisted to Redis, survive restart
 pos_data: dict = {
-    "eth_entry_price": None,  # float
-    "eth_qty":         None,  # float (+long / -short)
-    "eth_leverage":    None,  # float
-    "eth_liq_price":   None,  # float (manual override, opsional)
-    "btc_entry_price": None,
-    "btc_qty":         None,
-    "btc_leverage":    None,
-    "btc_liq_price":   None,
-    "strategy":        None,  # "S1" / "S2"
-    "set_at":          None,  # ISO string
+    # Legs
+    "eth_entry_price":  None,   # float
+    "eth_qty":          None,   # float (+long / -short)
+    "eth_notional_usd": None,   # float, USD value saat entry (opsional, untuk display)
+    "eth_leverage":     None,   # float
+    "eth_liq_price":    None,   # float (manual override, opsional)
+    "eth_funding_rate": None,   # float, % per 8h (positif = kamu bayar)
+    "btc_entry_price":  None,
+    "btc_qty":          None,
+    "btc_notional_usd": None,
+    "btc_leverage":     None,
+    "btc_liq_price":    None,
+    "btc_funding_rate": None,   # float, % per 8h
+    # Meta
+    "strategy":         None,   # "S1" / "S2"
+    "set_at":           None,   # ISO string
 }
 
 
@@ -375,9 +385,11 @@ def process_commands() -> None:
             "/pnl":       lambda: handle_pnl_command(chat_id),
             "/analysis":  lambda: handle_analysis_command(chat_id),
             # — Position Health Tracker —
-            "/setpos":    lambda: handle_setpos_command(args, chat_id),
-            "/health":    lambda: handle_health_command(chat_id),
-            "/clearpos":  lambda: handle_clearpos_command(chat_id),
+            "/setpos":      lambda: handle_setpos_command(args, chat_id),
+            "/health":      lambda: handle_health_command(chat_id),
+            "/clearpos":    lambda: handle_clearpos_command(chat_id),
+            "/setfunding":  lambda: handle_setfunding_command(args, chat_id),
+            "/velocity":    lambda: handle_velocity_command(chat_id),
         }
         if command in dispatch:
             dispatch[command]()
@@ -618,9 +630,91 @@ def get_pairs_health(
 # ─── POSITION HEALTH ENGINE ──────────────────────────────────────────────────
 # =============================================================================
 
+def calc_gap_velocity() -> dict:
+    """
+    Analisis kecepatan dan arah gap dari gap_history.
+    Returns dict dengan velocity metrics, atau empty dict kalau data kurang.
+    """
+    if len(gap_history) < 3:
+        return {}
+    try:
+        now     = datetime.now(timezone.utc)
+        # Ambil window berbeda untuk short/medium term
+        def _slice(minutes: int):
+            cutoff = now - timedelta(minutes=minutes)
+            pts    = [(ts, g) for ts, g in gap_history if ts >= cutoff]
+            return pts
+
+        pts_15  = _slice(15)
+        pts_30  = _slice(30)
+        pts_60  = _slice(60)
+
+        def _delta(pts):
+            if len(pts) < 2:
+                return None
+            return pts[-1][1] - pts[0][1]   # gap change over window
+
+        def _velocity(pts):
+            """Gap change per menit"""
+            if len(pts) < 2:
+                return None
+            dt = (pts[-1][0] - pts[0][0]).total_seconds() / 60
+            if dt <= 0:
+                return None
+            return (pts[-1][1] - pts[0][1]) / dt
+
+        d15 = _delta(pts_15)
+        d30 = _delta(pts_30)
+        d60 = _delta(pts_60)
+        v15 = _velocity(pts_15)   # gap/menit terbaru (15m window)
+        v60 = _velocity(pts_60)
+
+        curr_gap = gap_history[-1][1]
+
+        # Trend: apakah gap bergerak menuju TP atau menjauhinya?
+        # S1 TP = gap mengecil (positif ke nol), S2 TP = gap mengecil (negatif ke nol)
+        # Konverging = abs(gap) mengecil
+        abs_delta_15 = None
+        if d15 is not None:
+            abs_delta_15 = abs(gap_history[-1][1]) - abs(gap_history[-len(pts_15)][1]) if pts_15 else None
+
+        # Apakah gap accelerating atau decelerating menuju TP?
+        accel = None
+        if v15 is not None and v60 is not None and v60 != 0:
+            accel = v15 / v60    # > 1 = accelerating, < 1 = decelerating
+
+        # ETA ke TP (entry_threshold sebagai target konvergensi)
+        eta_minutes = None
+        et  = settings["exit_threshold"]
+        if v15 is not None and v15 != 0:
+            # Berapa jauh lagi abs(gap) perlu berubah menuju TP
+            gap_to_tp = abs(curr_gap) - et
+            if gap_to_tp > 0:
+                # Kecepatan konvergensi = -abs(gap) per menit
+                conv_rate = -abs(v15) if v15 * curr_gap > 0 else abs(v15)
+                if conv_rate != 0:
+                    eta_minutes = gap_to_tp / abs(conv_rate)
+
+        return {
+            "curr_gap": curr_gap,
+            "delta_15m": d15,
+            "delta_30m": d30,
+            "delta_60m": d60,
+            "vel_15m":   v15,
+            "vel_60m":   v60,
+            "accel":     accel,
+            "eta_min":   eta_minutes,
+            "n_pts":     len(gap_history),
+        }
+    except Exception as e:
+        logger.warning(f"calc_gap_velocity error: {e}")
+        return {}
+
+
 def calc_position_pnl() -> dict:
     """
-    Hitung P&L, margin, dan kesehatan tiap leg dari pos_data + harga sekarang.
+    Hitung P&L lengkap: unrealized, funding cost, net after funding,
+    break-even timer, time-in-trade, liq distance.
     Returns empty dict jika data tidak lengkap.
     """
     if pos_data["eth_entry_price"] is None or pos_data["btc_entry_price"] is None:
@@ -630,23 +724,31 @@ def calc_position_pnl() -> dict:
     if btc_now is None or eth_now is None:
         return {}
     try:
-        eth_entry = pos_data["eth_entry_price"]
-        eth_qty   = pos_data["eth_qty"]           # +long / -short
-        eth_lev   = pos_data["eth_leverage"] or 1.0
-        btc_entry = pos_data["btc_entry_price"]
-        btc_qty   = pos_data["btc_qty"]
-        btc_lev   = pos_data["btc_leverage"] or 1.0
-        eth_p     = float(eth_now)
-        btc_p     = float(btc_now)
+        eth_entry  = pos_data["eth_entry_price"]
+        eth_qty    = pos_data["eth_qty"]
+        eth_lev    = pos_data["eth_leverage"] or 1.0
+        eth_fr     = pos_data.get("eth_funding_rate") or 0.0   # % per 8h
+        btc_entry  = pos_data["btc_entry_price"]
+        btc_qty    = pos_data["btc_qty"]
+        btc_lev    = pos_data["btc_leverage"] or 1.0
+        btc_fr     = pos_data.get("btc_funding_rate") or 0.0
+        eth_p      = float(eth_now)
+        btc_p      = float(btc_now)
 
-        eth_notional   = abs(eth_qty) * eth_entry
-        btc_notional   = abs(btc_qty) * btc_entry
+        # ── Notional & Margin ─────────────────────────────────────────────────
+        # Gunakan notional_usd manual kalau ada (lebih akurat dari exchange)
+        eth_notional   = pos_data.get("eth_notional_usd") or (abs(eth_qty) * eth_entry)
+        btc_notional   = pos_data.get("btc_notional_usd") or (abs(btc_qty) * btc_entry)
         eth_margin     = eth_notional / eth_lev
         btc_margin     = btc_notional / btc_lev
         total_margin   = eth_margin + btc_margin
         total_notional = eth_notional + btc_notional
 
-        # PnL signed: long profit saat naik, short profit saat turun
+        # ── Nilai sekarang ───────────────────────────────────────────────────
+        eth_value_now  = abs(eth_qty) * eth_p
+        btc_value_now  = abs(btc_qty) * btc_p
+
+        # ── Unrealized PnL ───────────────────────────────────────────────────
         eth_pnl = eth_qty * (eth_p - eth_entry)
         btc_pnl = btc_qty * (btc_p - btc_entry)
         net_pnl = eth_pnl + btc_pnl
@@ -655,19 +757,66 @@ def calc_position_pnl() -> dict:
         btc_pnl_pct = btc_pnl / btc_margin * 100 if btc_margin > 0 else 0
         net_pnl_pct = net_pnl / total_margin * 100 if total_margin > 0 else 0
 
+        # ── Time-in-trade ────────────────────────────────────────────────────
+        set_at_str  = pos_data.get("set_at")
+        time_in_min = None
+        time_label  = "N/A"
+        if set_at_str:
+            try:
+                sa          = datetime.fromisoformat(set_at_str)
+                time_in_min = (datetime.now(timezone.utc) - sa).total_seconds() / 60
+                h_part      = int(time_in_min // 60)
+                m_part      = int(time_in_min % 60)
+                time_label  = f"{h_part}h {m_part}m" if h_part > 0 else f"{m_part}m"
+            except Exception:
+                pass
+
+        # ── Funding Cost ─────────────────────────────────────────────────────
+        # Funding rate: positif = kamu bayar (long bayar short)
+        # ETH leg: kalau long dan fr positif → kamu bayar; kalau short dan fr positif → kamu terima
+        # BTC leg: kebalikannya
+        def _funding_flow(qty: float, notional: float, fr: float) -> float:
+            """Negatif = kamu bayar, positif = kamu terima"""
+            direction = 1.0 if qty > 0 else -1.0
+            return -direction * notional * (fr / 100)   # per 8h dalam USD
+
+        eth_funding_per_8h = _funding_flow(eth_qty, eth_notional, eth_fr)
+        btc_funding_per_8h = _funding_flow(btc_qty, btc_notional, btc_fr)
+        net_funding_per_8h = eth_funding_per_8h + btc_funding_per_8h
+        net_funding_per_day = net_funding_per_8h * 3
+
+        # Total funding sudah dibayar/diterima berdasarkan time-in-trade
+        total_funding_paid = 0.0
+        if time_in_min is not None:
+            periods_8h         = time_in_min / 480   # 480 menit = 8 jam
+            total_funding_paid = net_funding_per_8h * periods_8h
+
+        # Net PnL setelah funding
+        net_pnl_after_funding     = net_pnl + total_funding_paid
+        net_pnl_af_pct            = net_pnl_after_funding / total_margin * 100 if total_margin > 0 else 0
+
+        # ── Break-even Timer ─────────────────────────────────────────────────
+        # Berapa jam lagi funding akan habiskan profit yang ada?
+        breakeven_hours = None
+        if net_pnl > 0 and net_funding_per_8h < 0:
+            # Kamu bayar funding, profit ada — kapan funding = profit?
+            breakeven_hours = (net_pnl / abs(net_funding_per_8h)) * 8
+        elif net_pnl < 0 and net_funding_per_8h > 0:
+            # Kamu terima funding, sedang rugi — kapan funding tutup kerugian?
+            breakeven_hours = abs(net_pnl) / abs(net_funding_per_8h) * 8
+
+        # ── Margin Health ────────────────────────────────────────────────────
         total_equity = total_margin + net_pnl
         margin_ratio = total_equity / total_notional * 100 if total_notional > 0 else 0
-
-        # Maintenance margin ~0.5% dari notional (estimasi)
         maint_margin    = total_notional * 0.005
         liq_buffer_usd  = total_equity - maint_margin
         liq_buffer_pct  = liq_buffer_usd / total_equity * 100 if total_equity > 0 else 0
 
-        # Estimasi liq price per leg kalau tidak diisi manual
+        # ── Liq Prices ───────────────────────────────────────────────────────
         eth_liq = pos_data["eth_liq_price"]
         btc_liq = pos_data["btc_liq_price"]
         if eth_liq is None and eth_qty != 0:
-            eth_liq = eth_entry - (eth_margin / eth_qty)  # long: entry - margin/qty; short: entry + margin/|qty|
+            eth_liq = eth_entry - (eth_margin / eth_qty)
         if btc_liq is None and btc_qty != 0:
             btc_liq = btc_entry - (btc_margin / btc_qty)
 
@@ -676,24 +825,43 @@ def calc_position_pnl() -> dict:
         eth_danger   = eth_dist_liq is not None and eth_dist_liq < 10
         btc_danger   = btc_dist_liq is not None and btc_dist_liq < 10
 
+        # ── Health Label ─────────────────────────────────────────────────────
         if margin_ratio >= 10:   health_e, health_label = "🟢", "SEHAT"
         elif margin_ratio >= 5:  health_e, health_label = "🟡", "PERHATIKAN"
         elif margin_ratio >= 3:  health_e, health_label = "🟠", "WASPADA"
         else:                    health_e, health_label = "🔴", "BAHAYA — Dekat Liquidasi!"
 
         return {
+            # ETH leg
             "eth_pnl": eth_pnl, "eth_pnl_pct": eth_pnl_pct,
             "eth_notional": eth_notional, "eth_margin": eth_margin,
+            "eth_value_now": eth_value_now,
             "eth_lev": eth_lev, "eth_liq_est": eth_liq,
             "eth_dist_liq": eth_dist_liq, "eth_danger": eth_danger,
+            "eth_funding_per_8h": eth_funding_per_8h,
+            # BTC leg
             "btc_pnl": btc_pnl, "btc_pnl_pct": btc_pnl_pct,
             "btc_notional": btc_notional, "btc_margin": btc_margin,
+            "btc_value_now": btc_value_now,
             "btc_lev": btc_lev, "btc_liq_est": btc_liq,
             "btc_dist_liq": btc_dist_liq, "btc_danger": btc_danger,
+            "btc_funding_per_8h": btc_funding_per_8h,
+            # Net
             "net_pnl": net_pnl, "net_pnl_pct": net_pnl_pct,
+            "net_pnl_after_funding": net_pnl_after_funding,
+            "net_pnl_af_pct": net_pnl_af_pct,
             "total_margin": total_margin, "total_notional": total_notional,
             "total_equity": total_equity, "margin_ratio": margin_ratio,
             "liq_buffer_usd": liq_buffer_usd, "liq_buffer_pct": liq_buffer_pct,
+            # Funding
+            "net_funding_per_8h": net_funding_per_8h,
+            "net_funding_per_day": net_funding_per_day,
+            "total_funding_paid": total_funding_paid,
+            "breakeven_hours": breakeven_hours,
+            # Time
+            "time_in_min": time_in_min,
+            "time_label": time_label,
+            # Health
             "health_emoji": health_e, "health_label": health_label,
         }
     except Exception as e:
@@ -702,41 +870,116 @@ def calc_position_pnl() -> dict:
 
 
 def build_position_health_message(h: dict) -> str:
-    now     = datetime.now(timezone.utc)
-    set_at  = pos_data.get("set_at")
-    age_str = ""
-    if set_at:
-        try:
-            sa      = datetime.fromisoformat(set_at) if isinstance(set_at, str) else set_at
-            age_min = int((now - sa).total_seconds() / 60)
-            age_str = f" _(diset {age_min}m lalu)_"
-        except Exception:
-            pass
+    strat   = pos_data.get("strategy") or "?"
+    eth_p   = float(scan_stats["last_eth_price"]) if scan_stats.get("last_eth_price") else 0
+    btc_p   = float(scan_stats["last_btc_price"]) if scan_stats.get("last_btc_price") else 0
+    eth_qty = pos_data["eth_qty"]
+    btc_qty = pos_data["btc_qty"]
+    eth_dir = "Long 📈" if eth_qty and eth_qty > 0 else "Short 📉"
+    btc_dir = "Long 📈" if btc_qty and btc_qty > 0 else "Short 📉"
 
-    strat    = pos_data.get("strategy") or "?"
-    eth_p    = float(scan_stats["last_eth_price"]) if scan_stats.get("last_eth_price") else 0
-    btc_p    = float(scan_stats["last_btc_price"]) if scan_stats.get("last_btc_price") else 0
-    eth_qty  = pos_data["eth_qty"]
-    btc_qty  = pos_data["btc_qty"]
-    eth_dir  = "Long 📈" if eth_qty and eth_qty > 0 else "Short 📉"
-    btc_dir  = "Long 📈" if btc_qty and btc_qty > 0 else "Short 📉"
+    def _s(v):  return "+" if v >= 0 else ""
+    def _e(v):  return "🟢" if v >= 0 else "🔴"
+    def _fe(v): return "🟢" if v >= 0 else "🔴"   # funding: pos = receive
 
-    def _sign(v): return "+" if v >= 0 else ""
-    def _pnl_emoji(v): return "🟢" if v >= 0 else "🔴"
-
+    # ── Liq strings ──────────────────────────────────────────────────────────
     eth_liq_s  = f"${h['eth_liq_est']:,.2f}" if h.get("eth_liq_est") else "N/A"
     btc_liq_s  = f"${h['btc_liq_est']:,.2f}" if h.get("btc_liq_est") else "N/A"
     eth_dist_s = f"{h['eth_dist_liq']:.1f}% jauh" if h.get("eth_dist_liq") else "N/A"
     btc_dist_s = f"{h['btc_dist_liq']:.1f}% jauh" if h.get("btc_dist_liq") else "N/A"
-    eth_warn   = " ⚠️" if h.get("eth_danger") else " ✅"
-    btc_warn   = " ⚠️" if h.get("btc_danger") else " ✅"
+    eth_liq_e  = "⚠️" if h.get("eth_danger") else "✅"
+    btc_liq_e  = "⚠️" if h.get("btc_danger") else "✅"
 
-    mr       = h["margin_ratio"]
-    mr_fill  = min(10, int(mr / 2))
-    mr_bar   = "█" * mr_fill + "░" * (10 - mr_fill)
-    lb_pct   = max(0.0, h["liq_buffer_pct"])
-    lb_fill  = min(10, int(lb_pct / 10))
-    lb_bar   = "█" * lb_fill + "░" * (10 - lb_fill)
+    # ── Value size (USD sekarang) ─────────────────────────────────────────────
+    eth_val_s = f"${h['eth_value_now']:,.2f}" if h.get("eth_value_now") else "N/A"
+    btc_val_s = f"${h['btc_value_now']:,.2f}" if h.get("btc_value_now") else "N/A"
+
+    # ── Funding strings ───────────────────────────────────────────────────────
+    eth_fr     = pos_data.get("eth_funding_rate") or 0.0
+    btc_fr     = pos_data.get("btc_funding_rate") or 0.0
+    has_funding = eth_fr != 0.0 or btc_fr != 0.0
+    eth_f8h    = h.get("eth_funding_per_8h", 0)
+    btc_f8h    = h.get("btc_funding_per_8h", 0)
+    net_f8h    = h.get("net_funding_per_8h", 0)
+    net_fday   = h.get("net_funding_per_day", 0)
+    total_fp   = h.get("total_funding_paid", 0)
+    be_h       = h.get("breakeven_hours")
+
+    funding_block = ""
+    if has_funding:
+        eth_f_dir = "terima 🟢" if eth_f8h >= 0 else "bayar 🔴"
+        btc_f_dir = "terima 🟢" if btc_f8h >= 0 else "bayar 🔴"
+        net_f_dir = "terima 🟢" if net_f8h >= 0 else "bayar 🔴"
+        be_str    = f"{be_h:.1f}h" if be_h is not None else "N/A"
+        be_label  = (
+            "waktu tersisa sebelum funding habiskan profit" if h["net_pnl"] > 0 and net_f8h < 0
+            else "waktu untuk funding tutup kerugian" if h["net_pnl"] < 0 and net_f8h > 0
+            else "—"
+        )
+        funding_block = (
+            f"\n*💸 Funding Cost:*\n"
+            f"┌─────────────────────\n"
+            f"│ ETH: {eth_fr:+.4f}%/8h → {_s(eth_f8h)}${abs(eth_f8h):.3f} ({eth_f_dir})\n"
+            f"│ BTC: {btc_fr:+.4f}%/8h → {_s(btc_f8h)}${abs(btc_f8h):.3f} ({btc_f_dir})\n"
+            f"│ Net: {_s(net_f8h)}${abs(net_f8h):.3f}/8h | {_s(net_fday)}${abs(net_fday):.2f}/hari ({net_f_dir})\n"
+            f"│ Total dibayar: {_s(total_fp)}${abs(total_fp):.2f}\n"
+            f"│ Net PnL after funding: {_e(h['net_pnl_after_funding'])} "
+            f"{_s(h['net_pnl_after_funding'])}${h['net_pnl_after_funding']:,.2f} "
+            f"({_s(h['net_pnl_af_pct'])}{h['net_pnl_af_pct']:.2f}%)\n"
+            + (f"│ ⏱️ Break-even: *{be_str}* lagi ({be_label})\n" if be_h is not None else "")
+            + f"└─────────────────────\n"
+        )
+    else:
+        funding_block = "\n_💸 Funding: belum diset — gunakan `/setfunding`~_\n"
+
+    # ── Gap Velocity ─────────────────────────────────────────────────────────
+    vel  = calc_gap_velocity()
+    vel_block = ""
+    if vel:
+        d15 = vel.get("delta_15m")
+        d60 = vel.get("delta_60m")
+        eta = vel.get("eta_min")
+        curr_gap = vel.get("curr_gap", 0)
+
+        if d15 is not None:
+            conv   = abs(curr_gap) > 0 and abs(curr_gap + d15) < abs(curr_gap)
+            d15_e  = "⬆️ melebar" if not conv else "⬇️ konvergen"
+            d15_s  = f"{d15:+.3f}%"
+        else:
+            d15_e, d15_s = "—", "N/A"
+
+        if d60 is not None:
+            d60_s = f"{d60:+.3f}%"
+        else:
+            d60_s = "N/A"
+
+        accel = vel.get("accel")
+        if accel is not None:
+            accel_s = "📈 accelerating" if accel > 1.2 else ("📉 decelerating" if accel < 0.8 else "➡️ steady")
+        else:
+            accel_s = "N/A"
+
+        eta_s = f"{int(eta)}m ({eta/60:.1f}h)" if eta is not None and eta < 10000 else "tidak bisa hitung"
+
+        vel_block = (
+            f"\n*📡 Gap Velocity:*\n"
+            f"┌─────────────────────\n"
+            f"│ Gap sekarang: {curr_gap:+.3f}%\n"
+            f"│ Δ 15m: {d15_s} {d15_e}\n"
+            f"│ Δ 60m: {d60_s}\n"
+            f"│ Trend: {accel_s}\n"
+            f"│ ETA ke TP: ~{eta_s}\n"
+            f"│ Data: {vel['n_pts']} pts\n"
+            f"└─────────────────────\n"
+        )
+
+    # ── Margin bars ───────────────────────────────────────────────────────────
+    mr      = h["margin_ratio"]
+    mr_fill = min(10, int(mr / 2))
+    mr_bar  = "█" * mr_fill + "░" * (10 - mr_fill)
+    lb_pct  = max(0.0, h["liq_buffer_pct"])
+    lb_fill = min(10, int(lb_pct / 10))
+    lb_bar  = "█" * lb_fill + "░" * (10 - lb_fill)
 
     danger_note = ""
     if h.get("eth_danger") or h.get("btc_danger"):
@@ -746,29 +989,30 @@ def build_position_health_message(h: dict) -> str:
         danger_note = f"\n🚨 *PERINGATAN: {'/'.join(legs)} mendekati liq price!*\n"
 
     return (
-        f"🏥 *Position Health — {strat}*{age_str}\n"
+        f"🏥 *Position Health — {strat}*\n"
+        f"⏱️ Time in trade: *{h['time_label']}*\n"
         f"💰 ETH: ${eth_p:,.2f} | BTC: ${btc_p:,.2f}\n"
         f"\n"
         f"*📊 ETH Leg ({eth_dir}):*\n"
         f"┌─────────────────────\n"
-        f"│ Entry:     ${pos_data['eth_entry_price']:,.2f}\n"
-        f"│ Qty:       {abs(eth_qty):.4f} ETH\n"
-        f"│ Leverage:  {h['eth_lev']:.0f}x\n"
-        f"│ Notional:  ${h['eth_notional']:,.2f}\n"
-        f"│ Margin:    ${h['eth_margin']:,.2f}\n"
-        f"│ UPnL:      {_pnl_emoji(h['eth_pnl'])} {_sign(h['eth_pnl'])}${h['eth_pnl']:,.2f} ({_sign(h['eth_pnl_pct'])}{h['eth_pnl_pct']:.2f}%)\n"
-        f"│ Liq:       {eth_liq_s}{eth_warn} | {eth_dist_s}\n"
+        f"│ Entry:    ${pos_data['eth_entry_price']:,.2f}\n"
+        f"│ Qty:      {abs(eth_qty):.4f} ETH\n"
+        f"│ Leverage: {h['eth_lev']:.0f}x\n"
+        f"│ Notional: ${h['eth_notional']:,.2f} → value now: {eth_val_s}\n"
+        f"│ Margin:   ${h['eth_margin']:,.2f}\n"
+        f"│ UPnL:     {_e(h['eth_pnl'])} {_s(h['eth_pnl'])}${h['eth_pnl']:,.2f} ({_s(h['eth_pnl_pct'])}{h['eth_pnl_pct']:.2f}%)\n"
+        f"│ Liq:      {eth_liq_s} {eth_liq_e} | {eth_dist_s}\n"
         f"└─────────────────────\n"
         f"\n"
         f"*📊 BTC Leg ({btc_dir}):*\n"
         f"┌─────────────────────\n"
-        f"│ Entry:     ${pos_data['btc_entry_price']:,.2f}\n"
-        f"│ Qty:       {abs(btc_qty):.6f} BTC\n"
-        f"│ Leverage:  {h['btc_lev']:.0f}x\n"
-        f"│ Notional:  ${h['btc_notional']:,.2f}\n"
-        f"│ Margin:    ${h['btc_margin']:,.2f}\n"
-        f"│ UPnL:      {_pnl_emoji(h['btc_pnl'])} {_sign(h['btc_pnl'])}${h['btc_pnl']:,.2f} ({_sign(h['btc_pnl_pct'])}{h['btc_pnl_pct']:.2f}%)\n"
-        f"│ Liq:       {btc_liq_s}{btc_warn} | {btc_dist_s}\n"
+        f"│ Entry:    ${pos_data['btc_entry_price']:,.2f}\n"
+        f"│ Qty:      {abs(btc_qty):.6f} BTC\n"
+        f"│ Leverage: {h['btc_lev']:.0f}x\n"
+        f"│ Notional: ${h['btc_notional']:,.2f} → value now: {btc_val_s}\n"
+        f"│ Margin:   ${h['btc_margin']:,.2f}\n"
+        f"│ UPnL:     {_e(h['btc_pnl'])} {_s(h['btc_pnl'])}${h['btc_pnl']:,.2f} ({_s(h['btc_pnl_pct'])}{h['btc_pnl_pct']:.2f}%)\n"
+        f"│ Liq:      {btc_liq_s} {btc_liq_e} | {btc_dist_s}\n"
         f"└─────────────────────\n"
         f"\n"
         f"*⚖️ Net Pairs:*\n"
@@ -776,19 +1020,19 @@ def build_position_health_message(h: dict) -> str:
         f"│ Notional:  ${h['total_notional']:,.2f}\n"
         f"│ Margin:    ${h['total_margin']:,.2f}\n"
         f"│ Equity:    ${h['total_equity']:,.2f}\n"
-        f"│ Net UPnL:  {_pnl_emoji(h['net_pnl'])} {_sign(h['net_pnl'])}${h['net_pnl']:,.2f} ({_sign(h['net_pnl_pct'])}{h['net_pnl_pct']:.2f}%)\n"
+        f"│ Net UPnL:  {_e(h['net_pnl'])} {_s(h['net_pnl'])}${h['net_pnl']:,.2f} ({_s(h['net_pnl_pct'])}{h['net_pnl_pct']:.2f}%)\n"
         f"└─────────────────────\n"
-        f"\n"
-        f"*🛡️ Kesehatan Margin:*\n"
+        f"{funding_block}"
+        f"{vel_block}"
+        f"*🛡️ Margin Health:*\n"
         f"┌─────────────────────\n"
         f"│ Margin Ratio: {mr:.2f}%\n"
         f"│ `{mr_bar}` {h['health_emoji']} *{h['health_label']}*\n"
-        f"│ Liq Buffer:   ${h['liq_buffer_usd']:,.2f} ({lb_pct:.1f}%)\n"
-        f"│ `{lb_bar}` buffer sebelum liq\n"
+        f"│ Liq Buffer: ${h['liq_buffer_usd']:,.2f} ({lb_pct:.1f}%)\n"
+        f"│ `{lb_bar}` sebelum likuidasi\n"
         f"└─────────────────────\n"
         f"{danger_note}\n"
-        f"_💡 Pairs trade: nilai NET yang penting, bukan per leg~_\n"
-        f"_Mentor: ETH -68% tapi net +$239 (◕‿◕)_"
+        f"_💡 NET = yang penting. Mentor: ETH -68% tapi net +$239~_"
     )
 
 
@@ -2424,8 +2668,9 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
             send_reply("Leverage harus antara 1x–200x~ (◕ω◕)", reply_chat)
             return
 
-        # Optional liq override: /setpos ... ethliq 1431.47 btcliq 85802.45
-        eth_liq, btc_liq = None, None
+        # Optional extras: ethliq btcliq ethval btcval
+        # Contoh: /setpos S1 ... ethliq 1431 btcliq 85000 ethval 3000 btcval 2000
+        eth_liq, btc_liq, eth_val, btc_val = None, None, None, None
         extra = args[9:]
         for i in range(0, len(extra) - 1, 2):
             key = extra[i].lower()
@@ -2433,35 +2678,47 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
                 val = _pf(extra[i + 1])
                 if key == "ethliq":   eth_liq = val
                 elif key == "btcliq": btc_liq = val
+                elif key == "ethval": eth_val = val   # override notional USD
+                elif key == "btcval": btc_val = val
             except (ValueError, IndexError):
                 pass
 
         now_iso = datetime.now(timezone.utc).isoformat()
         pos_data.update({
-            "eth_entry_price": eth_entry,
-            "eth_qty":         eth_qty,
-            "eth_leverage":    eth_lev,
-            "eth_liq_price":   eth_liq,
-            "btc_entry_price": btc_entry,
-            "btc_qty":         btc_qty,
-            "btc_leverage":    btc_lev,
-            "btc_liq_price":   btc_liq,
-            "strategy":        strat_str,
-            "set_at":          now_iso,
+            "eth_entry_price":  eth_entry,
+            "eth_qty":          eth_qty,
+            "eth_notional_usd": eth_val,
+            "eth_leverage":     eth_lev,
+            "eth_liq_price":    eth_liq,
+            "btc_entry_price":  btc_entry,
+            "btc_qty":          btc_qty,
+            "btc_notional_usd": btc_val,
+            "btc_leverage":     btc_lev,
+            "btc_liq_price":    btc_liq,
+            "strategy":         strat_str,
+            "set_at":           now_iso,
         })
 
         # Simpan ke Redis supaya survive restart
         saved  = save_pos_data()
         sv_str = "✅ Tersimpan ke Redis~" if saved else "⚠️ Redis tidak tersedia, data hanya di memory~"
 
-        eth_dir = "Long 📈" if eth_qty > 0 else "Short 📉"
-        btc_dir = "Long 📈" if btc_qty > 0 else "Short 📉"
+        eth_dir  = "Long 📈" if eth_qty > 0 else "Short 📉"
+        btc_dir  = "Long 📈" if btc_qty > 0 else "Short 📉"
+        val_note = ""
+        if eth_val or btc_val:
+            val_note = (
+                f"\nValue size (override):\n"
+                + (f"ETH notional: ${eth_val:,.2f}\n" if eth_val else "")
+                + (f"BTC notional: ${btc_val:,.2f}\n" if btc_val else "")
+            )
         liq_note = ""
         if eth_liq or btc_liq:
             liq_note = (
-                f"\nLiq price manual:\n"
-                f"ETH: ${eth_liq:,.2f}\n" if eth_liq else ""
-            ) + (f"BTC: ${btc_liq:,.2f}\n" if btc_liq else "")
+                f"\nLiq override:\n"
+                + (f"ETH liq: ${eth_liq:,.2f}\n" if eth_liq else "")
+                + (f"BTC liq: ${btc_liq:,.2f}\n" if btc_liq else "")
+            )
 
         logger.info(f"pos_data set: {strat_str} ETH {eth_dir} {eth_qty}@{eth_entry} {eth_lev}x | "
                     f"BTC {btc_dir} {btc_qty}@{btc_entry} {btc_lev}x")
@@ -2470,15 +2727,154 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
             f"\n"
             f"ETH: *{eth_dir}* {abs(eth_qty):.4f} @ ${eth_entry:,.2f} | {eth_lev:.0f}x\n"
             f"BTC: *{btc_dir}* {abs(btc_qty):.6f} @ ${btc_entry:,.2f} | {btc_lev:.0f}x\n"
-            f"{liq_note}\n"
+            f"{val_note}{liq_note}\n"
             f"{sv_str}\n"
             f"\n"
-            f"Ketik `/health` untuk cek kesehatan posisi~",
+            f"Ketik `/health` untuk cek, `/setfunding` untuk set funding rate~",
             reply_chat,
         )
     except (ValueError, IndexError) as e:
         send_reply(f"Format salah~ (◕ω◕)\n\n{usage}", reply_chat)
         logger.warning(f"setpos parse error: {e}")
+
+
+def handle_setfunding_command(args: list, reply_chat: str) -> None:
+    """
+    Set funding rate untuk dua leg — biar kalkulasi break-even akurat.
+
+    /setfunding eth <rate> btc <rate>
+
+    rate = % per 8 jam dari exchange (bisa negatif)
+    Positif = kamu bayar (kalau long), terima (kalau short)
+    Negatif = kamu terima (kalau long), bayar (kalau short)
+
+    Contoh: /setfunding eth 0.0100 btc 0.0080
+    """
+    usage = (
+        "*Usage:*\n"
+        "`/setfunding eth <rate%> btc <rate%>`\n"
+        "\n"
+        "Rate = % per 8h dari exchange (cek di funding history)\n"
+        "Positif = long bayar | Negatif = long terima\n"
+        "\n"
+        "Contoh:\n"
+        "`/setfunding eth 0.0100 btc 0.0080`\n"
+        "`/setfunding eth -0.0050 btc 0.0100`"
+    )
+    if len(args) < 4:
+        send_reply(usage, reply_chat)
+        return
+    try:
+        def _pf(s): return float(s.replace(",", ""))
+        if args[0].lower() != "eth" or args[2].lower() != "btc":
+            send_reply(usage, reply_chat)
+            return
+        eth_fr = _pf(args[1])
+        btc_fr = _pf(args[3])
+
+        pos_data["eth_funding_rate"] = eth_fr
+        pos_data["btc_funding_rate"] = btc_fr
+        save_pos_data()
+
+        # Preview cost kalau posisi sudah diset
+        preview = ""
+        if pos_data.get("eth_entry_price"):
+            eth_qty     = pos_data["eth_qty"] or 0
+            btc_qty     = pos_data["btc_qty"] or 0
+            eth_lev     = pos_data["eth_leverage"] or 1.0
+            btc_lev     = pos_data["btc_leverage"] or 1.0
+            eth_not     = pos_data.get("eth_notional_usd") or (abs(eth_qty) * pos_data["eth_entry_price"])
+            btc_not     = pos_data.get("btc_notional_usd") or (abs(btc_qty) * pos_data["btc_entry_price"])
+            eth_margin  = eth_not / eth_lev
+            btc_margin  = btc_not / btc_lev
+
+            def _flow(qty, notional, fr):
+                return -(1.0 if qty > 0 else -1.0) * notional * (fr / 100)
+
+            ef8h = _flow(eth_qty, eth_not, eth_fr)
+            bf8h = _flow(btc_qty, btc_not, btc_fr)
+            net8 = ef8h + bf8h
+            netd = net8 * 3
+            net_dir = "terima 🟢" if net8 >= 0 else "bayar 🔴"
+            preview = (
+                f"\n*Preview biaya funding:*\n"
+                f"ETH: {'+' if ef8h>=0 else ''}${ef8h:.3f}/8h\n"
+                f"BTC: {'+' if bf8h>=0 else ''}${bf8h:.3f}/8h\n"
+                f"Net: *{'+' if net8>=0 else ''}${net8:.3f}/8h* | *{'+' if netd>=0 else ''}${netd:.2f}/hari* ({net_dir})\n"
+            )
+
+        send_reply(
+            f"✅ *Funding rate disimpan~* (◕‿◕)\n"
+            f"\n"
+            f"ETH: {eth_fr:+.4f}%/8h\n"
+            f"BTC: {btc_fr:+.4f}%/8h\n"
+            f"{preview}\n"
+            f"Ketik `/health` untuk lihat break-even timer~",
+            reply_chat,
+        )
+    except (ValueError, IndexError) as e:
+        send_reply(f"Format salah~ (◕ω◕)\n\n{usage}", reply_chat)
+        logger.warning(f"setfunding parse error: {e}")
+
+
+def handle_velocity_command(reply_chat: str) -> None:
+    """Gap velocity & ETA ke TP."""
+    vel = calc_gap_velocity()
+    if not vel:
+        send_reply(
+            "Belum cukup data untuk velocity~ (◕ω◕)\n"
+            f"Sekarang: {len(gap_history)} pts | Butuh minimal 3~",
+            reply_chat,
+        )
+        return
+
+    curr_gap = vel["curr_gap"]
+    et       = settings["exit_threshold"]
+    it       = settings["invalidation_threshold"]
+    d15      = vel.get("delta_15m")
+    d30      = vel.get("delta_30m")
+    d60      = vel.get("delta_60m")
+    eta      = vel.get("eta_min")
+    accel    = vel.get("accel")
+
+    def _ds(v): return f"{v:+.3f}%" if v is not None else "N/A"
+
+    # Konverging atau melebar?
+    conv_15 = (d15 is not None and abs(curr_gap + d15) < abs(curr_gap))
+    trend_e = "⬇️ konvergen" if conv_15 else "⬆️ melebar"
+    if accel is not None:
+        if accel > 1.2:    momentum = "📈 *makin cepat*"
+        elif accel < 0.8:  momentum = "📉 *makin lambat*"
+        else:              momentum = "➡️ *stabil*"
+    else:
+        momentum = "N/A"
+
+    eta_s = f"~{int(eta)}m ({eta/60:.1f}h)" if eta is not None and eta < 10000 else "tidak bisa dihitung"
+    dist_to_tp  = abs(curr_gap) - et
+    dist_to_inv = it - abs(curr_gap)
+
+    send_reply(
+        f"📡 *Gap Velocity Monitor*\n"
+        f"\n"
+        f"┌─────────────────────\n"
+        f"│ Gap sekarang: *{curr_gap:+.3f}%*\n"
+        f"│ Jarak ke TP:   {dist_to_tp:+.3f}% (exit ±{et}%)\n"
+        f"│ Jarak ke Invalid: {dist_to_inv:.3f}% (invalid ±{it}%)\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Δ Gap (perubahan gap):*\n"
+        f"┌─────────────────────\n"
+        f"│ 15m: {_ds(d15)} {trend_e}\n"
+        f"│ 30m: {_ds(d30)}\n"
+        f"│ 60m: {_ds(d60)}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Momentum:* {momentum}\n"
+        f"*ETA ke TP:* {eta_s}\n"
+        f"\n"
+        f"_Dari {vel['n_pts']} pts terakhir~_",
+        reply_chat,
+    )
 
 
 def handle_health_command(reply_chat: str) -> None:
@@ -2516,6 +2912,9 @@ def handle_help_command(reply_chat: str) -> None:
     peak_s  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
     cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset"
     pos_str = pos_data.get("strategy") or "belum diset"
+    eth_fr  = pos_data.get("eth_funding_rate")
+    btc_fr  = pos_data.get("btc_funding_rate")
+    fr_str  = f"ETH {eth_fr:+.4f}% / BTC {btc_fr:+.4f}%" if eth_fr is not None else "belum diset"
     send_reply(
         "Ara ara~ ini semua yang bisa Akeno lakukan~ Ufufufu... (◕‿◕)\n"
         "\n"
@@ -2524,26 +2923,31 @@ def handle_help_command(reply_chat: str) -> None:
         "`/interval` `/lookback` `/heartbeat`\n"
         "`/threshold entry|exit|invalid <val>`\n"
         "`/sltp sl <val>` | `/peak on|off|<val>`\n"
-        f"_Peak sekarang: {peak_s}_\n"
+        f"_Peak: {peak_s}_\n"
         "\n"
-        "*🧠 Analysis:*\n"
+        "*🧠 Market Analysis:*\n"
         f"`/capital <usd>` _(sekarang: {cap_str})_\n"
-        "`/ratio` — ratio monitor + conviction + entry readiness\n"
+        "`/ratio` — ratio + conviction + entry readiness ✅❌\n"
+        "`/analysis` — full market snapshot\n"
+        "`/velocity` — gap velocity & ETA ke TP\n"
         "`/pnl` — net P&L posisi bot\n"
-        "`/analysis` — full snapshot\n"
         "\n"
         "*🏥 Position Health Tracker:*\n"
         f"`/setpos S1|S2 eth <entry> <qty> <lev>x btc <entry> <qty> <lev>x`\n"
+        f"_Optional: `ethval <usd> btcval <usd> ethliq <price> btcliq <price>`_\n"
         f"_Posisi: {pos_str}_ | _Tersimpan di Redis~_\n"
-        "`/health` — leverage, margin ratio, UPnL, liq price\n"
-        "`/clearpos` — hapus data posisi\n"
+        "`/health` — leverage, margin, UPnL, liq, funding, velocity\n"
+        f"`/setfunding eth <rate> btc <rate>` _(sekarang: {fr_str})_\n"
+        "`/clearpos` — hapus semua data posisi\n"
         "\n"
-        "*S1* (Long BTC / Short ETH):\n"
+        "*Contoh S1* (Long BTC / Short ETH):\n"
         "`/setpos S1 eth 2011 -1.49 50x btc 67794 0.029 50x`\n"
-        "*S2* (Long ETH / Short BTC):\n"
+        "`/setpos S1 eth 2011 -1.49 50x btc 67794 0.029 50x ethval 3000 btcval 2000`\n"
+        "*Contoh S2* (Long ETH / Short BTC):\n"
         "`/setpos S2 eth 1956 15.58 10x btc 67586 -0.44 10x`\n"
+        "`/setfunding eth 0.0100 btc -0.0050`\n"
         "\n"
-        "_Entry signal otomatis: driver, ratio, sizing, skenario, TP/TSL harga~ ⚡_",
+        "_Entry signal otomatis: driver, ratio, sizing, skenario, TP/TSL~ ⚡_",
         reply_chat,
     )
 
@@ -2680,8 +3084,14 @@ def main_loop() -> None:
                             price_then.btc, price_then.eth,
                         )
                         scan_stats["last_gap"]     = gap
-                        scan_stats["last_btc_ret"] = btc_ret
+                        scan_stats["last_btc_ret"] = eth_ret
                         scan_stats["last_eth_ret"] = eth_ret
+
+                        # Gap velocity history
+                        _now = datetime.now(timezone.utc)
+                        gap_history.append((_now, float(gap)))
+                        if len(gap_history) > MAX_GAP_HISTORY:
+                            gap_history.pop(0)
 
                         logger.info(
                             f"Mode: {current_mode.value} | "
