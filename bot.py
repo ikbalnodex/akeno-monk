@@ -380,7 +380,13 @@ def process_commands() -> None:
         dispatch = {
             "/settings":  lambda: handle_settings_command(chat_id),
             "/status":    lambda: handle_status_command(chat_id),
-            "/help":      lambda: handle_help_command(chat_id),
+            "/help": lambda: (
+                handle_help_market_command(chat_id)  if args and args[0].lower() in ("market", "m") else
+                handle_help_pos_command(chat_id)     if args and args[0].lower() in ("pos", "p", "health") else
+                handle_help_config_command(chat_id)  if args and args[0].lower() in ("config", "c", "conf") else
+                handle_help_example_command(chat_id) if args and args[0].lower() in ("example", "ex", "contoh") else
+                handle_help_command(chat_id)
+            ),
             "/start":     lambda: handle_help_command(chat_id),
             "/interval":  lambda: handle_interval_command(args, chat_id),
             "/threshold": lambda: handle_threshold_command(args, chat_id),
@@ -3394,45 +3400,169 @@ def handle_clearpos_command(reply_chat: str) -> None:
 
 
 def handle_help_command(reply_chat: str) -> None:
-    peak_s  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
-    cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset"
-    pos_str = pos_data.get("strategy") or "belum diset"
-    eth_fr  = pos_data.get("eth_funding_rate")
-    btc_fr  = pos_data.get("btc_funding_rate")
-    fr_str  = f"ETH {eth_fr:+.4f}% / BTC {btc_fr:+.4f}%" if eth_fr is not None else "belum diset"
+    """
+    /help          — menu utama
+    /help market   — perintah analisis pasar
+    /help pos      — position health tracker
+    /help config   — konfigurasi bot
+    /help examples — contoh lengkap setpos & setfunding
+    """
+    args_raw = getattr(handle_help_command, "_last_args", [])
+
+    peak_s  = "✅" if settings["peak_enabled"] else "❌"
+    cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "—"
+    pos_str = pos_data.get("strategy") or "—"
+    mode_s  = current_mode.value if current_mode else "SCAN"
+    gap_s   = f"{float(scan_stats['last_gap']):+.2f}%" if scan_stats.get("last_gap") is not None else "—"
+
     send_reply(
-        "Ara ara~ ini semua yang bisa Akeno lakukan~ Ufufufu... (◕‿◕)\n"
-        "\n"
-        "*⚙️ Core:*\n"
-        "`/settings` `/status` `/redis`\n"
-        "`/interval` `/lookback` `/heartbeat`\n"
-        "`/threshold entry|exit|invalid <val>`\n"
-        "`/sltp sl <val>` | `/peak on|off|<val>`\n"
-        f"_Peak: {peak_s}_\n"
-        "\n"
-        "*🧠 Market Analysis:*\n"
-        f"`/capital <usd>` _(sekarang: {cap_str})_\n"
-        "`/ratio` — ratio + conviction + entry readiness ✅❌\n"
-        "`/analysis` — full market snapshot\n"
-        "`/velocity` — gap velocity & ETA ke TP\n"
-        "`/pnl` — net P&L posisi bot\n"
-        "\n"
-        "*🏥 Position Health Tracker:*\n"
-        f"`/setpos S1|S2 eth <entry> <qty> <lev>x btc <entry> <qty> <lev>x`\n"
-        f"_Optional: `ethval <usd> btcval <usd> ethliq <price> btcliq <price>`_\n"
-        f"_Posisi: {pos_str}_ | _Tersimpan di Redis~_\n"
-        "`/health` — leverage, margin, UPnL, liq, funding, velocity\n"
-        f"`/setfunding eth <rate> btc <rate>` _(sekarang: {fr_str})_\n"
-        "`/clearpos` — hapus semua data posisi\n"
-        "\n"
-        "*Contoh S1* (Long BTC / Short ETH):\n"
-        "`/setpos S1 eth 2011 -1.49 50x btc 67794 0.029 50x`\n"
-        "`/setpos S1 eth 2011 -1.49 50x btc 67794 0.029 50x ethval 3000 btcval 2000`\n"
-        "*Contoh S2* (Long ETH / Short BTC):\n"
-        "`/setpos S2 eth 1956 15.58 10x btc 67586 -0.44 10x`\n"
-        "`/setfunding eth 0.0100 btc -0.0050`\n"
-        "\n"
-        "_Entry signal otomatis: driver, ratio, sizing, skenario, TP/TSL~ ⚡_",
+        f"📟 *Akeno — Menu Utama*\n"
+        f"_Gap: {gap_s} | Mode: {mode_s} | Peak: {peak_s} | Modal: {cap_str} | Pos: {pos_str}_\n"
+        f"\n"
+        f"Ketik salah satu untuk detail:\n"
+        f"\n"
+        f"📈 `/help market` — Analisis & sinyal\n"
+        f"🏥 `/help pos`    — Position tracker\n"
+        f"⚙️ `/help config` — Konfigurasi bot\n"
+        f"📋 `/help example`— Contoh perintah\n"
+        f"\n"
+        f"*Shortcut cepat:*\n"
+        f"`/analysis` `/ratio` `/health` `/status`",
+        reply_chat,
+    )
+
+
+def handle_help_market_command(reply_chat: str) -> None:
+    send_reply(
+        f"📈 *Market Analysis*\n"
+        f"───────────────────\n"
+        f"`/analysis`  — Snapshot lengkap\n"
+        f"             _(regime + gap + ratio + setup)_\n"
+        f"\n"
+        f"`/ratio`     — ETH/BTC ratio detail\n"
+        f"             _(conviction + entry readiness)_\n"
+        f"\n"
+        f"`/velocity`  — Kecepatan gap & ETA TP\n"
+        f"\n"
+        f"`/pnl`       — Net P&L posisi bot aktif\n"
+        f"\n"
+        f"`/capital <usd>`\n"
+        f"             — Set modal untuk sizing\n"
+        f"\n"
+        f"───────────────────\n"
+        f"_Sinyal otomatis dikirim saat gap ±threshold~_",
+        reply_chat,
+    )
+
+
+def handle_help_pos_command(reply_chat: str) -> None:
+    eth_fr = pos_data.get("eth_funding_rate")
+    btc_fr = pos_data.get("btc_funding_rate")
+    fr_str = f"ETH {eth_fr:+.4f}% / BTC {btc_fr:+.4f}%" if eth_fr is not None else "belum diset"
+    pos_s  = pos_data.get("strategy") or "belum diset"
+    send_reply(
+        f"🏥 *Position Health Tracker*\n"
+        f"_Posisi aktif: {pos_s}_\n"
+        f"───────────────────\n"
+        f"`/health`    — Cek health posisi\n"
+        f"             _(margin, UPnL, liq, funding)_\n"
+        f"\n"
+        f"`/setpos`    — Daftarkan posisi baru\n"
+        f"             _/help example untuk format_\n"
+        f"\n"
+        f"`/setfunding eth <r> btc <r>`\n"
+        f"             — Set funding rate/8h\n"
+        f"             _{fr_str}_\n"
+        f"\n"
+        f"`/clearpos`  — Hapus data posisi\n"
+        f"\n"
+        f"───────────────────\n"
+        f"_Data tersimpan di Redis, survive restart~_",
+        reply_chat,
+    )
+
+
+def handle_help_config_command(reply_chat: str) -> None:
+    et    = settings["entry_threshold"]
+    xt    = settings["exit_threshold"]
+    it    = settings["invalidation_threshold"]
+    sl    = settings["sl_pct"]
+    peak  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+    pr    = settings["peak_reversal"]
+    ec_s  = int(settings["exit_confirm_scans"])
+    ec_b  = float(settings["exit_confirm_buffer"])
+    ec_p  = float(settings["exit_pnl_gate"])
+    hb    = settings["heartbeat_minutes"]
+    iv    = settings["scan_interval"]
+    lk    = settings["lookback_hours"]
+    send_reply(
+        f"⚙️ *Konfigurasi Bot*\n"
+        f"───────────────────\n"
+        f"*Threshold:*\n"
+        f"  Entry:      ±{et}%\n"
+        f"  Exit/TP:    ±{xt}%\n"
+        f"  Invalid:    ±{it}%\n"
+        f"  Trail SL:   {sl}%\n"
+        f"\n"
+        f"*Peak Mode:* {peak} ({pr}% reversal)\n"
+        f"\n"
+        f"*Exit Confirmation:*\n"
+        f"  Scans:  {ec_s}x\n"
+        f"  Buffer: {ec_b:.2f}%\n"
+        f"  P&L gate: {ec_p:.2f}%\n"
+        f"\n"
+        f"*Timing:*\n"
+        f"  Scan:      {iv}s\n"
+        f"  Lookback:  {lk}h\n"
+        f"  Heartbeat: {hb}m\n"
+        f"\n"
+        f"───────────────────\n"
+        f"*Ubah dengan:*\n"
+        f"`/threshold entry|exit|invalid <val>`\n"
+        f"`/sltp sl <val>`\n"
+        f"`/peak on|off|<val>`\n"
+        f"`/exitconf scans|buffer|pnl <val>`\n"
+        f"`/interval <detik>`\n"
+        f"`/lookback <jam>`\n"
+        f"`/heartbeat <menit>`",
+        reply_chat,
+    )
+
+
+def handle_help_example_command(reply_chat: str) -> None:
+    et = settings["exit_threshold"]
+    send_reply(
+        f"📋 *Contoh Perintah*\n"
+        f"───────────────────\n"
+        f"*S1 — Long BTC / Short ETH:*\n"
+        f"`/setpos S1`\n"
+        f"`  eth 2011.56 -1.4907 50x`\n"
+        f"`  btc 67794.76 0.029491 50x`\n"
+        f"\n"
+        f"_Optional tambahan di akhir:_\n"
+        f"`  ethval 3000 btcval 2000`\n"
+        f"`  ethliq 1431 btcliq 85000`\n"
+        f"\n"
+        f"*S2 — Long ETH / Short BTC:*\n"
+        f"`/setpos S2`\n"
+        f"`  eth 1956.40 15.58 10x`\n"
+        f"`  btc 67586.10 -0.4439 10x`\n"
+        f"\n"
+        f"*Funding rate:*\n"
+        f"`/setfunding eth 0.0100 btc 0.0080`\n"
+        f"\n"
+        f"*Exit confirmation:*\n"
+        f"`/exitconf scans 2`\n"
+        f"`/exitconf buffer 0.2`\n"
+        f"`/exitconf pnl 0.3`\n"
+        f"\n"
+        f"*Threshold cepat:*\n"
+        f"`/threshold entry 1.2`\n"
+        f"`/threshold exit {et}`\n"
+        f"\n"
+        f"───────────────────\n"
+        f"_qty positif = Long | negatif = Short_\n"
+        f"_angka boleh pakai koma: 2,011.56 ✅_",
         reply_chat,
     )
 
