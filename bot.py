@@ -458,7 +458,7 @@ def analyze_gap_driver(
     gap:     float,
 ) -> Tuple[str, str, str]:
     """
-    Identifikasi siapa yang menggerakkan gap.
+    Identifikasi siapa yang menggerakkan gap (lookback window saja).
     Returns: (driver_label, emoji, explanation)
     """
     abs_btc = abs(btc_ret)
@@ -485,6 +485,155 @@ def analyze_gap_driver(
         explain = f"ETH {eth_contrib:.0f}% / BTC {btc_contrib:.0f}% — keduanya berkontribusi"
 
     return driver, emoji, explain
+
+
+def calc_dominance_score() -> dict:
+    """
+    Hitung ETH vs BTC dominance score dari multi-timeframe (1h, 4h, 24h).
+
+    Logika:
+      per timeframe: dominance = ETH_ret - BTC_ret
+      ETH > BTC → ETH dominant (positif)
+      BTC > ETH → BTC dominant (negatif)
+
+    Weighted score: 1h×1 + 4h×2 + 24h×3 (max ±6 normalized units)
+
+    Score > 0  → ETH dominant  → S1 signal (Short ETH yang terlalu tinggi)
+    Score < 0  → BTC dominant  → S2 signal (Short BTC yang terlalu tinggi)
+
+    Returns:
+      score          : float (raw weighted)
+      score_norm     : float (-1.0 to +1.0 normalized)
+      dominant       : "ETH" / "BTC" / "Seimbang"
+      strength       : "Ekstrem" / "Kuat" / "Moderat" / "Lemah"
+      signal         : "S1" / "S2" / None
+      aligned_with   : lambda strategy → bool
+      tf             : dict {1h/4h/24h: {btc, eth, diff}}
+      label          : str (human readable)
+      conviction_adj : int (-2 / -1 / 0 / +1 / +2) — adjustment ke conviction
+    """
+    if not price_history or len(price_history) < 3:
+        return {
+            "score": 0, "score_norm": 0, "dominant": "N/A",
+            "strength": "N/A", "signal": None, "tf": {},
+            "label": "Data belum cukup", "conviction_adj": 0,
+        }
+
+    now_pt   = price_history[-1]
+    btc_now  = float(now_pt.btc)
+    eth_now  = float(now_pt.eth)
+    interval = settings["scan_interval"]
+
+    def _ret(minutes: int):
+        scans_back = max(1, int(minutes * 60 / interval))
+        if len(price_history) <= scans_back:
+            return None, None
+        old = price_history[-scans_back - 1]
+        return (
+            (btc_now - float(old.btc)) / float(old.btc) * 100,
+            (eth_now - float(old.eth)) / float(old.eth) * 100,
+        )
+
+    btc_1h,  eth_1h  = _ret(60)
+    btc_4h,  eth_4h  = _ret(240)
+    btc_24h, eth_24h = _ret(1440)
+
+    tf = {}
+    weighted_sum = 0.0
+    weight_total = 0.0
+
+    for (label, btc_v, eth_v, weight) in [
+        ("1h",  btc_1h,  eth_1h,  1),
+        ("4h",  btc_4h,  eth_4h,  2),
+        ("24h", btc_24h, eth_24h, 3),
+    ]:
+        if btc_v is not None and eth_v is not None:
+            diff = eth_v - btc_v   # positive = ETH dominant, negative = BTC dominant
+            tf[label] = {"btc": btc_v, "eth": eth_v, "diff": diff}
+            weighted_sum += diff * weight
+            weight_total += weight
+
+    if weight_total == 0:
+        return {
+            "score": 0, "score_norm": 0, "dominant": "N/A",
+            "strength": "N/A", "signal": None, "tf": tf,
+            "label": "Data belum cukup", "conviction_adj": 0,
+        }
+
+    score      = weighted_sum / weight_total   # avg weighted diff %
+    abs_score  = abs(score)
+
+    # Normalize ke -1..+1 menggunakan 3% sebagai "extreme" reference
+    score_norm = max(-1.0, min(1.0, score / 3.0))
+
+    # Dominance & strength
+    if abs_score >= 2.0:   strength = "Ekstrem";  conv_adj = 2
+    elif abs_score >= 1.0: strength = "Kuat";     conv_adj = 1
+    elif abs_score >= 0.3: strength = "Moderat";  conv_adj = 0
+    else:                  strength = "Lemah";    conv_adj = -1
+
+    if score > 0.3:
+        dominant = "ETH"
+        signal   = Strategy.S1   # ETH terlalu tinggi → Short ETH
+        emoji    = "🟡"
+        label    = f"ETH dominant {strength} ({score:+.2f}%) → S1 favored"
+    elif score < -0.3:
+        dominant = "BTC"
+        signal   = Strategy.S2   # BTC terlalu tinggi → Short BTC
+        emoji    = "🟠"
+        label    = f"BTC dominant {strength} ({score:+.2f}%) → S2 favored"
+    else:
+        dominant = "Seimbang"
+        signal   = None
+        emoji    = "⚪"
+        label    = f"Seimbang ({score:+.2f}%) — tidak ada dominance jelas"
+        conv_adj = -1
+
+    return {
+        "score":         score,
+        "score_norm":    score_norm,
+        "dominant":      dominant,
+        "strength":      strength,
+        "signal":        signal,
+        "emoji":         emoji,
+        "tf":            tf,
+        "label":         label,
+        "conviction_adj": conv_adj,
+    }
+
+
+def check_dominance_alignment(strategy: Strategy, dom: dict) -> Tuple[str, str, int]:
+    """
+    Cek apakah dominance score align dengan strategi yang akan dientry.
+
+    Returns: (status, message, conviction_adj)
+      status: "STRONG" / "OK" / "WEAK" / "AGAINST"
+    """
+    dom_signal = dom.get("signal")
+    strength   = dom.get("strength", "N/A")
+    score      = dom.get("score", 0)
+    conv_adj   = dom.get("conviction_adj", 0)
+
+    if dom_signal == strategy:
+        # Align sempurna
+        if strength == "Ekstrem":
+            return "STRONG", f"✅ Dominance *Ekstrem* align — {dom['label']}", +2
+        elif strength == "Kuat":
+            return "STRONG", f"✅ Dominance *Kuat* align — {dom['label']}", +1
+        else:
+            return "OK", f"✅ Dominance align ({strength}) — {dom['label']}", 0
+
+    elif dom_signal is None:
+        # Seimbang — netral
+        return "WEAK", f"⚠️ Dominance lemah/seimbang — conviction berkurang", -1
+
+    else:
+        # Berlawanan
+        opp = "ETH" if strategy == Strategy.S1 else "BTC"
+        return "AGAINST", (
+            f"⚠️ Dominance berlawanan — *{dom['dominant']} dominant* tapi kamu entry {strategy.value}\n"
+            f"  {opp} sedang outperform, gap bisa melebar lebih lanjut"
+        ), -2
 
 
 def detect_market_regime() -> dict:
@@ -1843,6 +1992,20 @@ def build_entry_message(
     avg_str   = f"{avg_r:.5f}"  if avg_r  else "N/A"
     pct_str   = f"{pct_r}th"    if pct_r is not None else "N/A"
 
+    # Dominance score (calculated early, used in regime section + conviction)
+    dom      = calc_dominance_score()
+    dom_status, dom_msg, dom_conv = check_dominance_alignment(strategy, dom)
+
+    # Adjust conviction stars berdasarkan dominance alignment
+    star_list   = ["", "⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"]
+    current_lvl = len(stars)  # 1-5
+    adj_lvl     = max(1, min(5, current_lvl + dom_conv))
+    stars_adj   = star_list[adj_lvl]
+    conv_adj_label = (
+        f" _(+{dom_conv} dominance)_" if dom_conv > 0 else
+        f" _({dom_conv} dominance)_"  if dom_conv < 0 else ""
+    )
+
     # ── 3. Target Harga ───────────────────────────────────────────────────────
     eth_tp, btc_ref = calc_tp_target_price(strategy)
     eth_tp_str      = f"${eth_tp:,.2f}"  if eth_tp  else "N/A"
@@ -1863,12 +2026,13 @@ def build_entry_message(
         scen_a_str   = f"ETH naik ke *${eth_a:,.2f}*"  if eth_a else "N/A"
         scen_b_str   = f"BTC turun ke *${btc_b:,.2f}*" if btc_b else "N/A"
 
-    # ── 5. Market Regime ─────────────────────────────────────────────────────
+    # ── 5. Market Regime + Dominance ─────────────────────────────────────────
     reg = detect_market_regime()
+    dom = calc_dominance_score()
+    dom_status, dom_msg, dom_conv = check_dominance_alignment(strategy, dom)
 
     # Validasi kesesuaian regime dengan strategi
     if strategy == Strategy.S1:
-        # S1 ideal: BULLISH (pump, ETH outperform BTC)
         if reg["regime"] == "BULLISH" and reg["strength"] == "Kuat":
             regime_fit = "✅ Ideal — market pump kuat, ETH outperform BTC"
         elif reg["regime"] == "BULLISH":
@@ -1878,7 +2042,6 @@ def build_entry_message(
         else:
             regime_fit = "⚠️ Market dump — S1 berisiko, BTC ikut turun"
     else:
-        # S2 ideal: BEARISH (dump, ETH underperform BTC)
         if reg["regime"] == "BEARISH" and reg["strength"] == "Kuat":
             regime_fit = "✅ Ideal — market dump kuat, ETH underperform BTC"
         elif reg["regime"] == "BEARISH":
@@ -1888,9 +2051,25 @@ def build_entry_message(
         else:
             regime_fit = "⚠️ Market pump — S2 berisiko, ETH ikut naik"
 
+    # Dominance tf breakdown (1h/4h/24h)
+    def _dom_tf_line(key):
+        t = dom["tf"].get(key)
+        if not t: return ""
+        arr = "🟡 ETH" if t["diff"] > 0.1 else ("🟠 BTC" if t["diff"] < -0.1 else "⚪ Seimbang")
+        return f"│   {key}: BTC {t['btc']:+.2f}% | ETH {t['eth']:+.2f}% → {arr} ({t['diff']:+.2f}%)\n"
+
+    dom_block = (
+        f"│ Dominance: {dom['emoji']} *{dom['dominant']}* {dom.get('strength','')} (score {dom['score']:+.2f}%)\n"
+        + _dom_tf_line("1h")
+        + _dom_tf_line("4h")
+        + _dom_tf_line("24h")
+        + f"│ {dom_msg}\n"
+    )
+
     regime_line = (
         f"│ Market:   {reg['emoji']} *{reg['regime']}* {reg['strength']}\n"
         f"│ {regime_fit}\n"
+        f"{dom_block}"
     )
 
     # ── 6. Sizing ─────────────────────────────────────────────────────────────
@@ -1949,7 +2128,7 @@ def build_entry_message(
         f"│ Sekarang:   {ratio_str}\n"
         f"│ {lb} avg:   {avg_str}\n"
         f"│ Percentile: *{pct_str}*\n"
-        f"│ Conviction: {stars}\n"
+        f"│ Conviction: {stars_adj}{conv_adj_label}\n"
         f"│ _{conviction}_\n"
         f"└─────────────────────\n"
         f"\n"
@@ -3075,11 +3254,11 @@ def handle_analysis_command(reply_chat: str) -> None:
 
     # Market Regime
     reg = detect_market_regime()
+    dom = calc_dominance_score()
 
     def _pct(v): return f"{v:+.2f}%" if v is not None else "N/A"
 
     def _recap(btc_v, eth_v, label):
-        """Buat baris recap siapa lebih kencang di timeframe ini."""
         if btc_v is None or eth_v is None:
             return f"│ {label}: N/A"
         gap_tf  = eth_v - btc_v
@@ -3092,6 +3271,15 @@ def handle_analysis_command(reply_chat: str) -> None:
             who = f"🟠 BTC lebih {'pump' if btc_v > 0 else 'sedikit turun'} {abs_gap:.2f}%"
         return f"│ {label}: BTC {_pct(btc_v)} | ETH {_pct(eth_v)} → {who}"
 
+    # Dominance tf rows
+    def _dom_row(key):
+        t = dom["tf"].get(key)
+        if not t: return ""
+        arr = "🟡 ETH" if t["diff"] > 0.1 else ("🟠 BTC" if t["diff"] < -0.1 else "⚪")
+        return f"│ {key}: BTC {t['btc']:+.2f}% | ETH {t['eth']:+.2f}% → {arr} ({t['diff']:+.2f}%)\n"
+
+    dom_signal_str = f"→ *{dom['signal'].value}* favored" if dom.get("signal") else "→ tidak ada sinyal dominance"
+
     reg_block = (
         f"*🌍 Market Regime:*\n"
         f"┌─────────────────────\n"
@@ -3101,6 +3289,11 @@ def handle_analysis_command(reply_chat: str) -> None:
         f"{_recap(reg['btc_1h'],  reg['eth_1h'],  ' 1h')}\n"
         f"{_recap(reg['btc_4h'],  reg['eth_4h'],  ' 4h')}\n"
         f"{_recap(reg['btc_24h'], reg['eth_24h'], '24h')}\n"
+        f"├─────────────────────\n"
+        f"│ 📊 *Dominance Score: {dom['emoji']} {dom['dominant']} {dom.get('strength','')}*\n"
+        f"│ _{dom['label']}_\n"
+        f"│ Score: {dom['score']:+.2f}% weighted avg {dom_signal_str}\n"
+        + _dom_row("1h") + _dom_row("4h") + _dom_row("24h") +
         f"├─────────────────────\n"
         f"│ Volatilitas: {reg['volatility']} ({reg['vol_pct']:.3f}%/scan)\n"
         f"└─────────────────────\n"
