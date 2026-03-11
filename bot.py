@@ -3022,18 +3022,31 @@ def handle_analysis_command(reply_chat: str) -> None:
 
     def _pct(v): return f"{v:+.2f}%" if v is not None else "N/A"
 
+    def _recap(btc_v, eth_v, label):
+        """Buat baris recap siapa lebih kencang di timeframe ini."""
+        if btc_v is None or eth_v is None:
+            return f"│ {label}: N/A"
+        gap_tf  = eth_v - btc_v
+        abs_gap = abs(gap_tf)
+        if abs_gap < 0.1:
+            who = "⚪ Seimbang"
+        elif eth_v > btc_v:
+            who = f"🟡 ETH lebih {'pump' if eth_v > 0 else 'sedikit turun'} {abs_gap:.2f}%"
+        else:
+            who = f"🟠 BTC lebih {'pump' if btc_v > 0 else 'sedikit turun'} {abs_gap:.2f}%"
+        return f"│ {label}: BTC {_pct(btc_v)} | ETH {_pct(eth_v)} → {who}"
+
     reg_block = (
         f"*🌍 Market Regime:*\n"
         f"┌─────────────────────\n"
-        f"│ Regime:  {reg['emoji']} *{reg['regime']}* — {reg['strength']}\n"
+        f"│ {reg['emoji']} *{reg['regime']}* — {reg['strength']}\n"
         f"│ _{reg['description']}_\n"
-        f"│\n"
-        f"│          BTC        ETH\n"
-        f"│ 1h:   {_pct(reg['btc_1h']):>8}   {_pct(reg['eth_1h'])}\n"
-        f"│ 4h:   {_pct(reg['btc_4h']):>8}   {_pct(reg['eth_4h'])}\n"
-        f"│ 24h:  {_pct(reg['btc_24h']):>8}   {_pct(reg['eth_24h'])}\n"
-        f"│\n"
-        f"│ Volatilitas: {reg['volatility']} ({reg['vol_pct']:.3f}%/scan avg 1h)\n"
+        f"├─────────────────────\n"
+        f"{_recap(reg['btc_1h'],  reg['eth_1h'],  ' 1h')}\n"
+        f"{_recap(reg['btc_4h'],  reg['eth_4h'],  ' 4h')}\n"
+        f"{_recap(reg['btc_24h'], reg['eth_24h'], '24h')}\n"
+        f"├─────────────────────\n"
+        f"│ Volatilitas: {reg['volatility']} ({reg['vol_pct']:.3f}%/scan)\n"
         f"└─────────────────────\n"
         f"_{reg['implications']}_\n"
     )
