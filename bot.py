@@ -105,11 +105,11 @@ entry_driver:    Optional[str]     = None   # "ETH-led" / "BTC-led" / "Mixed"
 settings = {
     # — Core —
     "scan_interval":          SCAN_INTERVAL_SECONDS,
-    "entry_threshold":        ENTRY_THRESHOLD,
-    "exit_threshold":         EXIT_THRESHOLD,
+    "entry_threshold":        1.5,
+    "exit_threshold":         0.2,
     "invalidation_threshold": INVALIDATION_THRESHOLD,
     "peak_reversal":          0.3,
-    "peak_enabled":           True,
+    "peak_enabled":           False,
     "lookback_hours":         DEFAULT_LOOKBACK_HOURS,
     "heartbeat_minutes":      30,
     "sl_pct":                 1.0,
@@ -124,6 +124,38 @@ settings = {
     "exit_confirm_buffer":    0.0,     # 0.0 = disable; misal 0.3 = exit di threshold - 0.3%
     # Lapis 3: P&L gate — exit hanya kalau net P&L ≥ X% dari margin (pakai pos_data)
     "exit_pnl_gate":          0.0,     # 0.0 = disable; misal 0.5 = minimal +0.5% net
+    # — Sizing Ratio —
+    # eth_size_ratio: % dari modal ke ETH leg (0-100), sisanya ke BTC
+    # 50.0 = dollar-neutral | 60.0 = ETH 60% / BTC 40%
+    "eth_size_ratio":         50.0,
+    # — Regime Filter —
+    # Blokir entry kalau arah gap berlawanan dengan kondisi market
+    # S1 hanya valid saat BULLISH | S2 hanya valid saat BEARISH
+    # pump + ETH < BTC (gap -) = SKIP S2 | dump + ETH > BTC (gap +) = SKIP S1
+    "regime_filter_enabled":  True,
+    # — Simulation Mode —
+    "sim_enabled":            False,   # bot otomatis open/close posisi saat sinyal
+    "sim_margin_usd":         100.0,   # margin per leg dalam USD
+    "sim_leverage":           10.0,    # leverage (sama untuk dua leg)
+    "sim_fee_pct":            0.06,    # taker fee % per side (default Bybit/OKX)
+}
+
+# Simulation trade state — diisi otomatis saat entry signal, dikosongkan saat exit
+sim_trade: dict = {
+    "active":        False,
+    "strategy":      None,    # "S1" / "S2"
+    "eth_entry":     None,    # float, harga ETH saat open
+    "btc_entry":     None,    # float, harga BTC saat open
+    "eth_qty":       None,    # float, signed (+long / -short)
+    "btc_qty":       None,    # float, signed
+    "eth_notional":  None,    # float, USD
+    "btc_notional":  None,    # float, USD
+    "eth_margin":    None,    # float, USD
+    "btc_margin":    None,    # float, USD
+    "fee_open":      None,    # float, total fee saat buka 2 leg
+    "opened_at":     None,    # ISO string
+    # Rekap closed trades
+    "history":       [],      # list of dict per trade
 }
 
 last_update_id:      int                = 0
@@ -396,7 +428,11 @@ def process_commands() -> None:
             "/sltp":      lambda: handle_sltp_command(args, chat_id),
             "/redis":     lambda: handle_redis_command(chat_id),
             # — Swing / Day Trade —
-            "/capital":   lambda: handle_capital_command(args, chat_id),
+            "/capital":    lambda: handle_capital_command(args, chat_id),
+            "/sizeratio":     lambda: handle_sizeratio_command(args, chat_id),
+            "/regimefilter":  lambda: handle_regimefilter_command(args, chat_id),
+            "/sim":        lambda: handle_sim_command(args, chat_id),
+            "/simstats":   lambda: handle_simstats_command(chat_id),
             "/ratio":     lambda: handle_ratio_command(chat_id),
             "/pnl":       lambda: handle_pnl_command(chat_id),
             "/analysis":  lambda: handle_analysis_command(chat_id),
@@ -543,15 +579,15 @@ def detect_market_regime() -> dict:
 
     # Implikasi untuk pairs strategy
     if regime == "BULLISH" and strength == "Kuat":
-        impl = "⚠️ Bull kuat: S1 (Short ETH) lebih berisiko kalau ETH ikut naik. S2 favored kalau ETH lag."
+        impl = "✅ *S1 setup* — pump kuat, ETH cenderung outperform BTC. Monitor gap, kalau ETH pump lebih % dari BTC → entry S1."
     elif regime == "BULLISH":
-        impl = "S1 moderat OK, tapi awasi ETH — kalau ETH ikut pump, gap bisa melebar dulu."
+        impl = "S1 moderat — pump ada tapi belum kuat. Tunggu ETH jelas outperform BTC sebelum entry S1."
     elif regime == "BEARISH" and strength == "Kuat":
-        impl = "⚠️ Bear kuat: kedua koin turun. Gap lebih mudah terbentuk S1 (BTC bertahan lebih baik dari ETH)."
+        impl = "✅ *S2 setup* — dump kuat, ETH cenderung underperform BTC. Monitor gap, kalau ETH dump lebih % dari BTC → entry S2."
     elif regime == "BEARISH":
-        impl = "Bear moderat — pairs trade biasanya lebih mudah di kondisi ini, spread gap lebih predictable."
+        impl = "S2 moderat — dump ada tapi belum kuat. Tunggu ETH jelas underperform BTC sebelum entry S2."
     else:
-        impl = "✅ Konsolidasi ideal untuk pairs trade — gap lebih mudah revert, volatility rendah = SL jarang kena."
+        impl = "⚠️ Sideways — gap kecil dan tidak sustained. Kedua strategi sulit, lebih baik tunggu arah jelas."
 
     return {
         "regime":     regime,
@@ -571,18 +607,20 @@ def detect_market_regime() -> dict:
 def get_convergence_hint(strategy: Strategy, driver: str) -> str:
     """Prediksi cara konvergensi paling mungkin."""
     if strategy == Strategy.S1:
-        # Gap > 0 (ETH outperform BTC), konvergensi = gap mengecil
+        # Entry saat pump + ETH outperform BTC (gap > 0)
+        # Profit saat ETH pullback atau BTC catch up
         hints = {
-            "ETH-led": "ETH cenderung *pullback* — gap ETH-led biasanya revert lebih cepat",
-            "BTC-led": "BTC perlu *catch up* naik — butuh lebih sabar, tapi lebih sustained",
-            "Mixed":   "Konvergensi bisa dari kedua arah — pantau leg mana yang duluan bergerak",
+            "ETH-led": "ETH pump yang dominan → kemungkinan *ETH pullback* dulu. Revert biasanya lebih cepat.",
+            "BTC-led": "BTC yang ketinggalan naik → tunggu *BTC catch up*. Lebih lambat tapi lebih sustained.",
+            "Mixed":   "Keduanya berkontribusi → bisa revert dari ETH pullback atau BTC catch up.",
         }
     else:
-        # Gap < 0 (ETH underperform BTC), konvergensi = gap mengecil ke nol
+        # Entry saat dump + ETH underperform BTC (gap < 0)
+        # Profit saat ETH bounce atau BTC koreksi lebih dalam
         hints = {
-            "ETH-led": "ETH cenderung *bounce* dari oversold — ETH-led dump biasanya cepat recover",
-            "BTC-led": "BTC perlu *koreksi* turun — BTC-led gap = BTC kuat, butuh sabar lebih",
-            "Mixed":   "Konvergensi bisa dari kedua arah — pantau mana yang duluan bergerak",
+            "ETH-led": "ETH dump yang dominan → kemungkinan *ETH bounce* dulu. Revert biasanya lebih cepat.",
+            "BTC-led": "BTC yang terlalu kuat → tunggu *BTC koreksi*. Lebih lambat, seperti yang terjadi 2x ini.",
+            "Mixed":   "Keduanya berkontribusi → bisa revert dari ETH bounce atau BTC koreksi.",
         }
     return hints.get(driver, "")
 
@@ -777,17 +815,23 @@ def _build_conviction_detail(
 def calc_sizing(
     btc_price: Decimal,
     eth_price: Decimal,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float]:
     """
-    Dollar-neutral sizing. Returns: (half_capital, eth_qty, btc_qty)
+    Asymmetric sizing berdasarkan eth_size_ratio.
+    Returns: (eth_alloc, btc_alloc, eth_qty, btc_qty)
+    eth_size_ratio = 50 → dollar-neutral (50/50)
+    eth_size_ratio = 60 → ETH 60% / BTC 40%
     """
-    capital = settings["capital"]
+    capital   = settings["capital"]
+    eth_ratio = max(1.0, min(99.0, float(settings["eth_size_ratio"]))) / 100.0
+    btc_ratio = 1.0 - eth_ratio
     if capital <= 0 or float(btc_price) <= 0 or float(eth_price) <= 0:
-        return 0.0, 0.0, 0.0
-    half    = capital / 2.0
-    eth_qty = half / float(eth_price)
-    btc_qty = half / float(btc_price)
-    return half, eth_qty, btc_qty
+        return 0.0, 0.0, 0.0, 0.0
+    eth_alloc = capital * eth_ratio
+    btc_alloc = capital * btc_ratio
+    eth_qty   = eth_alloc / float(eth_price)
+    btc_qty   = btc_alloc / float(btc_price)
+    return eth_alloc, btc_alloc, eth_qty, btc_qty
 
 
 def calc_convergence_scenarios(
@@ -900,6 +944,189 @@ def get_pairs_health(
 # =============================================================================
 # ─── POSITION HEALTH ENGINE ──────────────────────────────────────────────────
 # =============================================================================
+
+def sim_open_position(strategy: Strategy, btc_price: float, eth_price: float) -> str:
+    """
+    Otomatis open posisi simulasi saat entry signal.
+    Returns: pesan ringkas untuk dilampirkan ke entry alert.
+    """
+    if not settings["sim_enabled"]:
+        return ""
+    if sim_trade["active"]:
+        return "_⚠️ Sim: posisi sudah aktif, skip open~_\n"
+
+    margin  = float(settings["sim_margin_usd"])
+    lev     = float(settings["sim_leverage"])
+    fee_pct = float(settings["sim_fee_pct"]) / 100.0
+
+    notional   = margin * lev
+    eth_ratio  = float(settings["eth_size_ratio"]) / 100.0
+    btc_ratio  = 1.0 - eth_ratio
+
+    eth_notional = notional * eth_ratio
+    btc_notional = notional * btc_ratio
+    eth_margin_  = eth_notional / lev
+    btc_margin_  = btc_notional / lev
+
+    eth_qty_abs = eth_notional / eth_price
+    btc_qty_abs = btc_notional / btc_price
+
+    # S1: Long BTC (+), Short ETH (-)
+    # S2: Long ETH (+), Short BTC (-)
+    if strategy == Strategy.S1:
+        eth_qty = -eth_qty_abs
+        btc_qty = +btc_qty_abs
+    else:
+        eth_qty = +eth_qty_abs
+        btc_qty = -btc_qty_abs
+
+    fee_open = (eth_notional + btc_notional) * fee_pct
+
+    sim_trade.update({
+        "active":       True,
+        "strategy":     strategy.value,
+        "eth_entry":    eth_price,
+        "btc_entry":    btc_price,
+        "eth_qty":      eth_qty,
+        "btc_qty":      btc_qty,
+        "eth_notional": eth_notional,
+        "btc_notional": btc_notional,
+        "eth_margin":   eth_margin_,
+        "btc_margin":   btc_margin_,
+        "fee_open":     fee_open,
+        "opened_at":    datetime.now(timezone.utc).isoformat(),
+    })
+
+    # Sync ke pos_data agar /health langsung bisa dipakai
+    pos_data.update({
+        "eth_entry_price":  eth_price,
+        "eth_qty":          eth_qty,
+        "eth_notional_usd": eth_notional,
+        "eth_leverage":     lev,
+        "eth_liq_price":    None,
+        "eth_funding_rate": None,
+        "btc_entry_price":  btc_price,
+        "btc_qty":          btc_qty,
+        "btc_notional_usd": btc_notional,
+        "btc_leverage":     lev,
+        "btc_liq_price":    None,
+        "btc_funding_rate": None,
+        "strategy":         strategy.value,
+        "set_at":           sim_trade["opened_at"],
+    })
+    save_pos_data()
+
+    eth_dir = "Long 📈" if eth_qty > 0 else "Short 📉"
+    btc_dir = "Long 📈" if btc_qty > 0 else "Short 📉"
+    er = settings["eth_size_ratio"]; br = 100 - er
+    logger.info(f"SIM OPEN {strategy.value}: ETH {eth_dir} {eth_qty:.4f}@{eth_price} | "
+                f"BTC {btc_dir} {btc_qty:.6f}@{btc_price} | fee ${fee_open:.3f}")
+    return (
+        f"\n"
+        f"🤖 *[SIM] Posisi Dibuka Otomatis*\n"
+        f"┌─────────────────────\n"
+        f"│ ETH: *{eth_dir}* {abs(eth_qty):.4f} @ ${eth_price:,.2f}\n"
+        f"│      Notional: ${eth_notional:,.2f} | Margin: ${eth_margin_:,.2f}\n"
+        f"│ BTC: *{btc_dir}* {abs(btc_qty):.6f} @ ${btc_price:,.2f}\n"
+        f"│      Notional: ${btc_notional:,.2f} | Margin: ${btc_margin_:,.2f}\n"
+        f"│ Leverage: {lev:.0f}x | Ratio: {er:.0f}/{br:.0f}\n"
+        f"│ Fee open: ${fee_open:.3f}\n"
+        f"└─────────────────────\n"
+        f"_Ketik `/health` untuk monitor PnL live~_\n"
+    )
+
+
+def sim_close_position(btc_price: float, eth_price: float, reason: str = "EXIT") -> str:
+    """
+    Otomatis close posisi simulasi saat exit/invalidasi signal.
+    Returns: recap PnL string untuk dilampirkan ke exit alert.
+    """
+    if not settings["sim_enabled"] or not sim_trade["active"]:
+        return ""
+
+    eth_qty      = sim_trade["eth_qty"]
+    btc_qty      = sim_trade["btc_qty"]
+    eth_entry    = sim_trade["eth_entry"]
+    btc_entry    = sim_trade["btc_entry"]
+    eth_notional = sim_trade["eth_notional"]
+    btc_notional = sim_trade["btc_notional"]
+    eth_margin   = sim_trade["eth_margin"]
+    btc_margin   = sim_trade["btc_margin"]
+    fee_pct      = float(settings["sim_fee_pct"]) / 100.0
+    fee_open     = sim_trade["fee_open"]
+    fee_close    = (eth_notional + btc_notional) * fee_pct
+    total_fee    = fee_open + fee_close
+    total_margin = eth_margin + btc_margin
+
+    # PnL per leg
+    eth_pnl = eth_qty * (eth_price - eth_entry)
+    btc_pnl = btc_qty * (btc_price - btc_entry)
+    gross_pnl = eth_pnl + btc_pnl
+    net_pnl   = gross_pnl - total_fee
+    net_pct   = net_pnl / total_margin * 100
+
+    # Duration
+    opened_at = sim_trade.get("opened_at")
+    dur_str   = "N/A"
+    if opened_at:
+        try:
+            sa      = datetime.fromisoformat(opened_at)
+            dur_min = int((datetime.now(timezone.utc) - sa).total_seconds() / 60)
+            h, m    = divmod(dur_min, 60)
+            dur_str = f"{h}h {m}m" if h > 0 else f"{m}m"
+        except Exception:
+            pass
+
+    result_e = "🟢" if net_pnl >= 0 else "🔴"
+    result_s = "PROFIT" if net_pnl >= 0 else "LOSS"
+    sign     = "+" if net_pnl >= 0 else ""
+
+    # Simpan ke history
+    sim_trade["history"].append({
+        "strategy":   sim_trade["strategy"],
+        "reason":     reason,
+        "eth_entry":  eth_entry, "eth_exit": eth_price,
+        "btc_entry":  btc_entry, "btc_exit": btc_price,
+        "gross_pnl":  gross_pnl, "fee": total_fee,
+        "net_pnl":    net_pnl,   "net_pct": net_pct,
+        "duration":   dur_str,
+        "closed_at":  datetime.now(timezone.utc).isoformat(),
+    })
+
+    # Reset sim state
+    sim_trade.update({
+        "active": False, "strategy": None,
+        "eth_entry": None, "btc_entry": None,
+        "eth_qty": None, "btc_qty": None,
+        "eth_notional": None, "btc_notional": None,
+        "eth_margin": None, "btc_margin": None,
+        "fee_open": None, "opened_at": None,
+    })
+    # Bersihkan pos_data
+    for k in ["eth_entry_price","eth_qty","eth_notional_usd","eth_leverage","eth_liq_price",
+              "btc_entry_price","btc_qty","btc_notional_usd","btc_leverage","btc_liq_price","strategy","set_at"]:
+        pos_data[k] = None
+    save_pos_data()
+
+    logger.info(f"SIM CLOSE {reason}: net P&L ${net_pnl:.2f} ({net_pct:.2f}%) | fee ${total_fee:.3f}")
+    return (
+        f"\n"
+        f"🤖 *[SIM] Posisi Ditutup — {result_e} {result_s}*\n"
+        f"┌─────────────────────\n"
+        f"│ ETH: {eth_entry:,.2f} → {eth_price:,.2f} "
+        f"({'▲' if eth_price>eth_entry else '▼'}{abs(eth_price-eth_entry)/eth_entry*100:.2f}%)\n"
+        f"│ BTC: {btc_entry:,.2f} → {btc_price:,.2f} "
+        f"({'▲' if btc_price>btc_entry else '▼'}{abs(btc_price-btc_entry)/btc_entry*100:.2f}%)\n"
+        f"├─────────────────────\n"
+        f"│ Gross PnL:  {'+' if gross_pnl>=0 else ''}${gross_pnl:.2f}\n"
+        f"│ Fee total:  -${total_fee:.3f}\n"
+        f"│ *Net PnL:   {sign}${net_pnl:.2f} ({sign}{net_pct:.2f}%)*\n"
+        f"│ Modal:      ${total_margin:.2f} | Durasi: {dur_str}\n"
+        f"└─────────────────────\n"
+        f"Total trade: {len(sim_trade['history'])} | "
+        f"Ketik `/simstats` untuk rekap semua~\n"
+    )
+
 
 def calc_gap_velocity() -> dict:
     """
@@ -1479,6 +1706,83 @@ def calc_tp_target_price(strategy: Strategy) -> Tuple[Optional[float], Optional[
 # ─── MESSAGE BUILDERS ────────────────────────────────────────────────────────
 # =============================================================================
 
+def check_regime_filter(strategy: Strategy) -> Tuple[bool, str]:
+    """
+    Cek apakah kondisi market mendukung strategi yang akan dientry.
+
+    S1 (Long BTC / Short ETH):
+      - Butuh BULLISH — market pump, ETH outperform BTC
+      - Blokir kalau BEARISH atau Mixed dengan BTC dominan
+
+    S2 (Short BTC / Long ETH):
+      - Butuh BEARISH — market dump, ETH underperform BTC
+      - Blokir kalau BULLISH atau Mixed dengan BTC dominan
+
+    Returns: (allowed: bool, reason: str)
+    """
+    if not settings["regime_filter_enabled"]:
+        return True, ""
+
+    reg = detect_market_regime()
+    regime   = reg["regime"]    # BULLISH / BEARISH / KONSOLIDASI
+    strength = reg["strength"]  # Kuat / Moderat / Lemah
+    emoji    = reg["emoji"]
+
+    if strategy == Strategy.S1:
+        # S1 = ETH outperform saat pump
+        if regime == "BULLISH":
+            return True, f"{emoji} {regime} {strength} — ✅ sesuai untuk S1"
+        elif regime == "KONSOLIDASI":
+            return True, f"{emoji} Sideways {strength} — ⚠️ S1 bisa, tapi lebih hati-hati"
+        else:
+            # BEARISH saat entry S1 = berbahaya
+            reason = (
+                f"{emoji} Market *{regime} {strength}* — "
+                f"❌ S1 diblokir\n"
+                f"Saat dump, Short ETH berisiko karena BTC bisa turun lebih dalam.\n"
+                f"Tunggu market berbalik BULLISH sebelum S1."
+            )
+            return False, reason
+
+    else:
+        # S2 = ETH underperform saat dump
+        if regime == "BEARISH":
+            return True, f"{emoji} {regime} {strength} — ✅ sesuai untuk S2"
+        elif regime == "KONSOLIDASI":
+            return True, f"{emoji} Sideways {strength} — ⚠️ S2 bisa, tapi lebih hati-hati"
+        else:
+            # BULLISH saat entry S2 = berbahaya (ini yang kamu alami!)
+            reason = (
+                f"{emoji} Market *{regime} {strength}* — "
+                f"❌ S2 diblokir\n"
+                f"Saat pump, Long ETH berisiko karena BTC yang pump bukan ETH lemah.\n"
+                f"Tunggu market berbalik BEARISH sebelum S2."
+            )
+            return False, reason
+
+
+def build_regime_blocked_message(strategy: Strategy, gap: Decimal, reason: str) -> str:
+    """Pesan alert saat entry diblokir karena regime filter."""
+    gap_f = float(gap)
+    reg   = detect_market_regime()
+    btc_r = float(scan_stats.get("last_btc_ret") or 0)
+    eth_r = float(scan_stats.get("last_eth_ret") or 0)
+    return (
+        f"⛔ *ENTRY DIBLOKIR — Regime Filter*\n"
+        f"\n"
+        f"Sinyal *{strategy.value}* muncul tapi kondisi market tidak mendukung~\n"
+        f"\n"
+        f"Gap sekarang: *{gap_f:+.2f}%*\n"
+        f"BTC: {btc_r:+.2f}% | ETH: {eth_r:+.2f}%\n"
+        f"\n"
+        f"*Alasan diblokir:*\n"
+        f"{reason}\n"
+        f"\n"
+        f"_Sinyal akan muncul saat kondisi market sesuai~_\n"
+        f"_`/regimefilter off` untuk matikan filter ini_"
+    )
+
+
 def build_peak_watch_message(strategy: Strategy, gap: Decimal) -> str:
     lb = get_lookback_label()
     if strategy == Strategy.S1:
@@ -1561,37 +1865,61 @@ def build_entry_message(
 
     # ── 5. Market Regime ─────────────────────────────────────────────────────
     reg = detect_market_regime()
+
+    # Validasi kesesuaian regime dengan strategi
+    if strategy == Strategy.S1:
+        # S1 ideal: BULLISH (pump, ETH outperform BTC)
+        if reg["regime"] == "BULLISH" and reg["strength"] == "Kuat":
+            regime_fit = "✅ Ideal — market pump kuat, ETH outperform BTC"
+        elif reg["regime"] == "BULLISH":
+            regime_fit = "✅ OK — market pump moderat"
+        elif reg["regime"] == "KONSOLIDASI":
+            regime_fit = "⚠️ Sideways — S1 bisa tapi gap revert lebih lambat"
+        else:
+            regime_fit = "⚠️ Market dump — S1 berisiko, BTC ikut turun"
+    else:
+        # S2 ideal: BEARISH (dump, ETH underperform BTC)
+        if reg["regime"] == "BEARISH" and reg["strength"] == "Kuat":
+            regime_fit = "✅ Ideal — market dump kuat, ETH underperform BTC"
+        elif reg["regime"] == "BEARISH":
+            regime_fit = "✅ OK — market dump moderat"
+        elif reg["regime"] == "KONSOLIDASI":
+            regime_fit = "⚠️ Sideways — S2 bisa tapi gap revert lebih lambat"
+        else:
+            regime_fit = "⚠️ Market pump — S2 berisiko, ETH ikut naik"
+
     regime_line = (
-        f"│ Market:   {reg['emoji']} *{reg['regime']}* {reg['strength']}"
-        + (f" — ⚠️ Hati-hati" if reg["regime"] == "BEARISH" and reg["strength"] == "Kuat" else "")
-        + "\n"
-        + (f"│ _{reg['implications']}_\n" if reg["regime"] != "KONSOLIDASI" else "│ _✅ Kondisi ideal untuk pairs trade_\n")
+        f"│ Market:   {reg['emoji']} *{reg['regime']}* {reg['strength']}\n"
+        f"│ {regime_fit}\n"
     )
 
-    # ── 6. Dollar-Neutral Sizing ──────────────────────────────────────────────
+    # ── 6. Sizing ─────────────────────────────────────────────────────────────
     sizing_section = ""
-    half, eth_qty, btc_qty = calc_sizing(btc_now, eth_now)
-    if half > 0:
+    eth_ratio = settings["eth_size_ratio"]
+    btc_ratio = 100.0 - eth_ratio
+    ratio_tag = f"{eth_ratio:.0f}/{btc_ratio:.0f}" if eth_ratio != 50.0 else "50/50"
+    eth_alloc, btc_alloc, eth_qty, btc_qty = calc_sizing(btc_now, eth_now)
+    if eth_alloc > 0:
         if strategy == Strategy.S1:
             sizing_section = (
                 f"\n"
-                f"💰 *Sizing Dollar-Neutral (${settings['capital']:,.0f}):*\n"
+                f"💰 *Sizing ({ratio_tag} ETH/BTC, ${settings['capital']:,.0f}):*\n"
                 f"┌─────────────────────\n"
-                f"│ Long BTC:  ${half:,.0f} → {btc_qty:.6f} BTC\n"
-                f"│ Short ETH: ${half:,.0f} → {eth_qty:.4f} ETH\n"
+                f"│ Long BTC:  ${btc_alloc:,.0f} → {btc_qty:.6f} BTC\n"
+                f"│ Short ETH: ${eth_alloc:,.0f} → {eth_qty:.4f} ETH\n"
                 f"└─────────────────────\n"
             )
         else:
             sizing_section = (
                 f"\n"
-                f"💰 *Sizing Dollar-Neutral (${settings['capital']:,.0f}):*\n"
+                f"💰 *Sizing ({ratio_tag} ETH/BTC, ${settings['capital']:,.0f}):*\n"
                 f"┌─────────────────────\n"
-                f"│ Long ETH:  ${half:,.0f} → {eth_qty:.4f} ETH\n"
-                f"│ Short BTC: ${half:,.0f} → {btc_qty:.6f} BTC\n"
+                f"│ Long ETH:  ${eth_alloc:,.0f} → {eth_qty:.4f} ETH\n"
+                f"│ Short BTC: ${btc_alloc:,.0f} → {btc_qty:.6f} BTC\n"
                 f"└─────────────────────\n"
             )
     else:
-        sizing_section = "\n_💡 `/capital <modal>` untuk sizing guide dollar-neutral~_\n"
+        sizing_section = "\n_💡 `/capital <modal>` untuk sizing guide~_\n"
 
     peak_line     = f"│ Peak:     {peak:+.2f}%\n" if not is_direct and peak else ""
     direct_tag    = " _(Peak OFF)_\n" if is_direct else "\n"
@@ -2164,12 +2492,20 @@ def evaluate_and_transition(
             peak, btc_now, eth_now, btc_lb, eth_lb,
             is_direct=is_direct,
         ))
+        # Simulation: auto-open posisi
+        sim_msg = sim_open_position(strategy, float(btc_now), float(eth_now))
+        if sim_msg:
+            send_alert(sim_msg)
         scan_stats["signals_sent"] += 1
 
     # ── SCAN ──────────────────────────────────────────────────────────────────
     if current_mode == Mode.SCAN:
         if gap_float >= entry_thresh:
-            if peak_enabled:
+            allowed, reason = check_regime_filter(Strategy.S1)
+            if not allowed:
+                send_alert(build_regime_blocked_message(Strategy.S1, gap, reason))
+                logger.info(f"S1 BLOCKED by regime filter. Gap: {gap_float:.2f}%")
+            elif peak_enabled:
                 current_mode  = Mode.PEAK_WATCH
                 peak_strategy = Strategy.S1
                 peak_gap      = gap_float
@@ -2180,7 +2516,11 @@ def evaluate_and_transition(
                 logger.info(f"DIRECT ENTRY S1. Gap: {gap_float:.2f}%")
 
         elif gap_float <= -entry_thresh:
-            if peak_enabled:
+            allowed, reason = check_regime_filter(Strategy.S2)
+            if not allowed:
+                send_alert(build_regime_blocked_message(Strategy.S2, gap, reason))
+                logger.info(f"S2 BLOCKED by regime filter. Gap: {gap_float:.2f}%")
+            elif peak_enabled:
                 current_mode  = Mode.PEAK_WATCH
                 peak_strategy = Strategy.S2
                 peak_gap      = gap_float
@@ -2204,8 +2544,14 @@ def evaluate_and_transition(
                 current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
                 logger.info(f"S1 peak cancelled. Gap: {gap_float:.2f}%")
             elif peak_gap - gap_float >= peak_reversal:
-                do_entry(Strategy.S1, is_direct=False)
-                logger.info(f"ENTRY S1. Peak: {peak_gap:.2f}% Entry: {gap_float:.2f}%")
+                allowed, reason = check_regime_filter(Strategy.S1)
+                if not allowed:
+                    send_alert(build_regime_blocked_message(Strategy.S1, gap, reason))
+                    current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
+                    logger.info(f"S1 BLOCKED by regime filter at peak entry. Gap: {gap_float:.2f}%")
+                else:
+                    do_entry(Strategy.S1, is_direct=False)
+                    logger.info(f"ENTRY S1. Peak: {peak_gap:.2f}% Entry: {gap_float:.2f}%")
             else:
                 logger.info(f"S1 peak watch: {gap_float:.2f}% | Peak {peak_gap:.2f}% | Need {peak_reversal}% drop")
 
@@ -2218,8 +2564,14 @@ def evaluate_and_transition(
                 current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
                 logger.info(f"S2 peak cancelled. Gap: {gap_float:.2f}%")
             elif gap_float - peak_gap >= peak_reversal:
-                do_entry(Strategy.S2, is_direct=False)
-                logger.info(f"ENTRY S2. Peak: {peak_gap:.2f}% Entry: {gap_float:.2f}%")
+                allowed, reason = check_regime_filter(Strategy.S2)
+                if not allowed:
+                    send_alert(build_regime_blocked_message(Strategy.S2, gap, reason))
+                    current_mode, peak_gap, peak_strategy = Mode.SCAN, None, None
+                    logger.info(f"S2 BLOCKED by regime filter at peak entry. Gap: {gap_float:.2f}%")
+                else:
+                    do_entry(Strategy.S2, is_direct=False)
+                    logger.info(f"ENTRY S2. Peak: {peak_gap:.2f}% Entry: {gap_float:.2f}%")
             else:
                 logger.info(f"S2 peak watch: {gap_float:.2f}% | Peak {peak_gap:.2f}% | Need {peak_reversal}% rise")
 
@@ -2271,6 +2623,10 @@ def evaluate_and_transition(
                     confirm_note += f" | P&L gate ✅ ({net_str})"
 
                 send_alert(build_exit_message(btc_ret, eth_ret, gap, confirm_note=confirm_note))
+                # Simulation: auto-close posisi
+                sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="EXIT")
+                if sim_msg:
+                    send_alert(sim_msg)
                 logger.info(f"EXIT {active_strategy.value}. Gap: {gap_float:.2f}% "
                             f"| Confirmed: {exit_confirm_count} scans | Buffer: {confirm_buffer}%")
                 reset_to_scan()
@@ -2300,12 +2656,16 @@ def evaluate_and_transition(
 
         if active_strategy == Strategy.S1 and gap_float >= invalid_thresh:
             send_alert(build_invalidation_message(Strategy.S1, btc_ret, eth_ret, gap))
+            sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="INVALID")
+            if sim_msg: send_alert(sim_msg)
             logger.info(f"INVALIDATION S1. Gap: {gap_float:.2f}%")
             reset_to_scan()
             return
 
         if active_strategy == Strategy.S2 and gap_float <= -invalid_thresh:
             send_alert(build_invalidation_message(Strategy.S2, btc_ret, eth_ret, gap))
+            sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="INVALID")
+            if sim_msg: send_alert(sim_msg)
             logger.info(f"INVALIDATION S2. Gap: {gap_float:.2f}%")
             reset_to_scan()
             return
@@ -2327,6 +2687,8 @@ def handle_settings_command(reply_chat: str) -> None:
     ec_scans = int(settings["exit_confirm_scans"])
     ec_buf   = float(settings["exit_confirm_buffer"])
     ec_pnl   = float(settings["exit_pnl_gate"])
+    eth_sr   = settings["eth_size_ratio"]
+    btc_sr   = 100.0 - eth_sr
     ec_str   = (
         f"{ec_scans} scan" + (f" + {ec_buf:.2f}% buffer" if ec_buf > 0 else "") +
         (f" + P&L gate {ec_pnl:.1f}%" if ec_pnl > 0 else "")
@@ -2346,6 +2708,8 @@ def handle_settings_command(reply_chat: str) -> None:
         f"🔍 Peak Mode:      {peak_s} ({settings['peak_reversal']}% reversal)\n"
         f"🛑 Trailing SL:    {settings['sl_pct']}%\n"
         f"🛡️ Exit Confirm:   {ec_str}\n"
+        f"📐 Size Ratio:     ETH {eth_sr:.0f}% / BTC {btc_sr:.0f}%\n"
+        f"🛡️ Regime Filter:  {'✅ ON' if settings['regime_filter_enabled'] else '❌ OFF'}\n"
         f"💰 Modal:          {cap_str}\n"
         f"📈 Ratio Window:   {settings['ratio_window_days']}d\n"
         f"\n"
@@ -2702,12 +3066,14 @@ def handle_analysis_command(reply_chat: str) -> None:
     # Sizing preview
     sizing_str = ""
     if settings["capital"] > 0 and btc_p and eth_p:
-        half, eth_qty, btc_qty = calc_sizing(btc_p, eth_p)
+        eth_r  = settings["eth_size_ratio"]
+        btc_r  = 100.0 - eth_r
+        rtag   = f"{eth_r:.0f}/{btc_r:.0f}" if eth_r != 50.0 else "50/50"
+        eth_alloc, btc_alloc, eth_qty, btc_qty = calc_sizing(btc_p, eth_p)
         sizing_str = (
-            f"\n*💰 Sizing Preview (${settings['capital']:,.0f}):*\n"
-            f"├─ Per sisi:  ${half:,.0f}\n"
-            f"├─ ETH qty:   {eth_qty:.4f} ETH\n"
-            f"└─ BTC qty:   {btc_qty:.6f} BTC\n"
+            f"\n*💰 Sizing Preview ({rtag} ETH/BTC, ${settings['capital']:,.0f}):*\n"
+            f"├─ ETH: ${eth_alloc:,.0f} → {eth_qty:.4f} ETH\n"
+            f"└─ BTC: ${btc_alloc:,.0f} → {btc_qty:.6f} BTC\n"
         )
 
     # Posisi aktif
@@ -2762,12 +3128,14 @@ def handle_capital_command(args: list, reply_chat: str) -> None:
             eth_p = scan_stats.get("last_eth_price")
             preview = ""
             if btc_p and eth_p:
-                half, eth_qty, btc_qty = calc_sizing(btc_p, eth_p)
+                eth_r = settings["eth_size_ratio"]
+                btc_r = 100.0 - eth_r
+                rtag  = f"{eth_r:.0f}/{btc_r:.0f}" if eth_r != 50.0 else "50/50"
+                eth_alloc, btc_alloc, eth_qty, btc_qty = calc_sizing(btc_p, eth_p)
                 preview = (
-                    f"\n*Preview sizing sekarang:*\n"
-                    f"Per sisi: ${half:,.0f}\n"
-                    f"ETH: {eth_qty:.4f} @ ${float(eth_p):,.2f}\n"
-                    f"BTC: {btc_qty:.6f} @ ${float(btc_p):,.2f}\n"
+                    f"\n*Preview sizing ({rtag}):*\n"
+                    f"ETH: ${eth_alloc:,.0f} → {eth_qty:.4f} ETH\n"
+                    f"BTC: ${btc_alloc:,.0f} → {btc_qty:.6f} BTC\n"
                 )
             send_reply(
                 f"💰 *Modal:* ${cap:,.0f}\n{preview}\nUsage: `/capital <jumlah USD>`",
@@ -2799,6 +3167,135 @@ def handle_capital_command(args: list, reply_chat: str) -> None:
         logger.info(f"Capital set to {val}")
     except ValueError:
         send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+
+
+def handle_sizeratio_command(args: list, reply_chat: str) -> None:
+    """
+    Set rasio alokasi modal ETH vs BTC.
+
+    /sizeratio           — tampilkan setting sekarang
+    /sizeratio <eth_pct> — set % modal ke ETH (sisanya ke BTC)
+    /sizeratio 50        — dollar-neutral (default)
+    /sizeratio 60        — ETH 60% / BTC 40%
+    /sizeratio 70        — ETH 70% / BTC 30%
+    """
+    curr_eth = settings["eth_size_ratio"]
+    curr_btc = 100.0 - curr_eth
+
+    if not args:
+        btc_p = scan_stats.get("last_btc_price")
+        eth_p = scan_stats.get("last_eth_price")
+        preview = ""
+        if btc_p and eth_p and settings["capital"] > 0:
+            eth_alloc, btc_alloc, eth_qty, btc_qty = calc_sizing(btc_p, eth_p)
+            preview = (
+                f"\n*Preview sizing sekarang (${settings['capital']:,.0f}):*\n"
+                f"ETH leg: ${eth_alloc:,.0f} → {eth_qty:.4f} ETH\n"
+                f"BTC leg: ${btc_alloc:,.0f} → {btc_qty:.6f} BTC\n"
+            )
+        send_reply(
+            f"📐 *Sizing Ratio*\n"
+            f"\n"
+            f"ETH leg: *{curr_eth:.0f}%* | BTC leg: *{curr_btc:.0f}%*\n"
+            f"{preview}\n"
+            f"Usage: `/sizeratio <eth_pct>`\n"
+            f"Contoh: `/sizeratio 60` → ETH 60% / BTC 40%\n"
+            f"`/sizeratio 50` → kembali ke dollar-neutral",
+            reply_chat,
+        )
+        return
+
+    try:
+        val = float(args[0])
+        if not (10.0 <= val <= 90.0):
+            send_reply(
+                "Range harus 10–90%~ (◕ω◕)\n"
+                "Contoh: `/sizeratio 60` untuk ETH 60% / BTC 40%",
+                reply_chat,
+            )
+            return
+
+        settings["eth_size_ratio"] = val
+        btc_pct = 100.0 - val
+        tag     = "dollar-neutral" if val == 50.0 else f"ETH lebih besar" if val > 50 else "BTC lebih besar"
+
+        # Preview langsung
+        btc_p = scan_stats.get("last_btc_price")
+        eth_p = scan_stats.get("last_eth_price")
+        preview = ""
+        if btc_p and eth_p and settings["capital"] > 0:
+            eth_alloc, btc_alloc, eth_qty, btc_qty = calc_sizing(btc_p, eth_p)
+            preview = (
+                f"\n*Preview sizing (${settings['capital']:,.0f}):*\n"
+                f"ETH leg: *${eth_alloc:,.0f}* → {eth_qty:.4f} ETH\n"
+                f"BTC leg: *${btc_alloc:,.0f}* → {btc_qty:.6f} BTC\n"
+            )
+
+        logger.info(f"Size ratio set: ETH {val:.0f}% / BTC {btc_pct:.0f}%")
+        send_reply(
+            f"✅ *Sizing ratio diupdate~* (◕‿◕)\n"
+            f"\n"
+            f"ETH leg: *{val:.0f}%* | BTC leg: *{btc_pct:.0f}%*\n"
+            f"_{tag}_\n"
+            f"{preview}\n"
+            f"Berlaku di semua sinyal entry berikutnya~",
+            reply_chat,
+        )
+    except ValueError:
+        send_reply("Angkanya tidak valid~ Contoh: `/sizeratio 60`~", reply_chat)
+
+
+def handle_regimefilter_command(args: list, reply_chat: str) -> None:
+    """
+    /regimefilter        — tampilkan status
+    /regimefilter on     — aktifkan filter (default)
+    /regimefilter off    — matikan filter (sinyal masuk walau market berlawanan)
+    """
+    curr = settings["regime_filter_enabled"]
+
+    if not args:
+        reg   = detect_market_regime()
+        status = "✅ ON" if curr else "❌ OFF"
+        send_reply(
+            f"🛡️ *Regime Filter: {status}*\n"
+            f"\n"
+            f"Market sekarang: {reg['emoji']} *{reg['regime']}* {reg['strength']}\n"
+            f"\n"
+            f"*Aturan filter:*\n"
+            f"S1 (Short ETH) → hanya saat *BULLISH* (market pump)\n"
+            f"S2 (Long ETH)  → hanya saat *BEARISH* (market dump)\n"
+            f"\n"
+            f"Tanpa filter ini, bot akan sinyal S2 saat pump seperti yang\n"
+            f"menyebabkan drawdown kemarin~\n"
+            f"\n"
+            f"`/regimefilter on` | `/regimefilter off`",
+            reply_chat,
+        )
+        return
+
+    cmd = args[0].lower()
+    if cmd == "on":
+        settings["regime_filter_enabled"] = True
+        send_reply(
+            "✅ *Regime filter aktif~*\n"
+            "\n"
+            "Bot hanya entry kalau arah gap sesuai kondisi market:\n"
+            "S1 → saat pump | S2 → saat dump\n"
+            "\n"
+            "_Entry yang berlawanan dengan regime akan diblokir + notif~_",
+            reply_chat,
+        )
+    elif cmd == "off":
+        settings["regime_filter_enabled"] = False
+        send_reply(
+            "⚠️ *Regime filter dimatikan~*\n"
+            "\n"
+            "Bot akan entry S1/S2 berdasarkan gap saja tanpa cek kondisi market.\n"
+            "_Hati-hati — ini bisa menyebabkan entry saat kondisi berlawanan~_",
+            reply_chat,
+        )
+    else:
+        send_reply("Usage: `/regimefilter on` atau `/regimefilter off`~", reply_chat)
 
 
 def handle_peak_command(args: list, reply_chat: str) -> None:
@@ -3399,6 +3896,209 @@ def handle_clearpos_command(reply_chat: str) -> None:
     send_reply("🗑️ *Data posisi dihapus~* (◕‿◕)\nRedis juga dibersihkan~", reply_chat)
 
 
+def handle_sim_command(args: list, reply_chat: str) -> None:
+    """
+    /sim              — status simulasi sekarang
+    /sim on           — aktifkan simulasi
+    /sim off          — matikan simulasi
+    /sim margin <usd> — set margin per leg
+    /sim lev <n>      — set leverage
+    /sim fee <pct>    — set taker fee % (default 0.06)
+    /sim reset        — hapus history trades
+    """
+    enabled    = settings["sim_enabled"]
+    margin     = settings["sim_margin_usd"]
+    lev        = settings["sim_leverage"]
+    fee        = settings["sim_fee_pct"]
+    active     = sim_trade["active"]
+    n_trades   = len(sim_trade["history"])
+
+    if not args or args[0].lower() == "status":
+        btc_p  = scan_stats.get("last_btc_price")
+        eth_p  = scan_stats.get("last_eth_price")
+        pnl_str = ""
+        if active and btc_p and eth_p:
+            h = calc_position_pnl()
+            if h:
+                s   = "+" if h["net_pnl"] >= 0 else ""
+                pnl_str = (
+                    f"\n*PnL sekarang:*\n"
+                    f"ETH leg: {'+' if h['eth_pnl']>=0 else ''}${h['eth_pnl']:.2f} ({h['eth_pnl_pct']:.2f}%)\n"
+                    f"BTC leg: {'+' if h['btc_pnl']>=0 else ''}${h['btc_pnl']:.2f} ({h['btc_pnl_pct']:.2f}%)\n"
+                    f"*Net:    {s}${h['net_pnl']:.2f} ({s}{h['net_pnl_pct']:.2f}%)*\n"
+                )
+        sim_state = f"{'🟢 AKTIF' if enabled else '🔴 MATI'}"
+        pos_state = f"{'📍 Posisi terbuka — ' + (sim_trade['strategy'] or '') if active else '💤 Tidak ada posisi'}"
+        send_reply(
+            f"🤖 *Simulation Mode*\n"
+            f"\n"
+            f"Status:  {sim_state}\n"
+            f"Posisi:  {pos_state}\n"
+            f"Margin:  ${margin:,.0f} per leg\n"
+            f"Lev:     {lev:.0f}x\n"
+            f"Fee:     {fee:.3f}% per side\n"
+            f"Trades:  {n_trades} total\n"
+            f"{pnl_str}\n"
+            f"*Commands:*\n"
+            f"`/sim on` `/sim off`\n"
+            f"`/sim margin <usd>`\n"
+            f"`/sim lev <n>`\n"
+            f"`/sim fee <pct>`\n"
+            f"`/sim reset` — hapus history\n"
+            f"`/simstats` — rekap semua trade",
+            reply_chat,
+        )
+        return
+
+    cmd = args[0].lower()
+
+    if cmd == "on":
+        settings["sim_enabled"] = True
+        send_reply(
+            f"🟢 *Simulation mode ON~* (◕‿◕)\n"
+            f"\n"
+            f"Margin: ${margin:,.0f} per leg | Lev: {lev:.0f}x | Fee: {fee:.3f}%\n"
+            f"Total eksposur per trade: ${margin * lev * 2:,.0f}\n"
+            f"\n"
+            f"Bot akan otomatis open posisi saat sinyal entry,\n"
+            f"dan close saat exit/invalidasi~\n"
+            f"\n"
+            f"_Ubah setting: `/sim margin 200` `/sim lev 20`_",
+            reply_chat,
+        )
+
+    elif cmd == "off":
+        settings["sim_enabled"] = False
+        if sim_trade["active"]:
+            send_reply(
+                "🔴 *Simulation mode OFF~*\n"
+                "⚠️ Masih ada posisi terbuka — gunakan `/sim on` lagi atau tunggu exit signal~",
+                reply_chat,
+            )
+        else:
+            send_reply("🔴 *Simulation mode OFF~* Bot tidak akan auto-trade lagi~", reply_chat)
+
+    elif cmd == "margin":
+        try:
+            val = float(args[1])
+            if val <= 0 or val > 100000:
+                send_reply("Margin harus antara $1 sampai $100,000~", reply_chat)
+                return
+            settings["sim_margin_usd"] = val
+            send_reply(
+                f"✅ Margin per leg: *${val:,.0f}*\n"
+                f"Total eksposur per trade: ${val * settings['sim_leverage'] * 2:,.0f}",
+                reply_chat,
+            )
+        except (IndexError, ValueError):
+            send_reply("Usage: `/sim margin <usd>` — contoh: `/sim margin 200`~", reply_chat)
+
+    elif cmd == "lev":
+        try:
+            val = float(args[1])
+            if not 1 <= val <= 200:
+                send_reply("Leverage harus 1x–200x~", reply_chat)
+                return
+            settings["sim_leverage"] = val
+            send_reply(
+                f"✅ Leverage: *{val:.0f}x*\n"
+                f"Total eksposur per trade: ${settings['sim_margin_usd'] * val * 2:,.0f}",
+                reply_chat,
+            )
+        except (IndexError, ValueError):
+            send_reply("Usage: `/sim lev <n>` — contoh: `/sim lev 20`~", reply_chat)
+
+    elif cmd == "fee":
+        try:
+            val = float(args[1])
+            settings["sim_fee_pct"] = val
+            send_reply(f"✅ Fee taker: *{val:.4f}%* per side~", reply_chat)
+        except (IndexError, ValueError):
+            send_reply("Usage: `/sim fee <pct>` — contoh: `/sim fee 0.06`~", reply_chat)
+
+    elif cmd == "reset":
+        sim_trade["history"].clear()
+        send_reply("✅ History trades direset~ (◕‿◕)", reply_chat)
+
+    else:
+        send_reply("Command tidak dikenal~ Ketik `/sim` untuk daftar perintah~", reply_chat)
+
+
+def handle_simstats_command(reply_chat: str) -> None:
+    """Rekap statistik semua sim trades."""
+    history = sim_trade["history"]
+
+    # Status posisi aktif dulu
+    active_str = ""
+    if sim_trade["active"]:
+        h = calc_position_pnl()
+        if h:
+            s = "+" if h["net_pnl"] >= 0 else ""
+            active_str = (
+                f"📍 *Posisi terbuka: {sim_trade['strategy']}*\n"
+                f"Net PnL sekarang: *{s}${h['net_pnl']:.2f} ({s}{h['net_pnl_pct']:.2f}%)*\n"
+                f"Time: {h['time_label']}\n\n"
+            )
+
+    if not history:
+        send_reply(
+            f"{active_str}"
+            f"📊 *Sim Stats*\n\n"
+            f"Belum ada trade yang selesai~ (◕ω◕)\n"
+            f"Aktifkan `/sim on` dan tunggu sinyal entry~",
+            reply_chat,
+        )
+        return
+
+    total     = len(history)
+    wins      = [t for t in history if t["net_pnl"] >= 0]
+    losses    = [t for t in history if t["net_pnl"] < 0]
+    total_net = sum(t["net_pnl"] for t in history)
+    total_fee = sum(t["fee"] for t in history)
+    win_rate  = len(wins) / total * 100
+    avg_win   = sum(t["net_pnl"] for t in wins) / len(wins) if wins else 0
+    avg_loss  = sum(t["net_pnl"] for t in losses) / len(losses) if losses else 0
+    best      = max(history, key=lambda t: t["net_pnl"])
+    worst     = min(history, key=lambda t: t["net_pnl"])
+
+    # Risk/reward ratio
+    rr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+
+    sign  = "+" if total_net >= 0 else ""
+    emoji = "🟢" if total_net >= 0 else "🔴"
+
+    # 5 trade terakhir
+    recent = history[-5:]
+    recent_lines = ""
+    for t in reversed(recent):
+        s    = "+" if t["net_pnl"] >= 0 else ""
+        e    = "✅" if t["net_pnl"] >= 0 else "❌"
+        rc   = "INV" if t["reason"] == "INVALID" else "TP"
+        recent_lines += f"│ {e} {t['strategy']} {rc}: {s}${t['net_pnl']:.2f} ({s}{t['net_pct']:.2f}%) {t['duration']}\n"
+
+    send_reply(
+        f"{active_str}"
+        f"📊 *Sim Stats — {total} trades*\n"
+        f"┌─────────────────────\n"
+        f"│ {emoji} *Net P&L:  {sign}${total_net:.2f}*\n"
+        f"│ Total fee: -${total_fee:.3f}\n"
+        f"├─────────────────────\n"
+        f"│ Win rate:  {len(wins)}W / {len(losses)}L ({win_rate:.0f}%)\n"
+        f"│ Avg win:   +${avg_win:.2f}\n"
+        f"│ Avg loss:  ${avg_loss:.2f}\n"
+        f"│ R:R ratio: 1:{rr:.2f}\n"
+        f"├─────────────────────\n"
+        f"│ Best:  +${best['net_pnl']:.2f} ({best['strategy']} {best['reason']})\n"
+        f"│ Worst:  ${worst['net_pnl']:.2f} ({worst['strategy']} {worst['reason']})\n"
+        f"├─────────────────────\n"
+        f"│ *5 Trade Terakhir:*\n"
+        f"{recent_lines}"
+        f"└─────────────────────\n"
+        f"_Ketik `/sim reset` untuk hapus history~_",
+        reply_chat,
+    )
+
+
 def handle_help_command(reply_chat: str) -> None:
     """
     /help          — menu utama
@@ -3522,6 +4222,8 @@ def handle_help_config_command(reply_chat: str) -> None:
         f"`/sltp sl <val>`\n"
         f"`/peak on|off|<val>`\n"
         f"`/exitconf scans|buffer|pnl <val>`\n"
+        f"`/sizeratio <eth_pct>` _(sekarang ETH {int(settings['eth_size_ratio'])}%)_\n"
+        f"`/regimefilter on|off` _(sekarang: {'✅ ON' if settings['regime_filter_enabled'] else '❌ OFF'})_\n"
         f"`/interval <detik>`\n"
         f"`/lookback <jam>`\n"
         f"`/heartbeat <menit>`",
