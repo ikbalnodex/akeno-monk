@@ -1181,7 +1181,7 @@ def sim_open_position(strategy: Strategy, btc_price: float, eth_price: float) ->
         f"│ Leverage: {lev:.0f}x | Ratio: {er:.0f}/{br:.0f}\n"
         f"│ Fee open: ${fee_open:.3f}\n"
         f"└─────────────────────\n"
-        f"_Ketik `/health` untuk monitor PnL live~_\n"
+        f"_Ketik `/health` untuk memantau P&L secara live._\n"
     )
 
 
@@ -1273,7 +1273,7 @@ def sim_close_position(btc_price: float, eth_price: float, reason: str = "EXIT")
         f"│ Modal:      ${total_margin:.2f} | Durasi: {dur_str}\n"
         f"└─────────────────────\n"
         f"Total trade: {len(sim_trade['history'])} | "
-        f"Ketik `/simstats` untuk rekap semua~\n"
+        f"Ketik `/simstats` untuk rekap semua\n"
     )
 
 
@@ -1679,7 +1679,7 @@ def build_position_health_message(h: dict) -> str:
         f"│ `{lb_bar}` sebelum likuidasi\n"
         f"└─────────────────────\n"
         f"{danger_note}\n"
-        f"_💡 NET = yang penting. Mentor: ETH -68% tapi net +$239~_"
+        f"_💡 Yang penting adalah net P&L. Contoh: ETH -68% tapi net +$239._"
     )
 
 
@@ -1734,7 +1734,7 @@ def build_entry_readiness(
         if not ratio_ok:
             warnings.append("ETH/BTC ratio belum ideal — gap bisa melebar lebih jauh sebelum revert")
     else:
-        checks.append((None, "Ratio N/A", "Butuh lebih banyak history~"))
+        checks.append((None, "Ratio N/A", "Butuh lebih banyak history"))
 
     # 3. Driver analysis
     if btc_r is not None and eth_r is not None:
@@ -1747,7 +1747,7 @@ def build_entry_readiness(
             else:
                 warnings.append("BTC-led di S2: BTC kuat, ETH belum tentu bounce cepat")
     else:
-        checks.append((None, "Driver belum tersedia", "Tunggu data scan~"))
+        checks.append((None, "Driver belum tersedia", "Tunggu data scan"))
 
     # 4. Buffer ke invalidation
     dist_invalid = (it - gap_f) if strategy == Strategy.S1 else (gap_f - (-it))
@@ -1776,7 +1776,7 @@ def build_entry_readiness(
         if abs(z) > 3.0:
             warnings.append(f"Z-score {z:+.2f}σ sangat ekstrem — bisa ada alasan fundamental, bukan sekadar divergence")
     else:
-        checks.append((None, "Z-score N/A", "Data kurang~"))
+        checks.append((None, "Z-score N/A", "Data kurang"))
 
     # Hitung skor
     true_count  = sum(1 for c in checks if c[0] is True)
@@ -1786,13 +1786,13 @@ def build_entry_readiness(
 
     # Verdict
     if false_count == 0 and true_count >= 4:
-        v_e, verdict, v_d = "🟢", "READY TO ENTRY", "Semua faktor oke — kondisi optimal~"
+        v_e, verdict, v_d = "🟢", "READY TO ENTRY", "Semua faktor oke — kondisi optimal"
     elif not correct_side or false_count >= 2:
-        v_e, verdict, v_d = "🔴", "JANGAN ENTRY DULU", "Terlalu banyak faktor tidak terpenuhi~"
+        v_e, verdict, v_d = "🔴", "JANGAN ENTRY DULU", "Terlalu banyak faktor tidak terpenuhi"
     elif false_count <= 1 and true_count >= 3:
-        v_e, verdict, v_d = "🟡", "BISA ENTRY, TAPI HATI-HATI", "1 faktor lemah — pertimbangkan sizing lebih kecil~"
+        v_e, verdict, v_d = "🟡", "BISA ENTRY, TAPI HATI-HATI", "1 faktor lemah — pertimbangkan sizing lebih kecil"
     else:
-        v_e, verdict, v_d = "🟠", "TUNGGU KONFIRMASI", "Beberapa faktor masih meragukan~"
+        v_e, verdict, v_d = "🟠", "TUNGGU KONFIRMASI", "Beberapa faktor masih meragukan"
 
     checklist = ""
     for ok, label, detail in checks:
@@ -1919,7 +1919,7 @@ def build_regime_blocked_message(strategy: Strategy, gap: Decimal, reason: str) 
     return (
         f"⛔ *ENTRY DIBLOKIR — Regime Filter*\n"
         f"\n"
-        f"Sinyal *{strategy.value}* muncul tapi kondisi market tidak mendukung~\n"
+        f"Sinyal *{strategy.value}* muncul tapi kondisi market tidak mendukung\n"
         f"\n"
         f"Gap sekarang: *{gap_f:+.2f}%*\n"
         f"BTC: {btc_r:+.2f}% | ETH: {eth_r:+.2f}%\n"
@@ -1927,8 +1927,8 @@ def build_regime_blocked_message(strategy: Strategy, gap: Decimal, reason: str) 
         f"*Alasan diblokir:*\n"
         f"{reason}\n"
         f"\n"
-        f"_Sinyal akan muncul saat kondisi market sesuai~_\n"
-        f"_`/regimefilter off` untuk matikan filter ini_"
+        f"_Sinyal akan muncul saat kondisi market sesuai._\n"
+        f"_`/regimefilter off` untuk menonaktifkan filter ini._"
     )
 
 
@@ -1942,13 +1942,13 @@ def build_peak_watch_message(strategy: Strategy, gap: Decimal) -> str:
         reason    = f"ETH dumping lebih dalam dari BTC ({lb})"
     return (
         f"………\n"
-        f"Ara ara~ Akeno melihat sesuatu menarik~ Ufufufu... (◕‿◕)\n"
+        f"Potensi sinyal terdeteksi \n"
         f"\n"
         f"_{reason}_\n"
         f"Rencana: *{direction}*\n"
         f"Gap sekarang: *{format_value(gap)}%*\n"
         f"\n"
-        f"Akeno tidak gegabah, sayangku~\n"
+        f"Menunggu konfirmasi. \n"
         f"Pantau puncaknya dulu sebelum entry ⚡"
     )
 
@@ -2103,12 +2103,12 @@ def build_entry_message(
     peak_line     = f"│ Peak:     {peak:+.2f}%\n" if not is_direct and peak else ""
     direct_tag    = " _(Peak OFF)_\n" if is_direct else "\n"
     reversal_note = (
-        f"_Gap berbalik {settings['peak_reversal']}% dari puncak → entry terkonfirmasi~_\n"
+        f"_Gap berbalik {settings['peak_reversal']}% dari puncak → entry terkonfirmasi._\n"
         if not is_direct else ""
     )
 
     return (
-        f"Ara ara ara~!!! Ini saatnya, sayangku~!!! ⚡\n"
+        f"ara   ⚡\n"
         f"🚨 *ENTRY SIGNAL: {strategy.value}*{direct_tag}"
         f"📈 *{direction}*\n"
         f"\n"
@@ -2152,7 +2152,7 @@ def build_entry_message(
         f"{sizing_section}"
         f"{reversal_note}"
         f"\n"
-        f"Akeno sudah menunggu momen ini~ Ufufufu... ⚡"
+        f"Akeno sudah menunggu momen ini ⚡"
     )
 
 
@@ -2168,7 +2168,7 @@ def build_exit_message(
     net_section   = _build_pnl_section(leg_e, leg_b, net)
     conf_line     = f"_{confirm_note}_\n" if confirm_note else ""
     return (
-        f"Ara ara~!!! Ufufufu... (◕▿◕)\n"
+        f"\n"
         f"✅ *EXIT — Gap Konvergen!*\n"
         f"{conf_line}"
         f"\n"
@@ -2179,7 +2179,7 @@ def build_exit_message(
         f"│ Gap:  *{format_value(gap)}%*\n"
         f"└─────────────────────\n"
         f"{net_section}"
-        f"Saatnya close posisi~ Akeno lanjut pantau. ⚡🔍"
+        f"Posisi di-close. Bot kembali memantau. ⚡"
     )
 
 
@@ -2197,7 +2197,7 @@ def build_tp_message(
     leg_e, leg_b, net = calc_net_pnl(active_strategy, gap_f) if active_strategy else (None, None, None)
     net_section = _build_pnl_section(leg_e, leg_b, net, emoji="🎉")
     return (
-        f"Ara ara~!!! TP kena sayangku~!!! ✨\n"
+        f"🎯 Target Profit tercapai. ✨\n"
         f"🎯 *TAKE PROFIT*\n"
         f"\n"
         f"*{lb} Change:*\n"
@@ -2210,7 +2210,7 @@ def build_tp_message(
         f"│ ETH:    {eth_str}\n"
         f"└─────────────────────\n"
         f"{net_section}"
-        f"Misi sukses~ Akeno senang! ⚡"
+        f"🎯 Target tercapai. ⚡"
     )
 
 
@@ -2233,7 +2233,7 @@ def build_trailing_sl_message(
         f"………\n"
         f"⛔ *TRAILING STOP LOSS*\n"
         f"\n"
-        f"Ara ara~ TSL kena. Profit diamankan~ (◕ω◕)\n"
+        f"TSL kena. Profit diamankan\n"
         f"\n"
         f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
@@ -2246,7 +2246,7 @@ def build_trailing_sl_message(
         f"│ Terkunci: ~{profit_locked:.2f}%\n"
         f"└─────────────────────\n"
         f"{net_section}"
-        f"Cut dulu~ Akeno scan ulang~ ⚡ (◕‿◕)"
+        f"Cut dulu~ Kembali scan. ⚡"
     )
 
 
@@ -2264,7 +2264,7 @@ def build_invalidation_message(
         f"………\n"
         f"⚠️ *INVALIDATION: {strategy.value}*\n"
         f"\n"
-        f"Ara ara~ gap malah melebar. Cut dulu~ (◕ω◕)\n"
+        f"gap malah melebar. Cut dulu\n"
         f"\n"
         f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
@@ -2273,7 +2273,7 @@ def build_invalidation_message(
         f"│ Gap:  {format_value(gap)}%\n"
         f"└─────────────────────\n"
         f"{net_section}"
-        f"Akeno scan ulang dari awal~ ⚡ (◕‿◕)"
+        f"Bot kembali ke mode SCAN. ⚡"
     )
 
 
@@ -2282,10 +2282,10 @@ def build_peak_cancelled_message(strategy: Strategy, gap: Decimal) -> str:
         f"………\n"
         f"❌ *Peak Watch Dibatalkan: {strategy.value}*\n"
         f"\n"
-        f"Gap mundur sebelum konfirmasi~ (◕ω◕)\n"
+        f"Gap mundur sebelum konfirmasi.\n"
         f"Gap sekarang: *{format_value(gap)}%*\n"
         f"\n"
-        f"Akeno pantau terus dari dekat~ (◕‿◕)"
+        f"Bot terus memantau."
     )
 
 
@@ -2419,9 +2419,9 @@ def build_heartbeat_message() -> str:
             f"└─────────────────────\n"
         )
 
-    last_r = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum~"
+    last_r = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum"
     return (
-        f"💓 *Akeno masih di sini~ Ufufufu... (◕‿◕)*\n"
+        f"💓 *Heartbeat — Bot Aktif*\n"
         f"\n"
         f"Mode: *{current_mode.value}* | Peak: {peak_str}\n"
         f"Strategi: {active_strategy.value if active_strategy else '—'}\n"
@@ -2820,8 +2820,8 @@ def evaluate_and_transition(
                         send_alert(
                             f"⏳ *Pre-exit: Gap menyentuh TP zone*\n"
                             f"Gap: {gap_float:+.2f}% | TP level: ±{exit_thresh}%\n"
-                            f"Menunggu konfirmasi {remaining} scan lagi{pnl_wait}~\n"
-                            f"_Sabar sebentar~ (◕ω◕)_"
+                            f"Menunggu konfirmasi {remaining} scan lagi{pnl_wait}\n"
+                            f"_Memproses..._"
                         )
                         logger.info(f"PRE-EXIT {active_strategy.value}. Gap: {gap_float:.2f}% "
                                     f"| Need {remaining} more scans{pnl_wait}")
@@ -2862,7 +2862,7 @@ def handle_settings_command(reply_chat: str) -> None:
     rr      = settings["redis_refresh_minutes"]
     rr_str  = f"{rr} menit" if rr > 0 else "Off"
     peak_s  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
-    cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "Belum diset~"
+    cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "Belum diset"
     ec_scans = int(settings["exit_confirm_scans"])
     ec_buf   = float(settings["exit_confirm_buffer"])
     ec_pnl   = float(settings["exit_pnl_gate"])
@@ -2875,7 +2875,7 @@ def handle_settings_command(reply_chat: str) -> None:
         else "OFF (langsung exit)"
     )
     send_reply(
-        f"⚙️ *Settings — Akeno jaga semuanya~ Ufufufu...*\n"
+        f"⚙️ *Settings — Akeno jaga semuanya~ *\n"
         f"\n"
         f"📊 Scan Interval:  {settings['scan_interval']}s\n"
         f"🕐 Lookback:       {settings['lookback_hours']}h\n"
@@ -2892,7 +2892,7 @@ def handle_settings_command(reply_chat: str) -> None:
         f"💰 Modal:          {cap_str}\n"
         f"📈 Ratio Window:   {settings['ratio_window_days']}d\n"
         f"\n"
-        f"_Lihat `/help` untuk semua command~ (◕‿◕)_",
+        f"_Ketik `/help` untuk daftar perintah lengkap._",
         reply_chat,
     )
 
@@ -2906,7 +2906,7 @@ def handle_status_command(reply_chat: str) -> None:
         else f"⏳ {hours_data:.1f}h / {lookback}h"
     )
     peak_s      = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
-    last_r      = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum~"
+    last_r      = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum"
 
     # SCAN section
     scan_section = ""
@@ -3012,7 +3012,7 @@ def handle_status_command(reply_chat: str) -> None:
         )
 
     send_reply(
-        f"📊 *Status Akeno* Ufufufu... (◕‿◕)\n"
+        f"📊 *Status Bot* \n"
         f"\n"
         f"Mode: *{current_mode.value}* | Peak: {peak_s}\n"
         f"Strategi: {active_strategy.value if active_strategy else '—'}\n"
@@ -3028,8 +3028,8 @@ def handle_pnl_command(reply_chat: str) -> None:
     """Net combined P&L posisi aktif — seperti cara mentor evaluate."""
     if current_mode != Mode.TRACK or active_strategy is None or entry_gap_value is None:
         send_reply(
-            "Ara ara~ tidak ada posisi aktif sekarang~ (◕ω◕)\n"
-            "Akeno masih mode SCAN~",
+            "tidak ada posisi aktif sekarang\n"
+            "Akeno masih mode SCAN",
             reply_chat,
         )
         return
@@ -3073,7 +3073,7 @@ def handle_pnl_command(reply_chat: str) -> None:
         if capital <= 0:
             pnl_body += "│ _/capital <modal> untuk P&L dalam $~_\n"
     else:
-        pnl_body = "│ Data tidak cukup~\n"
+        pnl_body = "│ Data tidak cukup\n"
 
     # Jarak ke TP dan TSL
     et   = settings["exit_threshold"]
@@ -3109,7 +3109,7 @@ def handle_pnl_command(reply_chat: str) -> None:
         f"*Health:* {health_e} {health_d}\n"
         f"\n"
         f"_💡 Pairs trade: nilai dari NET, bukan per leg~_\n"
-        f"_Seperti mentor: leg ETH -68% tapi net +$239~ (◕‿◕)_",
+        f"_Seperti mentor: leg ETH -68% tapi net +$239~_",
         reply_chat,
     )
 
@@ -3120,8 +3120,8 @@ def handle_ratio_command(reply_chat: str) -> None:
 
     if curr_r is None:
         send_reply(
-            f"Ara ara~ belum cukup data~ (◕ω◕)\n"
-            f"Sekarang: {len(price_history)} points. Butuh minimal 10~",
+            f"belum cukup data\n"
+            f"Sekarang: {len(price_history)} points. Butuh minimal 10",
             reply_chat,
         )
         return
@@ -3242,7 +3242,7 @@ def handle_analysis_command(reply_chat: str) -> None:
     eth_p   = scan_stats.get("last_eth_price")
 
     if gap_now is None:
-        send_reply("Ara ara~ belum ada data harga~ Tunggu scan pertama~ (◕ω◕)", reply_chat)
+        send_reply("belum ada data harga~ Tunggu scan pertama", reply_chat)
         return
 
     lb     = get_lookback_label()
@@ -3323,7 +3323,7 @@ def handle_analysis_command(reply_chat: str) -> None:
     else:
         cand_str  = "💤 Belum ada kandidat entry"
         stars, cv = "—", "—"
-        hint      = f"Tunggu gap ±{et}%~"
+        hint      = f"Tunggu gap ±{et}%"
 
     # Sizing preview
     sizing_str = ""
@@ -3356,7 +3356,7 @@ def handle_analysis_command(reply_chat: str) -> None:
 
     send_reply(
         f"🧠 *Full Market Analysis*\n"
-        f"_Akeno analisis semuanya~ Ufufufu... (◕‿◕)_\n"
+        f"_Snapshot kondisi pasar terkini._\n"
         f"\n"
         f"{recap_block}\n"
         f"{reg_block}\n"
@@ -3410,7 +3410,7 @@ def handle_capital_command(args: list, reply_chat: str) -> None:
         else:
             send_reply(
                 "💰 *Modal belum diset~*\n\n"
-                "Set modal untuk sizing guide & P&L dalam dollar~\n"
+                "Set modal untuk sizing guide & P&L dalam dollar\n"
                 "Usage: `/capital 1000`",
                 reply_chat,
             )
@@ -3419,20 +3419,20 @@ def handle_capital_command(args: list, reply_chat: str) -> None:
     try:
         val = float(args[0])
         if val < 0 or val > 10_000_000:
-            send_reply("Harus antara $0 sampai $10,000,000~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara $0 hingga $10.000.000.", reply_chat)
             return
         settings["capital"] = val
         if val == 0:
-            send_reply("Modal di-reset. Sizing & dollar P&L dimatikan~ (◕‿◕)", reply_chat)
+            send_reply("Modal direset. Fitur sizing & P&L dinonaktifkan.", reply_chat)
         else:
             send_reply(
-                f"💰 Modal *${val:,.0f}* disimpan~\n"
-                f"Sizing guide & P&L aktif~ Ufufufu... (◕‿◕)",
+                f"💰 Modal *${val:,.0f}* disimpan\n"
+                f"Fitur sizing & P&L dalam dollar aktif. ",
                 reply_chat,
             )
         logger.info(f"Capital set to {val}")
     except ValueError:
-        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+        send_reply("Nilai tidak valid.", reply_chat)
 
 
 def handle_sizeratio_command(args: list, reply_chat: str) -> None:
@@ -3475,7 +3475,7 @@ def handle_sizeratio_command(args: list, reply_chat: str) -> None:
         val = float(args[0])
         if not (10.0 <= val <= 90.0):
             send_reply(
-                "Range harus 10–90%~ (◕ω◕)\n"
+                "Nilai harus antara 10–90%.\n"
                 "Contoh: `/sizeratio 60` untuk ETH 60% / BTC 40%",
                 reply_chat,
             )
@@ -3499,16 +3499,16 @@ def handle_sizeratio_command(args: list, reply_chat: str) -> None:
 
         logger.info(f"Size ratio set: ETH {val:.0f}% / BTC {btc_pct:.0f}%")
         send_reply(
-            f"✅ *Sizing ratio diupdate~* (◕‿◕)\n"
+            f"✅ *Sizing ratio diperbarui.*\n"
             f"\n"
             f"ETH leg: *{val:.0f}%* | BTC leg: *{btc_pct:.0f}%*\n"
             f"_{tag}_\n"
             f"{preview}\n"
-            f"Berlaku di semua sinyal entry berikutnya~",
+            f"Berlaku untuk sinyal entry berikutnya.",
             reply_chat,
         )
     except ValueError:
-        send_reply("Angkanya tidak valid~ Contoh: `/sizeratio 60`~", reply_chat)
+        send_reply("Nilai tidak valid. Contoh: `/sizeratio 60`", reply_chat)
 
 
 def handle_regimefilter_command(args: list, reply_chat: str) -> None:
@@ -3532,7 +3532,7 @@ def handle_regimefilter_command(args: list, reply_chat: str) -> None:
             f"S2 (Long ETH)  → hanya saat *BEARISH* (market dump)\n"
             f"\n"
             f"Tanpa filter ini, bot akan sinyal S2 saat pump seperti yang\n"
-            f"menyebabkan drawdown kemarin~\n"
+            f"menyebabkan drawdown kemarin\n"
             f"\n"
             f"`/regimefilter on` | `/regimefilter off`",
             reply_chat,
@@ -3561,7 +3561,7 @@ def handle_regimefilter_command(args: list, reply_chat: str) -> None:
             reply_chat,
         )
     else:
-        send_reply("Usage: `/regimefilter on` atau `/regimefilter off`~", reply_chat)
+        send_reply("Usage: `/regimefilter on` atau `/regimefilter off`", reply_chat)
 
 
 def handle_peak_command(args: list, reply_chat: str) -> None:
@@ -3581,22 +3581,22 @@ def handle_peak_command(args: list, reply_chat: str) -> None:
     first = args[0].lower()
     if first == "on":
         settings["peak_enabled"] = True
-        send_reply("✅ *Peak Watch ON*~ (◕‿◕)", reply_chat)
+        send_reply("✅ *Peak Watch ON*", reply_chat)
         return
     if first == "off":
         _cancel_peak_watch_if_active(reply_chat)
         settings["peak_enabled"] = False
-        send_reply("❌ *Peak Watch OFF*~ Langsung entry saat threshold~ (◕ω◕)", reply_chat)
+        send_reply("❌ *Peak Watch OFF*~ Langsung entry saat threshold", reply_chat)
         return
     try:
         val = float(first)
         if val <= 0 or val > 3.0:
-            send_reply("Harus antara 0–3.0~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara 0–3.0.", reply_chat)
             return
         settings["peak_reversal"] = val
-        send_reply(f"Reversal *{val}%* dari puncak~ (◕‿◕)", reply_chat)
+        send_reply(f"Reversal *{val}%* dari puncak.", reply_chat)
     except ValueError:
-        send_reply("Gunakan `on`, `off`, atau angka reversal~ (◕ω◕)", reply_chat)
+        send_reply("Gunakan `on`, `off`, atau angka reversal.", reply_chat)
 
 
 def _cancel_peak_watch_if_active(reply_chat=None) -> None:
@@ -3605,7 +3605,7 @@ def _cancel_peak_watch_if_active(reply_chat=None) -> None:
         if reply_chat:
             send_reply(
                 f"⚠️ Peak Watch *{peak_strategy.value}* dibatalkan.\n"
-                "Kembali ke SCAN~ (◕ω◕)",
+                "Bot kembali ke mode SCAN.",
                 reply_chat,
             )
         current_mode  = Mode.SCAN
@@ -3639,42 +3639,42 @@ def handle_sltp_command(args: list, reply_chat: str) -> None:
         return
 
     if len(args) < 2:
-        send_reply("Usage: `/sltp sl <nilai>`~ (◕ω◕)", reply_chat)
+        send_reply("Usage: `/sltp sl <nilai>`", reply_chat)
         return
 
     try:
         key, val = args[0].lower(), float(args[1])
         if val <= 0 or val > 10:
-            send_reply("Harus antara 0–10~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara 0–10.", reply_chat)
             return
         if key == "sl":
             settings["sl_pct"] = val
-            send_reply(f"Trailing SL distance *{val}%*~ (◕‿◕)", reply_chat)
+            send_reply(f"Trailing SL distance *{val}%*.", reply_chat)
         elif key == "tp":
             send_reply(
-                f"TP mengikuti exit threshold ±{settings['exit_threshold']}%~\n"
-                f"Gunakan `/threshold exit <nilai>` ya~ (◕‿◕)",
+                f"TP mengikuti exit threshold ±{settings['exit_threshold']}%\n"
+                f"Gunakan `/threshold exit <nilai>` untuk menyesuaikan.",
                 reply_chat,
             )
         else:
-            send_reply("Gunakan `sl`~ (◕ω◕)", reply_chat)
+            send_reply("Gunakan parameter `sl`.", reply_chat)
     except ValueError:
-        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+        send_reply("Nilai tidak valid.", reply_chat)
 
 
 def handle_interval_command(args: list, reply_chat: str) -> None:
     if not args:
-        send_reply(f"Interval: *{settings['scan_interval']}s*~\nUsage: `/interval <60-3600>`", reply_chat)
+        send_reply(f"Interval: *{settings['scan_interval']}s*\nUsage: `/interval <60-3600>`", reply_chat)
         return
     try:
         val = int(args[0])
         if val < 60 or val > 3600:
-            send_reply("Harus 60–3600 detik~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara 60–3600 detik.", reply_chat)
             return
         settings["scan_interval"] = val
-        send_reply(f"Scan setiap *{val}s*~ (◕‿◕)", reply_chat)
+        send_reply(f"Interval scan diatur ke *{val}s*.", reply_chat)
     except ValueError:
-        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+        send_reply("Nilai tidak valid.", reply_chat)
 
 
 def handle_threshold_command(args: list, reply_chat: str) -> None:
@@ -3687,76 +3687,76 @@ def handle_threshold_command(args: list, reply_chat: str) -> None:
     try:
         t_type, val = args[0].lower(), float(args[1])
         if val <= 0 or val > 20:
-            send_reply("Harus antara 0–20~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara 0–20.", reply_chat)
             return
         if t_type == "entry":
             settings["entry_threshold"] = val
-            send_reply(f"Entry threshold *±{val}%*~ (◕‿◕)", reply_chat)
+            send_reply(f"Entry threshold diatur ke *±{val}%*.", reply_chat)
         elif t_type == "exit":
             settings["exit_threshold"] = val
-            send_reply(f"Exit/TP threshold *±{val}%*~ (◕‿◕)", reply_chat)
+            send_reply(f"Exit/TP threshold diatur ke *±{val}%*.", reply_chat)
         elif t_type in ("invalid", "invalidation"):
             settings["invalidation_threshold"] = val
-            send_reply(f"Invalidation *±{val}%*~ (◕‿◕)", reply_chat)
+            send_reply(f"Invalidation threshold diatur ke *±{val}%*.", reply_chat)
         else:
-            send_reply("Gunakan `entry`, `exit`, atau `invalid`~ (◕ω◕)", reply_chat)
+            send_reply("Gunakan parameter `entry`, `exit`, atau `invalid`.", reply_chat)
     except ValueError:
-        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+        send_reply("Nilai tidak valid.", reply_chat)
 
 
 def handle_lookback_command(args: list, reply_chat: str) -> None:
     if not args:
-        send_reply(f"Lookback: *{settings['lookback_hours']}h*~\nUsage: `/lookback <1-24>`", reply_chat)
+        send_reply(f"Lookback: *{settings['lookback_hours']}h*\nUsage: `/lookback <1-24>`", reply_chat)
         return
     try:
         val = int(args[0])
         if val < 1 or val > 24:
-            send_reply("Harus 1–24 jam~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara 1–24 jam.", reply_chat)
             return
         old = settings["lookback_hours"]
         settings["lookback_hours"] = val
         prune_history(datetime.now(timezone.utc))
-        send_reply(f"Lookback *{old}h* → *{val}h*~ History di-prune. (◕‿◕)", reply_chat)
+        send_reply(f"Lookback diperbarui: *{old}h* → *{val}h*. History di-prune.", reply_chat)
     except ValueError:
-        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+        send_reply("Nilai tidak valid.", reply_chat)
 
 
 def handle_heartbeat_command(args: list, reply_chat: str) -> None:
     if not args:
         send_reply(
-            f"Heartbeat: *{settings['heartbeat_minutes']} menit*~\nUsage: `/heartbeat <0-120>`",
+            f"Heartbeat: *{settings['heartbeat_minutes']} menit*\nUsage: `/heartbeat <0-120>`",
             reply_chat,
         )
         return
     try:
         val = int(args[0])
         if val < 0 or val > 120:
-            send_reply("Harus 0–120 menit~ (◕ω◕)", reply_chat)
+            send_reply("Nilai harus antara 0–120 menit.", reply_chat)
             return
         settings["heartbeat_minutes"] = val
         send_reply(
-            "Heartbeat *dimatikan*~" if val == 0
-            else f"Heartbeat setiap *{val} menit*~",
+            "Heartbeat *dimatikan*" if val == 0
+            else f"Heartbeat setiap *{val} menit*",
             reply_chat,
         )
     except ValueError:
-        send_reply("Angkanya tidak valid~ (◕ω◕)", reply_chat)
+        send_reply("Nilai tidak valid.", reply_chat)
 
 
 def handle_redis_command(reply_chat: str) -> None:
     if not UPSTASH_REDIS_URL:
-        send_reply("Redis belum dikonfigurasi~ (◕ω◕)", reply_chat)
+        send_reply("Redis belum dikonfigurasi.", reply_chat)
         return
     result = _redis_request("GET", f"/get/{REDIS_KEY}")
     if not result or result.get("result") is None:
-        send_reply("❌ Bot A belum simpan data~ (◕ω◕)", reply_chat)
+        send_reply("❌ Bot A belum menyimpan data.", reply_chat)
         return
     try:
         data       = json.loads(result["result"])
         hrs_stored = len(data) * settings["scan_interval"] / 3600
         lookback   = settings["lookback_hours"]
         status     = "✅ Siap" if hrs_stored >= lookback else f"⏳ {hrs_stored:.1f}h / {lookback}h"
-        last_r     = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum~"
+        last_r     = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum"
         send_reply(
             f"⚡ *Redis Status*\n"
             f"Points: {len(data)} | {hrs_stored:.1f}h | {status}\n"
@@ -3765,7 +3765,7 @@ def handle_redis_command(reply_chat: str) -> None:
             reply_chat,
         )
     except Exception as e:
-        send_reply(f"Gagal baca: `{e}` (◕ω◕)", reply_chat)
+        send_reply(f"Gagal baca: `{e}`", reply_chat)
 
 
 def handle_setpos_command(args: list, reply_chat: str) -> None:
@@ -3799,7 +3799,7 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
     try:
         strat_str = args[0].upper()
         if strat_str not in ("S1", "S2"):
-            send_reply("Strategi harus *S1* atau *S2*~ (◕ω◕)", reply_chat)
+            send_reply("Strategi harus *S1* atau *S2*.", reply_chat)
             return
         if args[1].lower() != "eth" or args[5].lower() != "btc":
             send_reply(usage, reply_chat)
@@ -3816,10 +3816,10 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
         btc_lev   = _pf(args[8].lower().replace("x", ""))
 
         if eth_entry <= 0 or btc_entry <= 0:
-            send_reply("Entry price harus positif~ (◕ω◕)", reply_chat)
+            send_reply("Harga entry harus bernilai positif.", reply_chat)
             return
         if not (1 <= eth_lev <= 200) or not (1 <= btc_lev <= 200):
-            send_reply("Leverage harus antara 1x–200x~ (◕ω◕)", reply_chat)
+            send_reply("Leverage harus antara 1x–200x.", reply_chat)
             return
 
         # Optional extras: ethliq btcliq ethval btcval
@@ -3855,7 +3855,7 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
 
         # Simpan ke Redis supaya survive restart
         saved  = save_pos_data()
-        sv_str = "✅ Tersimpan ke Redis~" if saved else "⚠️ Redis tidak tersedia, data hanya di memory~"
+        sv_str = "✅ Tersimpan ke Redis" if saved else "⚠️ Redis tidak tersedia, data hanya di memory"
 
         eth_dir  = "Long 📈" if eth_qty > 0 else "Short 📉"
         btc_dir  = "Long 📈" if btc_qty > 0 else "Short 📉"
@@ -3877,18 +3877,18 @@ def handle_setpos_command(args: list, reply_chat: str) -> None:
         logger.info(f"pos_data set: {strat_str} ETH {eth_dir} {eth_qty}@{eth_entry} {eth_lev}x | "
                     f"BTC {btc_dir} {btc_qty}@{btc_entry} {btc_lev}x")
         send_reply(
-            f"✅ *Posisi {strat_str} disimpan~* Ufufufu... (◕‿◕)\n"
+            f"✅ *Posisi {strat_str} tersimpan.* \n"
             f"\n"
             f"ETH: *{eth_dir}* {abs(eth_qty):.4f} @ ${eth_entry:,.2f} | {eth_lev:.0f}x\n"
             f"BTC: *{btc_dir}* {abs(btc_qty):.6f} @ ${btc_entry:,.2f} | {btc_lev:.0f}x\n"
             f"{val_note}{liq_note}\n"
             f"{sv_str}\n"
             f"\n"
-            f"Ketik `/health` untuk cek, `/setfunding` untuk set funding rate~",
+            f"Ketik `/health` untuk cek, `/setfunding` untuk set funding rate",
             reply_chat,
         )
     except (ValueError, IndexError) as e:
-        send_reply(f"Format salah~ (◕ω◕)\n\n{usage}", reply_chat)
+        send_reply(f"Format tidak sesuai.\n\n{usage}", reply_chat)
         logger.warning(f"setpos parse error: {e}")
 
 
@@ -3958,16 +3958,16 @@ def handle_setfunding_command(args: list, reply_chat: str) -> None:
             )
 
         send_reply(
-            f"✅ *Funding rate disimpan~* (◕‿◕)\n"
+            f"✅ *Funding rate tersimpan.*\n"
             f"\n"
             f"ETH: {eth_fr:+.4f}%/8h\n"
             f"BTC: {btc_fr:+.4f}%/8h\n"
             f"{preview}\n"
-            f"Ketik `/health` untuk lihat break-even timer~",
+            f"Ketik `/health` untuk lihat break-even timer",
             reply_chat,
         )
     except (ValueError, IndexError) as e:
-        send_reply(f"Format salah~ (◕ω◕)\n\n{usage}", reply_chat)
+        send_reply(f"Format tidak sesuai.\n\n{usage}", reply_chat)
         logger.warning(f"setfunding parse error: {e}")
 
 
@@ -3976,8 +3976,8 @@ def handle_velocity_command(reply_chat: str) -> None:
     vel = calc_gap_velocity()
     if not vel:
         send_reply(
-            "Belum cukup data untuk velocity~ (◕ω◕)\n"
-            f"Sekarang: {len(gap_history)} pts | Butuh minimal 3~",
+            "Data belum mencukupi untuk kalkulasi velocity.\n"
+            f"Sekarang: {len(gap_history)} pts | Butuh minimal 3",
             reply_chat,
         )
         return
@@ -4087,7 +4087,7 @@ def handle_exitconf_command(args: list, reply_chat: str) -> None:
         return
 
     if len(args) < 2:
-        send_reply("Usage: `/exitconf scans|buffer|pnl <nilai>` atau `/exitconf off`~", reply_chat)
+        send_reply("Usage: `/exitconf scans|buffer|pnl <nilai>` atau `/exitconf off`", reply_chat)
         return
 
     try:
@@ -4116,7 +4116,7 @@ def handle_exitconf_command(args: list, reply_chat: str) -> None:
                 send_reply(
                     f"✅ P&L gate: *{val:.2f}%*\n"
                     f"_Bot akan tahan exit sampai net P&L ≥ {val:.2f}%~_\n"
-                    f"⚠️ `/setpos` belum diset — P&L gate butuh data posisi~",
+                    f"⚠️ `/setpos` belum diset — P&L gate butuh data posisi",
                     reply_chat,
                 )
             else:
@@ -4126,17 +4126,17 @@ def handle_exitconf_command(args: list, reply_chat: str) -> None:
                     reply_chat,
                 )
         else:
-            send_reply("Key tidak dikenal~ Gunakan: `scans`, `buffer`, atau `pnl`~", reply_chat)
+            send_reply("Key tidak dikenal~ Gunakan: `scans`, `buffer`, atau `pnl`", reply_chat)
     except (ValueError, IndexError):
-        send_reply("Format salah~ Contoh: `/exitconf scans 2`~", reply_chat)
+        send_reply("Format tidak sesuai. Contoh: `/exitconf scans 2`", reply_chat)
 
 
 def handle_health_command(reply_chat: str) -> None:
     """Tampilkan health posisi — leverage, margin, UPnL, liq price, pairs net."""
     if pos_data["eth_entry_price"] is None:
         send_reply(
-            "Ara ara~ belum ada posisi yang diset~ (◕ω◕)\n\n"
-            "Gunakan `/setpos` dulu ya~\n\n"
+            "belum ada posisi yang diset\n\n"
+            "Gunakan `/setpos` dulu ya\n\n"
             "*Contoh S1* (Long BTC / Short ETH):\n"
             "`/setpos S1 eth 2011.56 -1.4907 50x btc 67794.76 0.029491 50x`\n\n"
             "*Contoh S2* (Long ETH / Short BTC):\n"
@@ -4145,11 +4145,11 @@ def handle_health_command(reply_chat: str) -> None:
         )
         return
     if scan_stats.get("last_btc_price") is None:
-        send_reply("Tunggu sebentar~ Akeno belum dapat harga terbaru~ (◕ω◕)", reply_chat)
+        send_reply("Harga belum tersedia. Coba lagi sesaat.", reply_chat)
         return
     h = calc_position_pnl()
     if not h:
-        send_reply("Gagal hitung P&L~ Coba `/setpos` ulang~ (◕ω◕)", reply_chat)
+        send_reply("Gagal menghitung P&L. Coba `/setpos` ulang.", reply_chat)
         return
     send_reply(build_position_health_message(h), reply_chat)
 
@@ -4159,7 +4159,7 @@ def handle_clearpos_command(reply_chat: str) -> None:
     for k in pos_data:
         pos_data[k] = None
     clear_pos_data_redis()
-    send_reply("🗑️ *Data posisi dihapus~* (◕‿◕)\nRedis juga dibersihkan~", reply_chat)
+    send_reply("🗑️ *Data posisi dihapus~*\nRedis juga dibersihkan.", reply_chat)
 
 
 def handle_sim_command(args: list, reply_chat: str) -> None:
@@ -4221,13 +4221,13 @@ def handle_sim_command(args: list, reply_chat: str) -> None:
     if cmd == "on":
         settings["sim_enabled"] = True
         send_reply(
-            f"🟢 *Simulation mode ON~* (◕‿◕)\n"
+            f"🟢 *Simulation Mode: ON*\n"
             f"\n"
             f"Margin: ${margin:,.0f} per leg | Lev: {lev:.0f}x | Fee: {fee:.3f}%\n"
             f"Total eksposur per trade: ${margin * lev * 2:,.0f}\n"
             f"\n"
             f"Bot akan otomatis open posisi saat sinyal entry,\n"
-            f"dan close saat exit/invalidasi~\n"
+            f"dan close saat exit/invalidasi\n"
             f"\n"
             f"_Ubah setting: `/sim margin 200` `/sim lev 20`_",
             reply_chat,
@@ -4238,17 +4238,17 @@ def handle_sim_command(args: list, reply_chat: str) -> None:
         if sim_trade["active"]:
             send_reply(
                 "🔴 *Simulation mode OFF~*\n"
-                "⚠️ Masih ada posisi terbuka — gunakan `/sim on` lagi atau tunggu exit signal~",
+                "⚠️ Masih ada posisi terbuka — gunakan `/sim on` lagi atau tunggu exit signal",
                 reply_chat,
             )
         else:
-            send_reply("🔴 *Simulation mode OFF~* Bot tidak akan auto-trade lagi~", reply_chat)
+            send_reply("🔴 *Simulation mode OFF~* Bot tidak akan auto-trade lagi", reply_chat)
 
     elif cmd == "margin":
         try:
             val = float(args[1])
             if val <= 0 or val > 100000:
-                send_reply("Margin harus antara $1 sampai $100,000~", reply_chat)
+                send_reply("Margin harus antara $1 sampai $100,000", reply_chat)
                 return
             settings["sim_margin_usd"] = val
             send_reply(
@@ -4257,13 +4257,13 @@ def handle_sim_command(args: list, reply_chat: str) -> None:
                 reply_chat,
             )
         except (IndexError, ValueError):
-            send_reply("Usage: `/sim margin <usd>` — contoh: `/sim margin 200`~", reply_chat)
+            send_reply("Usage: `/sim margin <usd>` — contoh: `/sim margin 200`", reply_chat)
 
     elif cmd == "lev":
         try:
             val = float(args[1])
             if not 1 <= val <= 200:
-                send_reply("Leverage harus 1x–200x~", reply_chat)
+                send_reply("Leverage harus 1x–200x", reply_chat)
                 return
             settings["sim_leverage"] = val
             send_reply(
@@ -4272,22 +4272,22 @@ def handle_sim_command(args: list, reply_chat: str) -> None:
                 reply_chat,
             )
         except (IndexError, ValueError):
-            send_reply("Usage: `/sim lev <n>` — contoh: `/sim lev 20`~", reply_chat)
+            send_reply("Usage: `/sim lev <n>` — contoh: `/sim lev 20`", reply_chat)
 
     elif cmd == "fee":
         try:
             val = float(args[1])
             settings["sim_fee_pct"] = val
-            send_reply(f"✅ Fee taker: *{val:.4f}%* per side~", reply_chat)
+            send_reply(f"✅ Fee taker: *{val:.4f}%* per side", reply_chat)
         except (IndexError, ValueError):
-            send_reply("Usage: `/sim fee <pct>` — contoh: `/sim fee 0.06`~", reply_chat)
+            send_reply("Usage: `/sim fee <pct>` — contoh: `/sim fee 0.06`", reply_chat)
 
     elif cmd == "reset":
         sim_trade["history"].clear()
-        send_reply("✅ History trades direset~ (◕‿◕)", reply_chat)
+        send_reply("✅ History trade direset.", reply_chat)
 
     else:
-        send_reply("Command tidak dikenal~ Ketik `/sim` untuk daftar perintah~", reply_chat)
+        send_reply("Command tidak dikenal~ Ketik `/sim` untuk daftar perintah", reply_chat)
 
 
 def handle_simstats_command(reply_chat: str) -> None:
@@ -4310,8 +4310,8 @@ def handle_simstats_command(reply_chat: str) -> None:
         send_reply(
             f"{active_str}"
             f"📊 *Sim Stats*\n\n"
-            f"Belum ada trade yang selesai~ (◕ω◕)\n"
-            f"Aktifkan `/sim on` dan tunggu sinyal entry~",
+            f"Belum ada trade yang selesai.\n"
+            f"Aktifkan `/sim on` dan tunggu sinyal entry",
             reply_chat,
         )
         return
@@ -4382,8 +4382,8 @@ def handle_help_command(reply_chat: str) -> None:
     gap_s   = f"{float(scan_stats['last_gap']):+.2f}%" if scan_stats.get("last_gap") is not None else "—"
 
     send_reply(
-        f"📟 *Akeno — Menu Utama*\n"
-        f"_Gap: {gap_s} | Mode: {mode_s} | Peak: {peak_s} | Modal: {cap_str} | Pos: {pos_str}_\n"
+        f"📟 *Menu Utama*\n"
+        f"_Gap: {gap_s} | Mode: {mode_s} | Peak: {peak_s} | Modal: {cap_str} | Posisi: {pos_str}_\n"
         f"\n"
         f"Ketik salah satu untuk detail:\n"
         f"\n"
@@ -4443,7 +4443,7 @@ def handle_help_pos_command(reply_chat: str) -> None:
         f"`/clearpos`  — Hapus data posisi\n"
         f"\n"
         f"───────────────────\n"
-        f"_Data tersimpan di Redis, survive restart~_",
+        f"_Data tersimpan di Redis dan akan bertahan saat restart._",
         reply_chat,
     )
 
@@ -4543,13 +4543,13 @@ def send_startup_message() -> bool:
     price_info  = (
         f"\n💰 BTC: ${float(price_data.btc_price):,.2f} | ETH: ${float(price_data.eth_price):,.2f}\n"
         if price_data
-        else "\n⚠️ Gagal ambil harga~ Akeno terus coba~ (◕ω◕)\n"
+        else "\n⚠️ Gagal mengambil data harga. Bot akan mencoba kembali.\n"
     )
     hrs_loaded  = len(price_history) * settings["scan_interval"] / 3600
     hist_info   = (
         f"⚡ History Bot A: *{hrs_loaded:.1f}h* siap!\n"
         if price_history
-        else f"⏳ Menunggu Bot A~ Sinyal setelah {settings['lookback_hours']}h tersedia~\n"
+        else f"⏳ Menunggu Bot A~ Sinyal setelah {settings['lookback_hours']}h tersedia\n"
     )
     peak_s      = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
     cap_str     = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset (gunakan /capital)"
@@ -4569,7 +4569,7 @@ def send_startup_message() -> bool:
 
     return send_alert(
         f"………\n"
-        f"Ara ara~ *Akeno (Bot B) sudah siap~* Ufufufu... (◕‿◕)\n"
+        f"✅ *Bot B — Aktif*\n"
         f"_Swing / Day Trade Edition — Mentor Analysis_\n"
         f"{price_info}\n"
         f"📊 Scan: {settings['scan_interval']}s | Lookback: {settings['lookback_hours']}h\n"
@@ -4585,7 +4585,7 @@ def send_startup_message() -> bool:
         f"• Net Combined P&L Tracker\n"
         f"\n"
         f"{hist_info}\n"
-        f"Ketik `/help` untuk semua command~\n"
+        f"Ketik `/help` untuk semua command\n"
         f"Akeno takkan pergi~ ⚡"
     )
 
