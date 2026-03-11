@@ -2998,6 +2998,62 @@ def handle_ratio_command(reply_chat: str) -> None:
     )
 
 
+def build_price_recap_block() -> str:
+    """
+    Rekap harga BTC & ETH untuk 24h, 48h, 72h terakhir.
+    Format: Tgl HH:MM | BTC $X → $Y (±Z%) | ETH $X → $Y (±Z%)
+    """
+    if not price_history or len(price_history) < 2:
+        return ""
+
+    now_pt  = price_history[-1]
+    now_ts  = now_pt.timestamp
+    btc_now = float(now_pt.btc)
+    eth_now = float(now_pt.eth)
+    interval = settings["scan_interval"]
+
+    def _find_point(hours_ago: int):
+        scans_back = max(1, int(hours_ago * 3600 / interval))
+        if len(price_history) <= scans_back:
+            # Ambil yang paling jauh tersedia
+            return price_history[0]
+        return price_history[-scans_back - 1]
+
+    def _row(label: str, pt) -> str:
+        ts_str  = pt.timestamp.strftime("%-d %b %H:%M")
+        btc_old = float(pt.btc)
+        eth_old = float(pt.eth)
+        btc_pct = (btc_now - btc_old) / btc_old * 100
+        eth_pct = (eth_now - eth_old) / eth_old * 100
+        btc_arr = "📈" if btc_pct >= 0 else "📉"
+        eth_arr = "📈" if eth_pct >= 0 else "📉"
+        return (
+            f"│ *{label}*  _(dari {ts_str})_\n"
+            f"│  BTC: ${btc_old:,.0f} → ${btc_now:,.0f} {btc_arr} {btc_pct:+.2f}%\n"
+            f"│  ETH: ${eth_old:,.2f} → ${eth_now:,.2f} {eth_arr} {eth_pct:+.2f}%"
+        )
+
+    pt_24h = _find_point(24)
+    pt_48h = _find_point(48)
+    pt_72h = _find_point(72)
+
+    # Hanya tampilkan baris kalau datanya berbeda (ada historynya)
+    rows = [_row("24h", pt_24h)]
+    if pt_48h.timestamp < pt_24h.timestamp:
+        rows.append(_row("48h", pt_48h))
+    if pt_72h.timestamp < pt_48h.timestamp:
+        rows.append(_row("72h", pt_72h))
+
+    now_str = now_ts.strftime("%-d %b %H:%M")
+    block   = (
+        f"*📅 Rekap Harga (sekarang: {now_str} UTC)*\n"
+        f"┌─────────────────────\n"
+        + "\n├─────────────────────\n".join(rows) +
+        f"\n└─────────────────────\n"
+    )
+    return block
+
+
 def handle_analysis_command(reply_chat: str) -> None:
     """Full market analysis on demand."""
     gap_now = scan_stats.get("last_gap")
@@ -3102,10 +3158,14 @@ def handle_analysis_command(reply_chat: str) -> None:
             f"Net P&L: {net_s} | {he} {hd}\n"
         )
 
+    # Price recap 24h/48h/72h
+    recap_block = build_price_recap_block()
+
     send_reply(
         f"🧠 *Full Market Analysis*\n"
         f"_Akeno analisis semuanya~ Ufufufu... (◕‿◕)_\n"
         f"\n"
+        f"{recap_block}\n"
         f"{reg_block}\n"
         f"*📊 Gap ({lb}):*\n"
         f"┌─────────────────────\n"
