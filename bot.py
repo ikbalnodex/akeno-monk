@@ -179,8 +179,12 @@ settings = {
     "eth_early_gap_pct":      0.5,
     # — Early Signal System —
     "early_signal_enabled":   True,
-    "early_lead_gap":         0.4,    # gap min untuk Phase-1 lead alert
-    "early_5m_move":          0.35,   # % pergerakan 5m untuk Phase-2 opportunity alert
+    "early_lead_gap":         0.4,
+    "early_5m_move":          0.35,
+    # — Divergence Stress Alert —
+    "div_stress_enabled":       True,
+    "div_stress_leg_loss_pct":  1.5,   # % leg rugi untuk trigger (default 1.5%)
+    "div_stress_gap_widen_pct": 0.3,   # gap melebar dari entry = "makin ekstrem"
     # — Simulation Mode —
     "sim_enabled":            False,   # bot otomatis open/close posisi saat sinyal
     "sim_margin_usd":         100.0,   # margin per leg dalam USD
@@ -507,6 +511,7 @@ def process_commands() -> None:
             "/sizeratio":     lambda: handle_sizeratio_command(args, chat_id),
             "/regimefilter":      lambda: handle_regimefilter_command(args, chat_id),
             "/earlysignal":       lambda: handle_earlysignal_command(args, chat_id),
+            "/divstress":         lambda: handle_divstress_command(args, chat_id),
             "/ethpullback":       lambda: handle_ethpullback_command(args, chat_id),
             "/sim":        lambda: handle_sim_command(args, chat_id),
             "/simstats":   lambda: handle_simstats_command(chat_id),
@@ -2997,8 +3002,222 @@ def _send_neutral_alert(
 
 
 # =============================================================================
-# Legacy ETH Pullback (dipakai /ethpullback command)
+# Divergence Stress Alert — notif kalau posisi rugi dan gap malah melebar
 # =============================================================================
+# State tracker
+div_stress_last_gap:     Optional[float] = None   # gap saat stress pertama terdeteksi
+div_stress_alerted:      bool            = False   # sudah kirim alert di siklus ini
+div_stress_alert_count:  int             = 0       # berapa kali alert dikirim sesi ini
+DIV_STRESS_LEG_LOSS_PCT  = 1.5    # % leg rugi untuk trigger cek (default)
+DIV_STRESS_GAP_WIDEN_PCT = 0.3    # gap melebar minimal ini dari entry untuk dianggap "makin ekstrem"
+DIV_STRESS_COOLDOWN      = 8      # scan interval cooldown setelah alert (biar tidak spam)
+div_stress_cooldown_cnt: int      = 0
+
+
+def _div_stress_reset():
+    global div_stress_last_gap, div_stress_alerted, div_stress_cooldown_cnt
+    div_stress_last_gap    = None
+    div_stress_alerted     = False
+    div_stress_cooldown_cnt = 0
+
+
+def check_divergence_stress(
+    gap_float:  float,
+    btc_ret:    Decimal,
+    eth_ret:    Decimal,
+    btc_price:  Decimal,
+    eth_price:  Decimal,
+) -> None:
+    """
+    Cek apakah posisi sedang dalam kondisi stress divergence:
+    - Leg yang harusnya profit justru rugi (gap makin melebar dari entry)
+    - Trigger: P&L negatif AND |gap| semakin jauh dari entry_gap_value
+
+    Decision tree:
+    PnL negatif → Cek: Apakah divergence makin ekstrem?
+    ├── YA: Bisa average (tapi hati-hati, tambah risiko)
+    │   └── Kurangi SIZE leg yang rugi, bukan tambah leg yang profit
+    └── TIDAK (divergence stabil/balik): Siap-siap profit segera
+    """
+    global div_stress_alerted, div_stress_last_gap
+    global div_stress_cooldown_cnt, div_stress_alert_count
+
+    # Hanya aktif saat TRACK mode dengan posisi diketahui
+    if current_mode != Mode.TRACK or active_strategy is None:
+        _div_stress_reset()
+        return
+    if entry_gap_value is None or entry_btc_price is None or entry_eth_price is None:
+        return
+
+    # Cooldown: jangan spam
+    if div_stress_alerted:
+        div_stress_cooldown_cnt += 1
+        if div_stress_cooldown_cnt >= DIV_STRESS_COOLDOWN:
+            div_stress_alerted      = False
+            div_stress_cooldown_cnt = 0
+        return
+
+    # Hitung P&L per leg sekarang
+    if active_strategy == Strategy.S1:
+        # Long BTC / Short ETH
+        leg_btc_pct = float((btc_price - entry_btc_price) / entry_btc_price * 100)
+        leg_eth_pct = float((entry_eth_price - eth_price)  / entry_eth_price * 100)
+        losing_leg  = "BTC"   # BTC gerak berlawanan
+        if leg_btc_pct >= 0:
+            return   # Long BTC tidak rugi, tidak perlu alert
+        losing_pct  = leg_btc_pct   # negatif
+    else:
+        # Long ETH / Short BTC
+        leg_eth_pct = float((eth_price - entry_eth_price) / entry_eth_price * 100)
+        leg_btc_pct = float((entry_btc_price - btc_price) / entry_btc_price * 100)
+        losing_leg  = "ETH"
+        if leg_eth_pct >= 0:
+            return
+        losing_pct  = leg_eth_pct
+
+    # Hanya trigger kalau leg rugi cukup signifikan
+    loss_threshold = settings.get("div_stress_leg_loss_pct", DIV_STRESS_LEG_LOSS_PCT)
+    if abs(losing_pct) < loss_threshold:
+        return
+
+    # Cek apakah gap makin ekstrem atau stabil/balik
+    gap_at_entry  = entry_gap_value   # positif untuk S1, negatif untuk S2
+    widen_thresh  = settings.get("div_stress_gap_widen_pct", DIV_STRESS_GAP_WIDEN_PCT)
+
+    if active_strategy == Strategy.S1:
+        # S1: gap harusnya mengecil (konvergen ke 0). Makin ekstrem = gap makin besar
+        diverging     = gap_float > gap_at_entry + widen_thresh
+        gap_movement  = gap_float - gap_at_entry   # positif = makin lebar
+    else:
+        # S2: gap harusnya naik (gap negatif mengecil ke 0). Makin ekstrem = gap makin negatif
+        diverging     = gap_float < gap_at_entry - widen_thresh
+        gap_movement  = gap_at_entry - gap_float   # positif = makin lebar
+
+    net_pnl  = (leg_eth_pct + leg_btc_pct) / 2
+
+    div_stress_alert_count += 1
+    div_stress_alerted      = True
+    div_stress_last_gap     = gap_float
+
+    _send_divergence_stress_alert(
+        strategy     = active_strategy,
+        diverging    = diverging,
+        losing_leg   = losing_leg,
+        losing_pct   = losing_pct,
+        leg_btc_pct  = leg_btc_pct,
+        leg_eth_pct  = leg_eth_pct,
+        net_pnl      = net_pnl,
+        gap_now      = gap_float,
+        gap_at_entry = gap_at_entry,
+        gap_movement = gap_movement,
+        btc_price    = float(btc_price),
+        eth_price    = float(eth_price),
+        alert_count  = div_stress_alert_count,
+    )
+    logger.info(
+        f"Divergence stress alert #{div_stress_alert_count}: "
+        f"diverging={diverging} | losing={losing_leg} {losing_pct:.2f}% | "
+        f"gap {gap_at_entry:.2f}% → {gap_float:.2f}%"
+    )
+
+
+def _send_divergence_stress_alert(
+    strategy:     Strategy,
+    diverging:    bool,
+    losing_leg:   str,
+    losing_pct:   float,
+    leg_btc_pct:  float,
+    leg_eth_pct:  float,
+    net_pnl:      float,
+    gap_now:      float,
+    gap_at_entry: float,
+    gap_movement: float,
+    btc_price:    float,
+    eth_price:    float,
+    alert_count:  int,
+) -> None:
+    lb       = get_lookback_label()
+    strat_str = "S1 (Long BTC / Short ETH)" if strategy == Strategy.S1 else "S2 (Long ETH / Short BTC)"
+
+    # Emoji & header
+    if diverging:
+        header  = f"⚠️ *Divergence Makin Ekstrem — Posisi Tertekan*"
+        urgency = "🔴 Gap terus melebar dari entry — posisi makin dalam minus."
+    else:
+        header  = f"🔔 *Posisi Rugi Tapi Gap Stabil — Pantau Ketat*"
+        urgency = "🟡 Gap tidak makin buruk. Bisa jadi mau berbalik."
+
+    # P&L block
+    net_emoji = "🔴" if net_pnl < 0 else "🟢"
+    leg_btc_s = f"{'🔴' if leg_btc_pct < 0 else '🟢'} Long BTC:  {leg_btc_pct:+.2f}%"
+    leg_eth_s = f"{'🔴' if leg_eth_pct < 0 else '🟢'} Short ETH: {leg_eth_pct:+.2f}%"
+    if strategy == Strategy.S2:
+        leg_btc_s = f"{'🔴' if leg_btc_pct < 0 else '🟢'} Short BTC: {leg_btc_pct:+.2f}%"
+        leg_eth_s = f"{'🔴' if leg_eth_pct < 0 else '🟢'} Long ETH:  {leg_eth_pct:+.2f}%"
+
+    # Gap block
+    gap_arrow = "↗️ melebar" if gap_movement > 0 else "↘️ mengecil"
+    gap_line  = (
+        f"Gap entry: {gap_at_entry:+.2f}% → sekarang: {gap_now:+.2f}% "
+        f"({gap_movement:+.2f}% {gap_arrow})"
+    )
+
+    # Decision tree
+    if diverging:
+        decision = (
+            f"*Divergence makin ekstrem — pilihan:*\n"
+            f"┌─────────────────────\n"
+            f"│ 1️⃣  *Kurangi size {losing_leg}* (leg rugi)\n"
+            f"│    Bukan tambah leg sebelah — itu nambah risiko\n"
+            f"│    Tujuan: kurangi eksposur sebelum tambah rugi\n"
+            f"├─────────────────────\n"
+            f"│ 2️⃣  *Tunggu konfirmasi reversal* dulu\n"
+            f"│    Gap balik ke < {gap_at_entry:+.2f}% = sinyal membaik\n"
+            f"│    Baru pertimbangkan average DOWN\n"
+            f"├─────────────────────\n"
+            f"│ 3️⃣  *Cut loss* kalau gap terus melebar\n"
+            f"│    Mentor rule: net PnL positif untuk close — "
+            f"{'belum tercapai' if net_pnl < 0 else 'sudah ✅'}\n"
+            f"└─────────────────────\n"
+            f"⚡ *Jangan average UP leg yang sudah profit* — itu bukan hedging, itu double risk."
+        )
+    else:
+        decision = (
+            f"*Gap tidak makin buruk — pilihan:*\n"
+            f"┌─────────────────────\n"
+            f"│ ✅ *Hold posisi* — divergence stabil\n"
+            f"│    Gap belum balik, tapi tidak makin jauh\n"
+            f"├─────────────────────\n"
+            f"│ ⏳ *Pantau 1–2 candle berikutnya*\n"
+            f"│    Kalau gap mulai konvergen → posisi segera profit\n"
+            f"├─────────────────────\n"
+            f"│ ❗ Kalau gap berbalik melebar >{DIV_STRESS_GAP_WIDEN_PCT}% lagi\n"
+            f"│    → alert berikutnya akan naik ke status ⚠️ ekstrem\n"
+            f"└─────────────────────\n"
+        )
+
+    msg = (
+        f"{header}\n"
+        f"_{urgency}_\n"
+        f"\n"
+        f"*Posisi: {strat_str}*\n"
+        f"┌─────────────────────\n"
+        f"│ {leg_btc_s}\n"
+        f"│ {leg_eth_s}\n"
+        f"│ {net_emoji} Net P&L: *{net_pnl:+.2f}%*\n"
+        f"├─────────────────────\n"
+        f"│ {gap_line}\n"
+        f"│ BTC: ${btc_price:,.2f}  ETH: ${eth_price:,.2f}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"{decision}\n"
+        f"_`/health` untuk detail posisi lengkap._"
+        + (f"\n_Alert #{alert_count} sesi ini._" if alert_count > 1 else "")
+    )
+    send_alert(msg)
+
+
+
 def _get_5m_eth_change(eth_now: float) -> Optional[float]:
     if not eth_5m_buffer:
         return None
@@ -3492,6 +3711,7 @@ def reset_to_scan() -> None:
     entry_eth_ret     = None
     entry_driver      = None
     exit_confirm_count = 0
+    _div_stress_reset()   # reset stress tracker saat posisi ditutup
 
 
 # =============================================================================
@@ -4440,6 +4660,102 @@ def handle_sizeratio_command(args: list, reply_chat: str) -> None:
         )
     except ValueError:
         send_reply("Nilai tidak valid. Contoh: `/sizeratio 60`", reply_chat)
+
+
+def handle_divstress_command(args: list, reply_chat: str) -> None:
+    """
+    /divstress              — status & config
+    /divstress on|off       — aktifkan/nonaktifkan
+    /divstress loss <pct>   — set % leg loss threshold (default 1.5%)
+    /divstress widen <pct>  — set gap widen threshold (default 0.3%)
+    """
+    if not args:
+        enabled   = settings.get("div_stress_enabled", True)
+        loss_th   = settings.get("div_stress_leg_loss_pct", DIV_STRESS_LEG_LOSS_PCT)
+        widen_th  = settings.get("div_stress_gap_widen_pct", DIV_STRESS_GAP_WIDEN_PCT)
+        status    = "✅ ON" if enabled else "❌ OFF"
+
+        # Tracker status
+        if current_mode == Mode.TRACK and active_strategy is not None and entry_gap_value is not None:
+            btc_p = scan_stats.get("last_btc_price")
+            eth_p = scan_stats.get("last_eth_price")
+            if btc_p and eth_p and entry_btc_price and entry_eth_price:
+                if active_strategy == Strategy.S1:
+                    l_btc = float((btc_p - entry_btc_price) / entry_btc_price * 100)
+                    l_eth = float((entry_eth_price - eth_p) / entry_eth_price * 100)
+                else:
+                    l_eth = float((eth_p - entry_eth_price) / entry_eth_price * 100)
+                    l_btc = float((entry_btc_price - btc_p) / entry_btc_price * 100)
+                net = (l_eth + l_btc) / 2
+                tracker_str = (
+                    f"\n*Posisi sekarang:*\n"
+                    f"┌─────────────────────\n"
+                    f"│ {'🔴' if l_btc < 0 else '🟢'} BTC leg: {l_btc:+.2f}%\n"
+                    f"│ {'🔴' if l_eth < 0 else '🟢'} ETH leg: {l_eth:+.2f}%\n"
+                    f"│ {'🔴' if net < 0 else '🟢'} Net P&L: {net:+.2f}%\n"
+                    f"│ Alert sesi ini: {div_stress_alert_count}x\n"
+                    f"└─────────────────────\n"
+                )
+            else:
+                tracker_str = "\n_Set `/setpos` untuk pantau P&L._\n"
+        else:
+            tracker_str = "\n_Tidak dalam posisi aktif._\n"
+
+        send_reply(
+            f"⚠️ *Divergence Stress Alert: {status}*\n"
+            f"\n"
+            f"*Trigger:*\n"
+            f"┌─────────────────────\n"
+            f"│ Leg loss ≥ {loss_th}%  → cek divergence\n"
+            f"│ Gap melebar ≥ {widen_th}%  → status ekstrem\n"
+            f"│ Cooldown: {DIV_STRESS_COOLDOWN} scan setelah tiap alert\n"
+            f"└─────────────────────\n"
+            f"{tracker_str}\n"
+            f"`/divstress on|off`\n"
+            f"`/divstress loss <pct>` | `/divstress widen <pct>`",
+            reply_chat,
+        )
+        return
+
+    cmd     = args[0].lower()
+    val_arg = args[1] if len(args) > 1 else None
+    if cmd == "on":
+        settings["div_stress_enabled"] = True
+        send_reply(
+            f"✅ *Divergence Stress Alert aktif.*\n"
+            f"Trigger: leg rugi ≥{settings['div_stress_leg_loss_pct']}% "
+            f"+ gap melebar ≥{settings['div_stress_gap_widen_pct']}%.",
+            reply_chat,
+        )
+    elif cmd == "off":
+        settings["div_stress_enabled"] = False
+        _div_stress_reset()
+        send_reply("❌ *Divergence Stress Alert dinonaktifkan.*", reply_chat)
+    elif cmd == "loss" and val_arg:
+        try:
+            val = float(val_arg)
+            if not 0.2 <= val <= 10.0:
+                send_reply("Nilai harus antara 0.2–10.0%.", reply_chat); return
+            settings["div_stress_leg_loss_pct"] = val
+            send_reply(f"✅ Leg loss threshold diperbarui: *{val}%*", reply_chat)
+        except ValueError:
+            send_reply("Nilai tidak valid.", reply_chat)
+    elif cmd == "widen" and val_arg:
+        try:
+            val = float(val_arg)
+            if not 0.05 <= val <= 5.0:
+                send_reply("Nilai harus antara 0.05–5.0%.", reply_chat); return
+            settings["div_stress_gap_widen_pct"] = val
+            send_reply(f"✅ Gap widen threshold diperbarui: *{val}%*", reply_chat)
+        except ValueError:
+            send_reply("Nilai tidak valid.", reply_chat)
+    else:
+        send_reply(
+            "Gunakan:\n`/divstress on|off`\n"
+            "`/divstress loss <pct>`\n"
+            "`/divstress widen <pct>`",
+            reply_chat,
+        )
 
 
 def handle_earlysignal_command(args: list, reply_chat: str) -> None:
@@ -5802,6 +6118,16 @@ def main_loop() -> None:
                         float(btc_ret), float(eth_ret),
                         float(price_data.btc_price), float(price_data.eth_price),
                     )
+
+                    # Divergence stress alert — posisi rugi + gap makin melebar
+                    if settings.get("div_stress_enabled", True):
+                        check_divergence_stress(
+                            gap_float  = float(gap),
+                            btc_ret    = btc_ret,
+                            eth_ret    = eth_ret,
+                            btc_price  = price_data.btc_price,
+                            eth_price  = price_data.eth_price,
+                        )
 
                     evaluate_and_transition(
                         btc_ret, eth_ret, gap,
