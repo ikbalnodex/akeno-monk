@@ -79,10 +79,41 @@ class PriceData(NamedTuple):
     eth_updated_at: datetime
 
 
+class Candle(NamedTuple):
+    """1H OHLC candle agregasi dari price_history tick-by-tick."""
+    ts:     datetime  # waktu buka candle (floor ke jam)
+    btc_o:  float
+    btc_h:  float
+    btc_l:  float
+    btc_c:  float
+    eth_o:  float
+    eth_h:  float
+    eth_l:  float
+    eth_c:  float
+
+    @property
+    def btc_ret(self) -> float:
+        """% return candle BTC (close vs open)."""
+        return (self.btc_c - self.btc_o) / self.btc_o * 100 if self.btc_o > 0 else 0.0
+
+    @property
+    def eth_ret(self) -> float:
+        return (self.eth_c - self.eth_o) / self.eth_o * 100 if self.eth_o > 0 else 0.0
+
+    @property
+    def gap(self) -> float:
+        """ETH_ret - BTC_ret untuk candle ini."""
+        return self.eth_ret - self.btc_ret
+
+
+
 # =============================================================================
 # Global State
 # =============================================================================
 price_history:   List[PricePoint]    = []
+candle_history:  List["Candle"]      = []   # 1H candles, max 48 lilin (48h)
+CANDLE_PERIOD    = 60   # menit per candle
+CANDLE_MAX       = 48   # simpan 48 candle (48h)
 current_mode:    Mode                = Mode.SCAN
 active_strategy: Optional[Strategy] = None
 
@@ -684,68 +715,52 @@ def check_dominance_alignment(strategy: Strategy, dom: dict) -> Tuple[str, str, 
 
 def detect_market_regime() -> dict:
     """
-    Deteksi regime pasar BTC (dan ETH) dari price_history.
-    Menggunakan multi-timeframe: 1h, 4h, 24h + volatility (ATR proxy).
+    Deteksi regime pasar dari candle_history (1H OHLC).
+    Menggunakan close-to-close antar candle — bebas noise tick-by-tick.
 
-    Returns dict:
-      regime       : "BULLISH" / "BEARISH" / "CONSOLIDASI"
-      strength     : "Kuat" / "Moderat" / "Lemah"
-      emoji        : str
-      btc_1h/4h/24h: % change
-      eth_1h/4h/24h: % change
-      volatility   : "Tinggi" / "Normal" / "Rendah"
-      vol_pct      : float (avg candle range % per period)
-      description  : str (satu baris penjelasan)
-      implications : str (implikasi untuk pairs strategy)
+    Candle lookback:
+      1H  = candle terakhir
+      4H  = 4 candle terakhir (close ke close)
+      24H = 24 candle terakhir
     """
-    if len(price_history) < 3:
-        return {"regime": "N/A", "emoji": "⚪", "strength": "—",
-                "description": "Data belum cukup", "implications": "—",
-                "btc_1h": None, "btc_4h": None, "btc_24h": None,
-                "eth_1h": None, "eth_4h": None, "eth_24h": None,
-                "volatility": "—", "vol_pct": 0.0}
+    EMPTY = {
+        "regime": "N/A", "emoji": "⚪", "strength": "—",
+        "description": "Data belum cukup (menunggu candle 1H terbentuk)",
+        "implications": "—",
+        "btc_1h": None, "btc_4h": None, "btc_24h": None,
+        "eth_1h": None, "eth_4h": None, "eth_24h": None,
+        "volatility": "—", "vol_pct": 0.0,
+    }
+    if len(candle_history) < 2:
+        return EMPTY
 
-    now      = price_history[-1]
-    btc_now  = float(now.btc)
-    eth_now  = float(now.eth)
-    interval = settings["scan_interval"]   # detik per scan
-
-    def _pct_change(minutes: int):
-        """Ambil price N menit lalu, hitung % change."""
-        scans_back = max(1, int(minutes * 60 / interval))
-        if len(price_history) <= scans_back:
+    def _candle_range_ret(n_candles: int):
+        """% return BTC & ETH dari n candle lalu ke sekarang (close ke close)."""
+        if len(candle_history) < n_candles + 1:
             return None, None
-        old = price_history[-scans_back - 1]
-        btc_ret = (btc_now - float(old.btc)) / float(old.btc) * 100
-        eth_ret = (eth_now - float(old.eth)) / float(old.eth) * 100
-        return btc_ret, eth_ret
+        old = candle_history[-(n_candles + 1)]
+        now = candle_history[-1]
+        btc_r = (now.btc_c - old.btc_c) / old.btc_c * 100 if old.btc_c > 0 else None
+        eth_r = (now.eth_c - old.eth_c) / old.eth_c * 100 if old.eth_c > 0 else None
+        return btc_r, eth_r
 
-    btc_1h,  eth_1h  = _pct_change(60)
-    btc_4h,  eth_4h  = _pct_change(240)
-    btc_24h, eth_24h = _pct_change(1440)
+    btc_1h,  eth_1h  = _candle_range_ret(1)
+    btc_4h,  eth_4h  = _candle_range_ret(4)
+    btc_24h, eth_24h = _candle_range_ret(24)
 
-    # Volatility: rata-rata |Δ%| per scan selama 60 menit terakhir
-    scans_1h   = max(2, int(3600 / interval))
-    window_pts = price_history[-scans_1h:] if len(price_history) >= scans_1h else price_history
+    # Volatility: rata-rata high-low range % per candle (ATR proxy dari candles)
+    vol_window = candle_history[-8:] if len(candle_history) >= 8 else candle_history
     vol_samples = []
-    for i in range(1, len(window_pts)):
-        prev_b = float(window_pts[i-1].btc)
-        curr_b = float(window_pts[i].btc)
-        if prev_b > 0:
-            vol_samples.append(abs(curr_b - prev_b) / prev_b * 100)
-    avg_vol = sum(vol_samples) / len(vol_samples) if vol_samples else 0.0
+    for c in vol_window:
+        if c.btc_l > 0:
+            vol_samples.append((c.btc_h - c.btc_l) / c.btc_l * 100)
+    avg_vol   = sum(vol_samples) / len(vol_samples) if vol_samples else 0.0
+    vol_label = "Tinggi 🔥" if avg_vol >= 1.5 else ("Normal 📊" if avg_vol >= 0.5 else "Rendah 😴")
 
-    if avg_vol >= 0.15:     vol_label = "Tinggi 🔥"
-    elif avg_vol >= 0.05:   vol_label = "Normal 📊"
-    else:                   vol_label = "Rendah 😴"
-
-    # Regime logic — pakai weighted vote dari 3 timeframe
-    # Bobot: 1h=1, 4h=2, 24h=3 (4h dan 24h lebih penting)
-    def _vote(ret, threshold=0.5):
+    # Weighted vote dari 3 TF — 4H dan 24H lebih berat
+    def _vote(ret, threshold):
         if ret is None: return 0
-        if ret > threshold:  return 1    # bull
-        if ret < -threshold: return -1   # bear
-        return 0                          # konsolidasi
+        return 1 if ret > threshold else (-1 if ret < -threshold else 0)
 
     votes = (
         _vote(btc_1h,  0.3) * 1 +
@@ -753,68 +768,53 @@ def detect_market_regime() -> dict:
         _vote(btc_24h, 1.5) * 3
     )
 
-    # Tentukan regime dari total votes (-6 s/d +6)
-    if votes >= 4:      regime, emoji = "BULLISH",     "🟢"
-    elif votes >= 1:    regime, emoji = "BULLISH",     "🟡"
-    elif votes <= -4:   regime, emoji = "BEARISH",     "🔴"
-    elif votes <= -1:   regime, emoji = "BEARISH",     "🟠"
-    else:               regime, emoji = "KONSOLIDASI", "⚪"
+    if votes >= 4:    regime, emoji = "BULLISH",     "🟢"
+    elif votes >= 1:  regime, emoji = "BULLISH",     "🟡"
+    elif votes <= -4: regime, emoji = "BEARISH",     "🔴"
+    elif votes <= -1: regime, emoji = "BEARISH",     "🟠"
+    else:             regime, emoji = "KONSOLIDASI", "⚪"
 
-    if abs(votes) >= 4: strength = "Kuat"
-    elif abs(votes) >= 2: strength = "Moderat"
-    else: strength = "Lemah"
+    strength = "Kuat" if abs(votes) >= 4 else ("Moderat" if abs(votes) >= 2 else "Lemah")
 
-    # Description
     if regime == "BULLISH":
-        desc = f"BTC dalam tren naik — momentum {'kuat' if strength == 'Kuat' else 'moderat'}"
+        desc = f"BTC tren naik ({strength}) — {len(candle_history)} candle 1H teramati"
+        impl = (
+            "Market pump. Gap > 0 (ETH > BTC) → S1 ideal.\n"
+            "Gap < 0 (BTC > ETH) → S2 berisiko, BTC mungkin lanjut naik."
+        )
     elif regime == "BEARISH":
-        desc = f"BTC dalam tren turun — momentum {'kuat' if strength == 'Kuat' else 'moderat'}"
+        desc = f"BTC tren turun ({strength}) — {len(candle_history)} candle 1H teramati"
+        impl = (
+            "Market dump. Gap < 0 (BTC > ETH) → S2 ideal.\n"
+            "Gap > 0 (ETH > BTC) → S1 valid, tapi pantau BTC tidak dump lebih dalam."
+        )
     else:
-        desc = "BTC bergerak sideways — tidak ada tren jelas"
-
-    # Implikasi untuk pairs strategy
-    if regime == "BULLISH" and strength == "Kuat":
-        impl = "✅ *S1 setup* — pump kuat, ETH cenderung outperform BTC. Monitor gap, kalau ETH pump lebih % dari BTC → entry S1."
-    elif regime == "BULLISH":
-        impl = "S1 moderat — pump ada tapi belum kuat. Tunggu ETH jelas outperform BTC sebelum entry S1."
-    elif regime == "BEARISH" and strength == "Kuat":
-        impl = "✅ *S2 setup* — dump kuat, ETH cenderung underperform BTC. Monitor gap, kalau ETH dump lebih % dari BTC → entry S2."
-    elif regime == "BEARISH":
-        impl = "S2 moderat — dump ada tapi belum kuat. Tunggu ETH jelas underperform BTC sebelum entry S2."
-    else:
-        impl = "⚠️ Sideways — gap kecil dan tidak sustained. Kedua strategi sulit, lebih baik tunggu arah jelas."
+        desc = f"BTC sideways — {len(candle_history)} candle 1H teramati"
+        impl = "Sideways — gap bisa terbentuk di kedua arah. Threshold lebih ketat disarankan."
 
     return {
-        "regime":     regime,
-        "emoji":      emoji,
-        "strength":   strength,
-        "votes":      votes,
-        "btc_1h":     btc_1h,  "eth_1h":  eth_1h,
-        "btc_4h":     btc_4h,  "eth_4h":  eth_4h,
-        "btc_24h":    btc_24h, "eth_24h": eth_24h,
-        "volatility": vol_label,
-        "vol_pct":    avg_vol,
-        "description": desc,
-        "implications": impl,
+        "regime":      regime,  "emoji":   emoji,   "strength":  strength,
+        "votes":       votes,
+        "btc_1h":      btc_1h,  "eth_1h":  eth_1h,
+        "btc_4h":      btc_4h,  "eth_4h":  eth_4h,
+        "btc_24h":     btc_24h, "eth_24h": eth_24h,
+        "volatility":  vol_label, "vol_pct": avg_vol,
+        "description": desc, "implications": impl,
     }
 
 
 def get_convergence_hint(strategy: Strategy, driver: str) -> str:
     """Prediksi cara konvergensi paling mungkin."""
     if strategy == Strategy.S1:
-        # Entry saat pump + ETH outperform BTC (gap > 0)
-        # Profit saat ETH pullback atau BTC catch up
         hints = {
             "ETH-led": "ETH pump yang dominan → kemungkinan *ETH pullback* dulu. Revert biasanya lebih cepat.",
             "BTC-led": "BTC yang ketinggalan naik → tunggu *BTC catch up*. Lebih lambat tapi lebih sustained.",
             "Mixed":   "Keduanya berkontribusi → bisa revert dari ETH pullback atau BTC catch up.",
         }
     else:
-        # Entry saat dump + ETH underperform BTC (gap < 0)
-        # Profit saat ETH bounce atau BTC koreksi lebih dalam
         hints = {
             "ETH-led": "ETH dump yang dominan → kemungkinan *ETH bounce* dulu. Revert biasanya lebih cepat.",
-            "BTC-led": "BTC yang terlalu kuat → tunggu *BTC koreksi*. Lebih lambat, seperti yang terjadi 2x ini.",
+            "BTC-led": "BTC yang terlalu kuat → tunggu *BTC koreksi*. Lebih lambat.",
             "Mixed":   "Keduanya berkontribusi → bisa revert dari ETH bounce atau BTC koreksi.",
         }
     return hints.get(driver, "")
@@ -825,70 +825,79 @@ def calc_ratio_percentile() -> Tuple[
     Optional[float], Optional[float], Optional[int]
 ]:
     """
-    Hitung ETH/BTC ratio sekarang dan percentile-nya.
+    Hitung ETH/BTC ratio dari candle_history (close price).
+    Lebih stabil daripada tick-by-tick karena pakai close candle 1H.
     Returns: (current, avg, high, low, percentile)
     """
-    if not price_history or len(price_history) < 10:
+    if len(candle_history) < 5:
+        # Fallback ke price_history kalau candle belum terbentuk
+        if not price_history or len(price_history) < 10:
+            return None, None, None, None, None
+        ratios_raw = [float(p.eth / p.btc) for p in price_history]
+    else:
+        ratios_raw = [c.eth_c / c.btc_c for c in candle_history if c.btc_c > 0]
+
+    if not ratios_raw:
         return None, None, None, None, None
 
-    now     = datetime.now(timezone.utc)
-    cutoff  = now - timedelta(days=settings["ratio_window_days"])
-    window  = [p for p in price_history if p.timestamp >= cutoff]
-    if len(window) < 5:
-        window = price_history  # fallback semua history
-
-    ratios = [float(p.eth / p.btc) for p in window]
-    if not ratios:
-        return None, None, None, None, None
-
-    current    = ratios[-1]
-    avg        = sum(ratios) / len(ratios)
-    high       = max(ratios)
-    low        = min(ratios)
-    below      = sum(1 for r in ratios if r <= current)
-    percentile = int(below / len(ratios) * 100)
-
+    current    = ratios_raw[-1]
+    avg        = sum(ratios_raw) / len(ratios_raw)
+    high       = max(ratios_raw)
+    low        = min(ratios_raw)
+    below      = sum(1 for r in ratios_raw if r <= current)
+    percentile = int(below / len(ratios_raw) * 100)
     return current, avg, high, low, percentile
 
 
 # =============================================================================
-# Ratio Momentum
+# Ratio Momentum (candle-based)
 # =============================================================================
 def calc_ratio_momentum() -> dict:
-    if not price_history or len(price_history) < 5:
-        return {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
-                "slope_1h": None, "slope_4h": None, "slope_24h": None,
-                "label": "Data belum cukup", "acceleration": "N/A"}
-    interval  = settings["scan_interval"]
-    now_pt    = price_history[-1]
-    ratio_now = float(now_pt.eth) / float(now_pt.btc)
-    def _slope(minutes):
-        scans_back = max(1, int(minutes * 60 / interval))
-        if len(price_history) <= scans_back:
+    """
+    Slope ETH/BTC ratio dari candle_history.
+    1H = 1 candle lalu, 4H = 4 candle lalu, 24H = 24 candle lalu.
+    Bebas noise intra-jam.
+    """
+    EMPTY = {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
+             "slope_1h": None, "slope_4h": None, "slope_24h": None,
+             "label": "Data belum cukup", "acceleration": "N/A"}
+    if len(candle_history) < 2:
+        return EMPTY
+
+    ratio_now = candle_history[-1].eth_c / candle_history[-1].btc_c if candle_history[-1].btc_c > 0 else None
+    if ratio_now is None:
+        return EMPTY
+
+    def _slope(n_back):
+        if len(candle_history) < n_back + 1:
             return None
-        old = price_history[-scans_back - 1]
-        ratio_old = float(old.eth) / float(old.btc)
-        return (ratio_now - ratio_old) / ratio_old * 100 if ratio_old != 0 else None
-    s1h  = _slope(60)
-    s4h  = _slope(240)
-    s24h = _slope(1440)
+        old = candle_history[-(n_back + 1)]
+        r_old = old.eth_c / old.btc_c if old.btc_c > 0 else None
+        if r_old is None or r_old == 0:
+            return None
+        return (ratio_now - r_old) / r_old * 100
+
+    s1h  = _slope(1)
+    s4h  = _slope(4)
+    s24h = _slope(24)
     primary = s4h if s4h is not None else s1h
     if primary is None:
-        return {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
-                "slope_1h": s1h, "slope_4h": s4h, "slope_24h": s24h,
-                "label": "Data belum cukup", "acceleration": "N/A"}
-    abs_p = abs(primary)
+        return EMPTY
+
+    abs_p    = abs(primary)
     strength = "Kuat" if abs_p >= 1.5 else ("Moderat" if abs_p >= 0.5 else "Lemah")
-    if primary > 0.1:   direction, emoji = "NAIK", "📈"
-    elif primary < -0.1: direction, emoji = "TURUN", "📉"
-    else:                direction, emoji = "SIDEWAYS", "➡️"
+    if primary > 0.05:    direction, emoji = "NAIK",     "📈"
+    elif primary < -0.05: direction, emoji = "TURUN",    "📉"
+    else:                 direction, emoji = "SIDEWAYS", "➡️"
+
     acceleration = "Stabil"
-    if s1h is not None and s4h is not None:
+    if s1h is not None and s4h is not None and s4h != 0:
         rate_4h = s4h / 4
-        if abs(rate_4h) > 0.01:
+        if abs(rate_4h) > 0.005:
             r = s1h / rate_4h
             if r > 1.3:   acceleration = "Mempercepat 🔥"
             elif r < 0.7: acceleration = "Melambat 🧊"
+
     return {"direction": direction, "emoji": emoji, "strength": strength,
             "slope_1h": s1h, "slope_4h": s4h, "slope_24h": s24h,
             "label": f"Ratio {direction} {strength}", "acceleration": acceleration}
@@ -902,7 +911,9 @@ def calc_adaptive_thresholds() -> dict:
     vol_pct = reg["vol_pct"]
     entry_base = settings["entry_threshold"]
     exit_base  = settings["exit_threshold"]
-    ref_vol    = 0.05
+    # Candle ATR sudah dalam skala % high-low per candle (biasanya 0.5–3%)
+    # Ref vol: 1% = candle range normal untuk BTC
+    ref_vol    = 1.0
     multiplier = max(0.5, min(2.5, vol_pct / ref_vol)) if vol_pct > 0 else 1.0
     min_e = settings["adaptive_min_entry"]
     max_e = settings["adaptive_max_entry"]
@@ -954,36 +965,46 @@ def get_market_session() -> dict:
 
 
 # =============================================================================
-# Multi-TF Gap
+# Multi-TF Gap (candle-based)
 # =============================================================================
 def calc_multitf_gap() -> dict:
-    if not price_history or len(price_history) < 3:
-        return {"gap_1h": None, "gap_4h": None, "gap_24h": None,
-                "alignment": "N/A", "consistency": 0, "note": "Data belum cukup"}
-    interval = settings["scan_interval"]
-    now_pt   = price_history[-1]
-    btc_now  = float(now_pt.btc)
-    eth_now  = float(now_pt.eth)
-    def _gap(minutes):
-        scans_back = max(1, int(minutes * 60 / interval))
-        if len(price_history) <= scans_back:
+    """
+    Gap ETH vs BTC dari candle_history — 1H, 4H, 24H.
+    Masing-masing dihitung dari close candle N jam lalu ke close sekarang.
+    Bebas noise scan-by-scan.
+    """
+    EMPTY = {"gap_1h": None, "gap_4h": None, "gap_24h": None,
+             "alignment": "N/A", "consistency": 0, "note": "Data belum cukup"}
+    if len(candle_history) < 2:
+        return EMPTY
+
+    now_c = candle_history[-1]
+
+    def _gap(n_back):
+        if len(candle_history) < n_back + 1:
             return None, None, None
-        old = price_history[-scans_back - 1]
-        btc_ret = (btc_now - float(old.btc)) / float(old.btc) * 100
-        eth_ret = (eth_now - float(old.eth)) / float(old.eth) * 100
-        return eth_ret - btc_ret, btc_ret, eth_ret
-    g1h,  b1h,  e1h  = _gap(60)
-    g4h,  b4h,  e4h  = _gap(240)
-    g24h, b24h, e24h = _gap(1440)
+        old = candle_history[-(n_back + 1)]
+        if old.btc_c <= 0 or old.eth_c <= 0:
+            return None, None, None
+        btc_r = (now_c.btc_c - old.btc_c) / old.btc_c * 100
+        eth_r = (now_c.eth_c - old.eth_c) / old.eth_c * 100
+        return eth_r - btc_r, btc_r, eth_r
+
+    g1h,  b1h,  e1h  = _gap(1)
+    g4h,  b4h,  e4h  = _gap(4)
+    g24h, b24h, e24h = _gap(24)
+
     gaps = [g for g in [g1h, g4h, g24h] if g is not None]
     pos  = sum(1 for g in gaps if g > 0.2)
     neg  = sum(1 for g in gaps if g < -0.2)
-    if not gaps:              alignment, consistency, note = "N/A", 0, "Data belum cukup"
-    elif pos == len(gaps):    alignment, consistency, note = "ALIGNED_S1", pos, f"Semua {pos} TF ETH outperform — S1 kuat"
-    elif neg == len(gaps):    alignment, consistency, note = "ALIGNED_S2", neg, f"Semua {neg} TF BTC outperform — S2 kuat"
-    elif pos > neg:           alignment, consistency, note = "MIXED_S1", pos, f"ETH dominant di {pos}/{len(gaps)} TF"
-    elif neg > pos:           alignment, consistency, note = "MIXED_S2", neg, f"BTC dominant di {neg}/{len(gaps)} TF"
-    else:                     alignment, consistency, note = "FLAT", 0, "Tidak ada arah dominan"
+
+    if not gaps:           alignment, consistency, note = "N/A",        0,   "Data belum cukup"
+    elif pos == len(gaps): alignment, consistency, note = "ALIGNED_S1", pos, f"Semua {pos} TF ETH outperform — S1 kuat"
+    elif neg == len(gaps): alignment, consistency, note = "ALIGNED_S2", neg, f"Semua {neg} TF BTC outperform — S2 kuat"
+    elif pos > neg:        alignment, consistency, note = "MIXED_S1",   pos, f"ETH dominant di {pos}/{len(gaps)} TF"
+    elif neg > pos:        alignment, consistency, note = "MIXED_S2",   neg, f"BTC dominant di {neg}/{len(gaps)} TF"
+    else:                  alignment, consistency, note = "FLAT",       0,   "Tidak ada arah dominan"
+
     return {"gap_1h": g1h, "btc_1h": b1h, "eth_1h": e1h,
             "gap_4h": g4h, "btc_4h": b4h, "eth_4h": e4h,
             "gap_24h": g24h, "btc_24h": b24h, "eth_24h": e24h,
@@ -2045,55 +2066,126 @@ def check_regime_filter(strategy: Strategy) -> Tuple[bool, str]:
     """
     Cek apakah kondisi market mendukung strategi yang akan dientry.
 
-    S1 (Long BTC / Short ETH):
-      - Butuh BULLISH — market pump, ETH outperform BTC
-      - Blokir kalau BEARISH atau Mixed dengan BTC dominan
+    Logika dasar yang benar:
+      S1 (Long BTC / Short ETH):
+        Trigger: gap >= threshold  → ETH outperform BTC
+        ✅ Valid di SEMUA regime — ini strategi RELATIF, bukan directional
+        ⚠️  Warning di BEARISH Kuat: Long BTC berisiko kalau BTC lanjut dump
+        ❌  Blokir hanya kalau gap terbentuk dari BTC dump ekstrem,
+            bukan karena ETH genuinely outperform
 
-    S2 (Short BTC / Long ETH):
-      - Butuh BEARISH — market dump, ETH underperform BTC
-      - Blokir kalau BULLISH atau Mixed dengan BTC dominan
+      S2 (Long ETH / Short BTC):
+        Trigger: gap <= -threshold → BTC outperform ETH
+        ✅ Valid di SEMUA regime
+        ⚠️  Warning di BULLISH Kuat: Short BTC berisiko kalau BTC lanjut pump
+        ❌  Blokir hanya kalau gap terbentuk dari ETH pump ekstrem
+
+    Kunci: strategi ini pairs/relative — market direction adalah KONTEKS,
+    bukan syarat entry. Hard block hanya untuk kondisi ekstrem.
 
     Returns: (allowed: bool, reason: str)
     """
     if not settings["regime_filter_enabled"]:
         return True, ""
 
-    reg = detect_market_regime()
-    regime   = reg["regime"]    # BULLISH / BEARISH / KONSOLIDASI
-    strength = reg["strength"]  # Kuat / Moderat / Lemah
+    reg      = detect_market_regime()
+    regime   = reg["regime"]
+    strength = reg["strength"]
     emoji    = reg["emoji"]
+    btc_1h   = reg["btc_1h"]
+    eth_1h   = reg["eth_1h"]
+
+    # Tentukan sumber gap (dari candle terakhir)
+    gap_source = "N/A"
+    if btc_1h is not None and eth_1h is not None:
+        if strategy == Strategy.S1:
+            # Gap > 0: ETH > BTC. Cek apakah karena ETH naik atau BTC turun
+            if eth_1h > 0 and btc_1h >= 0:
+                gap_source = "ETH-led"     # ETH pump lebih, BTC juga naik → ideal
+            elif eth_1h > btc_1h and btc_1h < 0:
+                gap_source = "BTC-weak"    # BTC dump, ETH dump lebih sedikit → valid tapi hati-hati
+            else:
+                gap_source = "Mixed"
+        else:
+            # Gap < 0: BTC > ETH. Cek apakah karena BTC naik atau ETH turun
+            if btc_1h > 0 and eth_1h <= 0:
+                gap_source = "BTC-led"     # BTC pump, ETH flat/turun → ideal
+            elif btc_1h > eth_1h and eth_1h < 0:
+                gap_source = "ETH-weak"    # ETH dump lebih dalam → valid tapi hati-hati
+            else:
+                gap_source = "Mixed"
 
     if strategy == Strategy.S1:
-        # S1 = ETH outperform saat pump
+        # ✅ Semua kondisi umumnya valid
         if regime == "BULLISH":
-            return True, f"{emoji} {regime} {strength} — ✅ sesuai untuk S1"
-        elif regime == "KONSOLIDASI":
-            return True, f"{emoji} Sideways {strength} — ⚠️ S1 bisa, tapi lebih hati-hati"
-        else:
-            # BEARISH saat entry S1 = berbahaya
-            reason = (
-                f"{emoji} Market *{regime} {strength}* — "
-                f"❌ S1 diblokir\n"
-                f"Saat dump, Short ETH berisiko karena BTC bisa turun lebih dalam.\n"
-                f"Tunggu market berbalik BULLISH sebelum S1."
+            return True, (
+                f"{emoji} BULLISH {strength} — "
+                f"✅ Ideal untuk S1. ETH outperform saat market naik."
             )
-            return False, reason
+        elif regime == "KONSOLIDASI":
+            return True, (
+                f"{emoji} Sideways {strength} — "
+                f"✅ S1 valid. Gap terbentuk tanpa arah pasar jelas."
+            )
+        else:
+            # BEARISH — valid tapi perlu hati-hati
+            if strength == "Kuat" and gap_source == "BTC-weak":
+                # Hard block: BTC sedang dump keras, gap hanya karena BTC lemah
+                # Long BTC di kondisi ini sangat berisiko
+                return False, (
+                    f"{emoji} BEARISH {strength} + gap dari *BTC dump* — "
+                    f"❌ S1 diblokir\n"
+                    f"Gap terbentuk karena BTC turun keras, bukan ETH genuinely kuat.\n"
+                    f"Long BTC saat BTC sedang dump berisiko tinggi."
+                )
+            elif strength == "Kuat":
+                return True, (
+                    f"{emoji} BEARISH {strength} — "
+                    f"⚠️ S1 diizinkan, tapi *hati-hati* pada Long BTC.\n"
+                    f"Gap source: {gap_source}. ETH masih outperform relatif — "
+                    f"short ETH valid, long BTC butuh pantau ketat."
+                )
+            else:
+                return True, (
+                    f"{emoji} BEARISH {strength} — "
+                    f"✅ S1 valid. BEARISH moderat, ETH tetap outperform BTC."
+                )
 
-    else:
-        # S2 = ETH underperform saat dump
+    else:  # S2 (Long ETH / Short BTC)
         if regime == "BEARISH":
-            return True, f"{emoji} {regime} {strength} — ✅ sesuai untuk S2"
-        elif regime == "KONSOLIDASI":
-            return True, f"{emoji} Sideways {strength} — ⚠️ S2 bisa, tapi lebih hati-hati"
-        else:
-            # BULLISH saat entry S2 = berbahaya (ini yang kamu alami!)
-            reason = (
-                f"{emoji} Market *{regime} {strength}* — "
-                f"❌ S2 diblokir\n"
-                f"Saat pump, Long ETH berisiko karena BTC yang pump bukan ETH lemah.\n"
-                f"Tunggu market berbalik BEARISH sebelum S2."
+            return True, (
+                f"{emoji} BEARISH {strength} — "
+                f"✅ Ideal untuk S2. BTC outperform saat market turun."
             )
-            return False, reason
+        elif regime == "KONSOLIDASI":
+            return True, (
+                f"{emoji} Sideways {strength} — "
+                f"✅ S2 valid. Gap terbentuk tanpa arah pasar jelas."
+            )
+        else:
+            # BULLISH — valid tapi perlu hati-hati
+            if strength == "Kuat" and gap_source == "ETH-weak":
+                # Hard block: ETH sedang pump keras, gap hanya karena ETH weak relatif
+                return False, (
+                    f"{emoji} BULLISH {strength} + gap dari *ETH pump* — "
+                    f"❌ S2 diblokir\n"
+                    f"Gap terbentuk karena ETH naik keras, bukan BTC genuinely kuat.\n"
+                    f"Short BTC saat market pump berisiko tinggi."
+                )
+            elif strength == "Kuat":
+                return True, (
+                    f"{emoji} BULLISH {strength} — "
+                    f"⚠️ S2 diizinkan, tapi *hati-hati* pada Short BTC.\n"
+                    f"Gap source: {gap_source}. BTC masih outperform relatif — "
+                    f"long ETH valid, short BTC butuh pantau ketat."
+                )
+            else:
+                return True, (
+                    f"{emoji} BULLISH {strength} — "
+                    f"✅ S2 valid. BULLISH moderat, BTC tetap outperform ETH."
+                )
+
+
 
 
 def build_regime_blocked_message(strategy: Strategy, gap: Decimal, reason: str) -> str:
@@ -3275,7 +3367,61 @@ def prune_history(now: datetime) -> None:
     price_history = [p for p in price_history if p.timestamp >= cutoff]
 
 
+def build_candles(period_min: int = CANDLE_PERIOD, max_candles: int = CANDLE_MAX) -> List[Candle]:
+    """
+    Agregasi price_history (tick-by-tick) menjadi OHLC candle.
+
+    Setiap candle = 1 jam (60 menit). Ambil max_candles terakhir.
+    Candle terbaru (partial / belum tutup) tetap disertakan sebagai "live candle".
+
+    Ini menghilangkan noise scan-by-scan:
+    - Volatility intra-menit tidak memengaruhi sinyal
+    - Regime dan gap dihitung dari close ke close
+    """
+    if not price_history:
+        return []
+
+    period_s = period_min * 60
+    # Floor setiap timestamp ke slot candle
+    def _slot(ts: datetime) -> int:
+        return int(ts.timestamp()) // period_s
+
+    # Kelompokkan tick ke slot
+    slots: dict = {}
+    for p in price_history:
+        s = _slot(p.timestamp)
+        if s not in slots:
+            slots[s] = []
+        slots[s].append(p)
+
+    candles = []
+    for slot_ts in sorted(slots.keys()):
+        pts     = slots[slot_ts]
+        btc_p   = [float(p.btc) for p in pts]
+        eth_p   = [float(p.eth) for p in pts]
+        open_dt = datetime.fromtimestamp(slot_ts * period_s, tz=timezone.utc)
+        candles.append(Candle(
+            ts    = open_dt,
+            btc_o = btc_p[0],  btc_h = max(btc_p),
+            btc_l = min(btc_p), btc_c = btc_p[-1],
+            eth_o = eth_p[0],  eth_h = max(eth_p),
+            eth_l = min(eth_p), eth_c = eth_p[-1],
+        ))
+
+    # Kembalikan max_candles terakhir (sudah sorted ascending)
+    return candles[-max_candles:]
+
+
+def refresh_candles() -> None:
+    """Rebuild candle_history dari price_history — dipanggil tiap scan."""
+    global candle_history
+    candle_history = build_candles()
+
+
 def get_lookback_price(now: datetime) -> Optional[PricePoint]:
+    """
+    Fallback tick-based lookback — dipakai kalau candle belum cukup.
+    """
     target    = now - timedelta(hours=settings["lookback_hours"])
     best, diff = None, timedelta(minutes=30)
     for point in price_history:
@@ -3283,6 +3429,34 @@ def get_lookback_price(now: datetime) -> Optional[PricePoint]:
         if d < diff:
             diff, best = d, point
     return best
+
+
+def get_candle_lookback() -> Optional[Candle]:
+    """
+    Ambil candle N jam lalu untuk kalkulasi gap utama scanner.
+    lookback_hours = 4 → pakai close candle 4 jam lalu.
+    Kalau candle belum cukup, return None (fallback ke tick).
+    """
+    n = int(settings["lookback_hours"])   # 1, 4, 8, 24, dll
+    if len(candle_history) < n + 1:
+        return None
+    return candle_history[-(n + 1)]
+
+
+def compute_returns_from_candle(
+    btc_now: Decimal, eth_now: Decimal,
+    candle_ref: Candle,
+) -> Tuple[Decimal, Decimal, Decimal]:
+    """
+    Hitung return vs close candle referensi.
+    btc_now / eth_now = harga live sekarang (tick terbaru).
+    candle_ref = candle N jam lalu (close price sebagai base).
+    """
+    btc_base = Decimal(str(candle_ref.btc_c))
+    eth_base = Decimal(str(candle_ref.eth_c))
+    btc_chg  = (btc_now - btc_base) / btc_base * Decimal("100")
+    eth_chg  = (eth_now - eth_base) / eth_base * Decimal("100")
+    return btc_chg, eth_chg, eth_chg - btc_chg
 
 
 def compute_returns(btc_now, eth_now, btc_prev, eth_prev):
@@ -5562,6 +5736,7 @@ def main_loop() -> None:
                     last_heartbeat_time = now
 
             refresh_history_from_redis(now)
+            refresh_candles()  # rebuild 1H candles dari price_history terbaru
 
             price_data = fetch_prices()
             if price_data is None:
@@ -5574,49 +5749,66 @@ def main_loop() -> None:
                 if not is_data_fresh(now, price_data.btc_updated_at, price_data.eth_updated_at):
                     logger.warning("Data not fresh, skipping")
                 else:
-                    price_then = get_lookback_price(now)
-
-                    if price_then is None:
-                        hrs = len(price_history) * settings["scan_interval"] / 3600
-                        logger.info(f"Waiting for data... ({hrs:.1f}h / {settings['lookback_hours']}h)")
+                    # ── Gap calculation: candle close (noise-free) ──────────────
+                    # Pakai close candle N jam lalu sebagai base, bukan tick acak.
+                    # Fallback ke tick kalau candle belum cukup (bot baru start).
+                    candle_ref = get_candle_lookback()
+                    if candle_ref is not None:
+                        btc_ret, eth_ret, gap = compute_returns_from_candle(
+                            price_data.btc_price, price_data.eth_price,
+                            candle_ref,
+                        )
+                        gap_source_label = "candle"
                     else:
+                        price_then = get_lookback_price(now)
+                        if price_then is None:
+                            hrs = len(price_history) * settings["scan_interval"] / 3600
+                            logger.info(f"Waiting for data... ({hrs:.1f}h / {settings['lookback_hours']}h)")
+                            time.sleep(settings["scan_interval"])
+                            continue
                         btc_ret, eth_ret, gap = compute_returns(
                             price_data.btc_price, price_data.eth_price,
                             price_then.btc, price_then.eth,
                         )
-                        scan_stats["last_gap"]     = gap
-                        scan_stats["last_btc_ret"] = btc_ret
-                        scan_stats["last_eth_ret"] = eth_ret
+                        gap_source_label = "tick"
 
-                        # Gap velocity history
-                        _now = datetime.now(timezone.utc)
-                        gap_history.append((_now, float(gap)))
-                        if len(gap_history) > MAX_GAP_HISTORY:
-                            gap_history.pop(0)
+                    scan_stats["last_gap"]     = gap
+                    scan_stats["last_btc_ret"] = btc_ret
+                    scan_stats["last_eth_ret"] = eth_ret
+                    if candle_ref is not None:
+                        scan_stats["last_candle_ref_ts"] = candle_ref.ts.strftime("%H:%M")
 
-                        logger.info(
-                            f"Mode: {current_mode.value} | "
-                            f"BTC {settings['lookback_hours']}h: {format_value(btc_ret)}% | "
-                            f"ETH: {format_value(eth_ret)}% | Gap: {format_value(gap)}%"
-                        )
+                    # Gap velocity history
+                    _now = datetime.now(timezone.utc)
+                    gap_history.append((_now, float(gap)))
+                    if len(gap_history) > MAX_GAP_HISTORY:
+                        gap_history.pop(0)
 
-                        # Early signal system — Phase 1 & 2
-                        check_early_signal(
-                            float(btc_ret), float(eth_ret),
-                            float(price_data.btc_price), float(price_data.eth_price),
-                        )
+                    logger.info(
+                        f"Mode: {current_mode.value} | "
+                        f"BTC {settings['lookback_hours']}h: {format_value(btc_ret)}% | "
+                        f"ETH: {format_value(eth_ret)}% | Gap: {format_value(gap)}% "
+                        f"[{gap_source_label}]"
+                    )
 
-                        # Legacy ETH pullback tracker
-                        check_eth_pullback_alert(
-                            float(btc_ret), float(eth_ret),
-                            float(price_data.btc_price), float(price_data.eth_price),
-                        )
+                    # Early signal system — Phase 1 & 2
+                    check_early_signal(
+                        float(btc_ret), float(eth_ret),
+                        float(price_data.btc_price), float(price_data.eth_price),
+                    )
 
-                        evaluate_and_transition(
-                            btc_ret, eth_ret, gap,
-                            price_data.btc_price, price_data.eth_price,
-                            price_then.btc, price_then.eth,
-                        )
+                    # Legacy ETH pullback tracker
+                    check_eth_pullback_alert(
+                        float(btc_ret), float(eth_ret),
+                        float(price_data.btc_price), float(price_data.eth_price),
+                    )
+
+                    evaluate_and_transition(
+                        btc_ret, eth_ret, gap,
+                        price_data.btc_price, price_data.eth_price,
+                        Decimal(str(candle_ref.btc_c)) if candle_ref else price_then.btc,
+                        Decimal(str(candle_ref.eth_c)) if candle_ref else price_then.eth,
+                    )
 
             time.sleep(settings["scan_interval"])
 
