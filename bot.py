@@ -134,21 +134,22 @@ settings = {
     # pump + ETH < BTC (gap -) = SKIP S2 | dump + ETH > BTC (gap +) = SKIP S1
     "regime_filter_enabled":  True,
     # — Adaptive Threshold —
-    # Threshold entry/exit otomatis menyesuaikan volatility market
-    # Saat volatility tinggi → threshold naik | rendah → threshold turun
     "adaptive_threshold":     True,
-    "adaptive_min_entry":     0.8,    # batas bawah entry threshold
-    "adaptive_max_entry":     3.0,    # batas atas entry threshold
-    "adaptive_min_exit":      0.1,    # batas bawah exit threshold
-    "adaptive_max_exit":      0.8,    # batas atas exit threshold
+    "adaptive_min_entry":     0.8,
+    "adaptive_max_entry":     3.0,
+    "adaptive_min_exit":      0.1,
+    "adaptive_max_exit":      0.8,
     # — Session Awareness —
-    "session_awareness":      True,   # tampilkan info session di analysis
-    # — ETH Pullback Alert —
-    # Kirim warning saat ETH turun X% dari puncaknya ketika sedang outperform BTC
+    "session_awareness":      True,
+    # — ETH Pullback Alert (legacy) —
     "eth_pullback_enabled":   True,
-    "eth_pullback_pct":       1.5,    # % drop dari peak ETH untuk trigger alert
-    "eth_pullback_5m_pct":    0.3,    # % drop ETH dalam 5 menit untuk trigger early alert
-    "eth_early_gap_pct":      0.5,    # gap minimum untuk aktifkan tracker (jauh di bawah threshold)
+    "eth_pullback_pct":       1.5,
+    "eth_pullback_5m_pct":    0.3,
+    "eth_early_gap_pct":      0.5,
+    # — Early Signal System —
+    "early_signal_enabled":   True,
+    "early_lead_gap":         0.4,    # gap min untuk Phase-1 lead alert
+    "early_5m_move":          0.35,   # % pergerakan 5m untuk Phase-2 opportunity alert
     # — Simulation Mode —
     "sim_enabled":            False,   # bot otomatis open/close posisi saat sinyal
     "sim_margin_usd":         100.0,   # margin per leg dalam USD
@@ -195,19 +196,32 @@ scan_stats = {
 gap_history: List[Tuple[datetime, float]] = []   # (timestamp, gap_value)
 MAX_GAP_HISTORY = 120   # simpan ~2 jam kalau scan setiap 60s
 
-# ETH Pullback Alert tracker
-# Aktif saat ETH outperforming BTC — track ETH peak price untuk deteksi reversal
-eth_peak_price:         Optional[float] = None   # ETH harga tertinggi sejak outperform mulai
-eth_peak_btc_price:     Optional[float] = None   # BTC saat ETH peak (untuk konteks)
-eth_peak_gap:           Optional[float] = None   # gap saat ETH peak
-eth_peak_time:          Optional[object] = None  # timestamp peak
-eth_outperform_active:  bool            = False  # apakah ETH sedang outperform
-eth_pullback_alerted:   bool            = False  # sudah kirim alert untuk pullback ini
+# 5-Minute Price Buffer — independen dari lookback panjang
+price_5m_buffer: list = []   # List[(datetime, eth_price, btc_price)]
+PRICE_5M_WINDOW  = 5 * 60   # 5 menit dalam detik
 
-# Buffer 5-menit: simpan (timestamp, eth_price, btc_price) per scan
-# Dipakai untuk hitung perubahan harga jangka pendek (5m) terlepas dari lookback panjang
-eth_5m_buffer: list = []   # List[(datetime, float, float)]  — eth, btc
-ETH_5M_WINDOW  = 5 * 60    # 5 menit dalam detik
+# Early Signal System State
+es_leader:         Optional[str]    = None
+es_lead_gap:       Optional[float]  = None
+es_lead_alerted:   bool             = False
+es_lead_start_ts:  Optional[object] = None
+es_eth_peak:       Optional[float]  = None
+es_btc_peak:       Optional[float]  = None
+es_eth_trough:     Optional[float]  = None
+es_btc_trough:     Optional[float]  = None
+es_move_alerted:   bool             = False
+es_last_eth_price: Optional[float]  = None
+es_last_btc_price: Optional[float]  = None
+
+# Legacy ETH Pullback tracker (dipakai /ethpullback command)
+eth_peak_price:        Optional[float]  = None
+eth_peak_btc_price:    Optional[float]  = None
+eth_peak_gap:          Optional[float]  = None
+eth_peak_time:         Optional[object] = None
+eth_outperform_active: bool             = False
+eth_pullback_alerted:  bool             = False
+eth_5m_buffer:         list             = []
+ETH_5M_WINDOW          = 5 * 60
 
 # Manual position tracker — persisted to Redis, survive restart
 pos_data: dict = {
@@ -461,8 +475,7 @@ def process_commands() -> None:
             "/capital":    lambda: handle_capital_command(args, chat_id),
             "/sizeratio":     lambda: handle_sizeratio_command(args, chat_id),
             "/regimefilter":      lambda: handle_regimefilter_command(args, chat_id),
-            "/adaptivethreshold": lambda: handle_adaptive_command(args, chat_id),
-            "/session":           lambda: handle_session_command(chat_id),
+            "/earlysignal":       lambda: handle_earlysignal_command(args, chat_id),
             "/ethpullback":       lambda: handle_ethpullback_command(args, chat_id),
             "/sim":        lambda: handle_sim_command(args, chat_id),
             "/simstats":   lambda: handle_simstats_command(chat_id),
@@ -839,301 +852,143 @@ def calc_ratio_percentile() -> Tuple[
 
 
 # =============================================================================
-# Feature: Ratio Momentum
+# Ratio Momentum
 # =============================================================================
 def calc_ratio_momentum() -> dict:
-    """
-    Hitung momentum ETH/BTC ratio — apakah ratio sedang naik atau turun.
-
-    Windows: 1h, 4h, 24h
-    Slope = (ratio_sekarang - ratio_N_lalu) / ratio_N_lalu * 100  (% change)
-
-    Returns dict:
-      slope_1h / 4h / 24h : % change ratio per window
-      direction            : "NAIK" / "TURUN" / "SIDEWAYS"
-      strength             : "Kuat" / "Moderat" / "Lemah"
-      emoji                : str
-      label                : str (human readable)
-      acceleration         : "Mempercepat" / "Melambat" / "Stabil"
-    """
     if not price_history or len(price_history) < 5:
         return {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
                 "slope_1h": None, "slope_4h": None, "slope_24h": None,
                 "label": "Data belum cukup", "acceleration": "N/A"}
-
     interval  = settings["scan_interval"]
     now_pt    = price_history[-1]
     ratio_now = float(now_pt.eth) / float(now_pt.btc)
-
-    def _slope(minutes: int) -> Optional[float]:
+    def _slope(minutes):
         scans_back = max(1, int(minutes * 60 / interval))
         if len(price_history) <= scans_back:
             return None
         old = price_history[-scans_back - 1]
         ratio_old = float(old.eth) / float(old.btc)
-        if ratio_old == 0:
-            return None
-        return (ratio_now - ratio_old) / ratio_old * 100
-
+        return (ratio_now - ratio_old) / ratio_old * 100 if ratio_old != 0 else None
     s1h  = _slope(60)
     s4h  = _slope(240)
     s24h = _slope(1440)
-
-    # Primary signal dari 4h (most reliable)
     primary = s4h if s4h is not None else s1h
-
     if primary is None:
         return {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
                 "slope_1h": s1h, "slope_4h": s4h, "slope_24h": s24h,
                 "label": "Data belum cukup", "acceleration": "N/A"}
-
     abs_p = abs(primary)
-    if abs_p >= 1.5:   strength = "Kuat"
-    elif abs_p >= 0.5: strength = "Moderat"
-    else:              strength = "Lemah"
-
-    if primary > 0.1:
-        direction, emoji = "NAIK", "📈"
-    elif primary < -0.1:
-        direction, emoji = "TURUN", "📉"
-    else:
-        direction, emoji = "SIDEWAYS", "➡️"
-
-    # Acceleration: bandingkan 1h vs 4h slope (normalized per jam)
+    strength = "Kuat" if abs_p >= 1.5 else ("Moderat" if abs_p >= 0.5 else "Lemah")
+    if primary > 0.1:   direction, emoji = "NAIK", "📈"
+    elif primary < -0.1: direction, emoji = "TURUN", "📉"
+    else:                direction, emoji = "SIDEWAYS", "➡️"
     acceleration = "Stabil"
     if s1h is not None and s4h is not None:
-        rate_1h = s1h          # % per 1h
-        rate_4h = s4h / 4      # % per 1h (normalized)
+        rate_4h = s4h / 4
         if abs(rate_4h) > 0.01:
-            ratio_accel = rate_1h / rate_4h
-            if ratio_accel > 1.3:
-                acceleration = "Mempercepat 🔥"
-            elif ratio_accel < 0.7:
-                acceleration = "Melambat 🧊"
-
-    label = f"Ratio {direction} {strength} — 4h: {s4h:+.3f}% | {acceleration}"
-
-    return {
-        "direction":    direction,
-        "emoji":        emoji,
-        "strength":     strength,
-        "slope_1h":     s1h,
-        "slope_4h":     s4h,
-        "slope_24h":    s24h,
-        "label":        label,
-        "acceleration": acceleration,
-    }
+            r = s1h / rate_4h
+            if r > 1.3:   acceleration = "Mempercepat 🔥"
+            elif r < 0.7: acceleration = "Melambat 🧊"
+    return {"direction": direction, "emoji": emoji, "strength": strength,
+            "slope_1h": s1h, "slope_4h": s4h, "slope_24h": s24h,
+            "label": f"Ratio {direction} {strength}", "acceleration": acceleration}
 
 
 # =============================================================================
-# Feature: Adaptive Threshold
+# Adaptive Threshold
 # =============================================================================
 def calc_adaptive_thresholds() -> dict:
-    """
-    Hitung threshold entry/exit adaptif berdasarkan volatility saat ini.
-
-    Logika:
-      - Ambil volatility dari detect_market_regime() (avg |Δ%| per scan 1h)
-      - Scale threshold: vol rendah → threshold lebih ketat, vol tinggi → lebih longgar
-      - Base threshold tetap dari settings, adaptive adalah REKOMENDASI saja
-
-    Returns dict:
-      entry_base    : float (dari settings)
-      exit_base     : float (dari settings)
-      entry_adaptive: float (rekomendasi)
-      exit_adaptive : float (rekomendasi)
-      vol_pct       : float
-      vol_label     : str
-      multiplier    : float
-      note          : str
-    """
-    reg       = detect_market_regime()
-    vol_pct   = reg["vol_pct"]    # avg |Δ%| per scan (1h window)
-    vol_label = reg["volatility"]
-
+    reg    = detect_market_regime()
+    vol_pct = reg["vol_pct"]
     entry_base = settings["entry_threshold"]
     exit_base  = settings["exit_threshold"]
-
-    # Volatility reference: 0.05% per scan = normal
-    # Multiplier: vol / 0.05, clamped antara 0.5–2.5
     ref_vol    = 0.05
     multiplier = max(0.5, min(2.5, vol_pct / ref_vol)) if vol_pct > 0 else 1.0
-
     min_e = settings["adaptive_min_entry"]
     max_e = settings["adaptive_max_entry"]
     min_x = settings["adaptive_min_exit"]
     max_x = settings["adaptive_max_exit"]
-
     entry_adaptive = round(max(min_e, min(max_e, entry_base * multiplier)), 2)
     exit_adaptive  = round(max(min_x, min(max_x, exit_base  * multiplier)), 2)
-
     if multiplier > 1.3:
         note = "Volatility tinggi — threshold lebih lebar agar tidak false entry"
     elif multiplier < 0.8:
         note = "Volatility rendah — threshold lebih ketat, gap kecil sudah signifikan"
     else:
         note = "Volatility normal — threshold sesuai base setting"
-
-    return {
-        "entry_base":     entry_base,
-        "exit_base":      exit_base,
-        "entry_adaptive": entry_adaptive,
-        "exit_adaptive":  exit_adaptive,
-        "vol_pct":        vol_pct,
-        "vol_label":      vol_label,
-        "multiplier":     multiplier,
-        "note":           note,
-    }
+    return {"entry_base": entry_base, "exit_base": exit_base,
+            "entry_adaptive": entry_adaptive, "exit_adaptive": exit_adaptive,
+            "vol_pct": vol_pct, "vol_label": reg["volatility"],
+            "multiplier": multiplier, "note": note}
 
 
 # =============================================================================
-# Feature: Session Awareness
+# Session Awareness
 # =============================================================================
 def get_market_session() -> dict:
-    """
-    Deteksi sesi trading aktif berdasarkan UTC sekarang.
-
-    Session windows (UTC):
-      Asian:  00:00 – 08:00
-      London: 08:00 – 16:00
-      NY:     13:00 – 21:00
-      Overlap London+NY: 13:00 – 16:00 (paling volatile)
-      Dead zone: 21:00 – 00:00
-
-    Returns dict:
-      sessions  : list of active session names
-      primary   : str (dominant session)
-      emoji     : str
-      volatility_expect: "Tinggi" / "Sedang" / "Rendah"
-      pairs_note: str (implikasi untuk ETH/BTC pairs)
-    """
     now_utc = datetime.now(timezone.utc)
     hour    = now_utc.hour
-
-    active = []
-    if 0 <= hour < 8:
-        active.append("Asian")
-    if 8 <= hour < 16:
-        active.append("London")
-    if 13 <= hour < 21:
-        active.append("NY")
-
+    active  = []
+    if 0 <= hour < 8:   active.append("Asian")
+    if 8 <= hour < 16:  active.append("London")
+    if 13 <= hour < 21: active.append("NY")
     overlap = "London" in active and "NY" in active
-
     if overlap:
-        primary          = "London + NY Overlap"
-        emoji            = "🔥"
-        vol_expect       = "Tinggi"
-        pairs_note       = "Overlap session — volume tertinggi, gap lebih besar dan cepat revert. Sinyal lebih reliable."
+        primary, emoji, vol_expect = "London + NY Overlap", "🔥", "Tinggi"
+        pairs_note = "Overlap session — volume tertinggi, gap lebih besar dan cepat revert."
     elif "NY" in active:
-        primary          = "New York"
-        emoji            = "🗽"
-        vol_expect       = "Sedang-Tinggi"
-        pairs_note       = "NY session — BTC/ETH aktif, gap bisa terbentuk cepat mengikuti berita AS."
+        primary, emoji, vol_expect = "New York", "🗽", "Sedang-Tinggi"
+        pairs_note = "NY session — BTC/ETH aktif, gap bisa terbentuk cepat."
     elif "London" in active:
-        primary          = "London"
-        emoji            = "🏦"
-        vol_expect       = "Sedang"
-        pairs_note       = "London session — likuiditas baik, momentum pairs biasanya stabil."
+        primary, emoji, vol_expect = "London", "🏦", "Sedang"
+        pairs_note = "London session — likuiditas baik, momentum pairs stabil."
     elif "Asian" in active:
-        primary          = "Asian"
-        emoji            = "🌏"
-        vol_expect       = "Rendah-Sedang"
-        pairs_note       = "Asian session — volatility lebih rendah, gap cenderung lebih kecil dan lambat revert."
+        primary, emoji, vol_expect = "Asian", "🌏", "Rendah-Sedang"
+        pairs_note = "Asian session — volatility lebih rendah, gap cenderung kecil."
     else:
-        primary          = "Dead Zone"
-        emoji            = "🌙"
-        vol_expect       = "Rendah"
-        pairs_note       = "Di luar sesi utama — likuiditas tipis, sinyal kurang reliable. Lebih baik tunggu London/NY."
-
-    return {
-        "sessions":           active if active else ["Dead Zone"],
-        "primary":            primary,
-        "emoji":              emoji,
-        "volatility_expect":  vol_expect,
-        "pairs_note":         pairs_note,
-        "hour_utc":           hour,
-        "time_str":           now_utc.strftime("%H:%M UTC"),
-    }
+        primary, emoji, vol_expect = "Dead Zone", "🌙", "Rendah"
+        pairs_note = "Di luar sesi utama — likuiditas tipis, sinyal kurang reliable."
+    return {"sessions": active if active else ["Dead Zone"], "primary": primary,
+            "emoji": emoji, "volatility_expect": vol_expect, "pairs_note": pairs_note,
+            "hour_utc": hour, "time_str": now_utc.strftime("%H:%M UTC")}
 
 
 # =============================================================================
-# Feature: Multi-TF Gap
+# Multi-TF Gap
 # =============================================================================
 def calc_multitf_gap() -> dict:
-    """
-    Hitung gap ETH vs BTC di multiple timeframe (1h, 4h, 24h).
-
-    gap_Nh = ETH_ret_Nh - BTC_ret_Nh
-    Berbeda dari lookback gap (settings["lookback_hours"]) yang dipakai untuk sinyal —
-    ini khusus untuk context analysis.
-
-    Returns dict:
-      gap_1h / 4h / 24h  : float atau None
-      btc_1h/4h/24h      : float atau None
-      eth_1h/4h/24h      : float atau None
-      alignment          : "ALIGNED_S1" / "ALIGNED_S2" / "MIXED" / "FLAT"
-      consistency        : int (0-3, berapa banyak TF setuju)
-      note               : str
-    """
     if not price_history or len(price_history) < 3:
         return {"gap_1h": None, "gap_4h": None, "gap_24h": None,
                 "alignment": "N/A", "consistency": 0, "note": "Data belum cukup"}
-
     interval = settings["scan_interval"]
     now_pt   = price_history[-1]
     btc_now  = float(now_pt.btc)
     eth_now  = float(now_pt.eth)
-
-    def _gap(minutes: int):
+    def _gap(minutes):
         scans_back = max(1, int(minutes * 60 / interval))
         if len(price_history) <= scans_back:
             return None, None, None
-        old     = price_history[-scans_back - 1]
+        old = price_history[-scans_back - 1]
         btc_ret = (btc_now - float(old.btc)) / float(old.btc) * 100
         eth_ret = (eth_now - float(old.eth)) / float(old.eth) * 100
         return eth_ret - btc_ret, btc_ret, eth_ret
-
     g1h,  b1h,  e1h  = _gap(60)
     g4h,  b4h,  e4h  = _gap(240)
     g24h, b24h, e24h = _gap(1440)
-
-    # Alignment: berapa banyak TF agree arahnya
     gaps = [g for g in [g1h, g4h, g24h] if g is not None]
     pos  = sum(1 for g in gaps if g > 0.2)
     neg  = sum(1 for g in gaps if g < -0.2)
+    if not gaps:              alignment, consistency, note = "N/A", 0, "Data belum cukup"
+    elif pos == len(gaps):    alignment, consistency, note = "ALIGNED_S1", pos, f"Semua {pos} TF ETH outperform — S1 kuat"
+    elif neg == len(gaps):    alignment, consistency, note = "ALIGNED_S2", neg, f"Semua {neg} TF BTC outperform — S2 kuat"
+    elif pos > neg:           alignment, consistency, note = "MIXED_S1", pos, f"ETH dominant di {pos}/{len(gaps)} TF"
+    elif neg > pos:           alignment, consistency, note = "MIXED_S2", neg, f"BTC dominant di {neg}/{len(gaps)} TF"
+    else:                     alignment, consistency, note = "FLAT", 0, "Tidak ada arah dominan"
+    return {"gap_1h": g1h, "btc_1h": b1h, "eth_1h": e1h,
+            "gap_4h": g4h, "btc_4h": b4h, "eth_4h": e4h,
+            "gap_24h": g24h, "btc_24h": b24h, "eth_24h": e24h,
+            "alignment": alignment, "consistency": consistency, "note": note}
 
-    if len(gaps) == 0:
-        alignment, consistency, note = "N/A", 0, "Data belum cukup"
-    elif pos == len(gaps):
-        alignment   = "ALIGNED_S1"
-        consistency = pos
-        note        = f"Semua {pos} timeframe ETH outperform — S1 setup kuat"
-    elif neg == len(gaps):
-        alignment   = "ALIGNED_S2"
-        consistency = neg
-        note        = f"Semua {neg} timeframe BTC outperform — S2 setup kuat"
-    elif pos > neg:
-        alignment   = "MIXED_S1"
-        consistency = pos
-        note        = f"ETH dominant di {pos}/{len(gaps)} timeframe — S1 lebih likely"
-    elif neg > pos:
-        alignment   = "MIXED_S2"
-        consistency = neg
-        note        = f"BTC dominant di {neg}/{len(gaps)} timeframe — S2 lebih likely"
-    else:
-        alignment   = "FLAT"
-        consistency = 0
-        note        = "Tidak ada arah dominan — sinyal lemah"
-
-    return {
-        "gap_1h":  g1h,  "btc_1h":  b1h,  "eth_1h":  e1h,
-        "gap_4h":  g4h,  "btc_4h":  b4h,  "eth_4h":  e4h,
-        "gap_24h": g24h, "btc_24h": b24h, "eth_24h": e24h,
-        "alignment":    alignment,
-        "consistency":  consistency,
-        "note":         note,
-    }
 
 
 def get_ratio_conviction(strategy: Strategy, pct: Optional[int]) -> Tuple[str, str]:
@@ -1512,7 +1367,7 @@ def sim_open_position(strategy: Strategy, btc_price: float, eth_price: float) ->
         f"│ Leverage: {lev:.0f}x | Ratio: {er:.0f}/{br:.0f}\n"
         f"│ Fee open: ${fee_open:.3f}\n"
         f"└─────────────────────\n"
-        f"_Ketik `/health` untuk memantau P&L secara live._\n"
+        f"_Ketik `/health` untuk monitor PnL live~_\n"
     )
 
 
@@ -2010,7 +1865,7 @@ def build_position_health_message(h: dict) -> str:
         f"│ `{lb_bar}` sebelum likuidasi\n"
         f"└─────────────────────\n"
         f"{danger_note}\n"
-        f"_💡 Yang penting adalah net P&L. Contoh: ETH -68% tapi net +$239._"
+        f"_💡 NET = yang penting. Mentor: ETH -68% tapi net +$239~_"
     )
 
 
@@ -2258,8 +2113,8 @@ def build_regime_blocked_message(strategy: Strategy, gap: Decimal, reason: str) 
         f"*Alasan diblokir:*\n"
         f"{reason}\n"
         f"\n"
-        f"_Sinyal akan muncul saat kondisi market sesuai._\n"
-        f"_`/regimefilter off` untuk menonaktifkan filter ini._"
+        f"_Sinyal akan muncul saat kondisi market sesuai~_\n"
+        f"_`/regimefilter off` untuk matikan filter ini_"
     )
 
 
@@ -2434,12 +2289,12 @@ def build_entry_message(
     peak_line     = f"│ Peak:     {peak:+.2f}%\n" if not is_direct and peak else ""
     direct_tag    = " _(Peak OFF)_\n" if is_direct else "\n"
     reversal_note = (
-        f"_Gap berbalik {settings['peak_reversal']}% dari puncak → entry terkonfirmasi._\n"
+        f"_Gap berbalik {settings['peak_reversal']}% dari puncak → entry terkonfirmasi~_\n"
         if not is_direct else ""
     )
 
     return (
-        f"ara   ⚡\n"
+        f" Ini saatnya, !!! ⚡\n"
         f"🚨 *ENTRY SIGNAL: {strategy.value}*{direct_tag}"
         f"📈 *{direction}*\n"
         f"\n"
@@ -2499,7 +2354,7 @@ def build_exit_message(
     net_section   = _build_pnl_section(leg_e, leg_b, net)
     conf_line     = f"_{confirm_note}_\n" if confirm_note else ""
     return (
-        f"\n"
+        f" \n"
         f"✅ *EXIT — Gap Konvergen!*\n"
         f"{conf_line}"
         f"\n"
@@ -2510,7 +2365,7 @@ def build_exit_message(
         f"│ Gap:  *{format_value(gap)}%*\n"
         f"└─────────────────────\n"
         f"{net_section}"
-        f"Posisi di-close. Bot kembali memantau. ⚡"
+        f"Saatnya close posisi~ Akeno lanjut pantau. ⚡🔍"
     )
 
 
@@ -2528,7 +2383,7 @@ def build_tp_message(
     leg_e, leg_b, net = calc_net_pnl(active_strategy, gap_f) if active_strategy else (None, None, None)
     net_section = _build_pnl_section(leg_e, leg_b, net, emoji="🎉")
     return (
-        f"🎯 Target Profit tercapai. ✨\n"
+        f" TP kena !!! ✨\n"
         f"🎯 *TAKE PROFIT*\n"
         f"\n"
         f"*{lb} Change:*\n"
@@ -2541,7 +2396,7 @@ def build_tp_message(
         f"│ ETH:    {eth_str}\n"
         f"└─────────────────────\n"
         f"{net_section}"
-        f"🎯 Target tercapai. ⚡"
+        f"Misi sukses~ Akeno senang! ⚡"
     )
 
 
@@ -2675,31 +2530,400 @@ def _build_pnl_section(
         return f"\n_Net gap movement: {net:+.2f}%_\n\n"
 
 
+
+# =============================================================================
+# 5-Minute Price Buffer
+# =============================================================================
+def _update_price_buffer(eth_price: float, btc_price: float) -> None:
+    global price_5m_buffer
+    now = datetime.now(timezone.utc)
+    price_5m_buffer.append((now, eth_price, btc_price))
+    cutoff = now.timestamp() - (PRICE_5M_WINDOW * 2)
+    price_5m_buffer = [(ts, ep, bp) for ts, ep, bp in price_5m_buffer if ts.timestamp() >= cutoff]
+
+
+def _get_5m_changes() -> dict:
+    now_ts  = datetime.now(timezone.utc).timestamp()
+    cutoff  = now_ts - PRICE_5M_WINDOW
+    in_win  = [(ts, ep, bp) for ts, ep, bp in price_5m_buffer if ts.timestamp() >= cutoff]
+    if len(in_win) < 2:
+        return {"eth_5m": None, "btc_5m": None, "eth_from": None, "btc_from": None}
+    oldest_eth = in_win[0][1]
+    oldest_btc = in_win[0][2]
+    latest_eth = in_win[-1][1]
+    latest_btc = in_win[-1][2]
+    eth_5m = (latest_eth - oldest_eth) / oldest_eth * 100 if oldest_eth > 0 else None
+    btc_5m = (latest_btc - oldest_btc) / oldest_btc * 100 if oldest_btc > 0 else None
+    return {"eth_5m": eth_5m, "btc_5m": btc_5m, "eth_from": oldest_eth, "btc_from": oldest_btc}
+
+
+# =============================================================================
+# Early Signal System — Phase 1 (Lead) + Phase 2 (5m Move)
+# =============================================================================
+def _es_reset() -> None:
+    global es_leader, es_lead_gap, es_lead_alerted, es_lead_start_ts
+    global es_eth_peak, es_btc_peak, es_eth_trough, es_btc_trough
+    global es_move_alerted, es_last_eth_price, es_last_btc_price
+    es_leader         = None
+    es_lead_gap       = None
+    es_lead_alerted   = False
+    es_lead_start_ts  = None
+    es_eth_peak       = None
+    es_btc_peak       = None
+    es_eth_trough     = None
+    es_btc_trough     = None
+    es_move_alerted   = False
+    es_last_eth_price = None
+    es_last_btc_price = None
+
+
+def check_early_signal(
+    btc_ret: float, eth_ret: float,
+    btc_price: float, eth_price: float,
+) -> None:
+    """
+    Phase 1 — Lead Detection:
+      gap = eth_ret - btc_ret
+      gap >= +early_lead_gap → ETH memimpin → potensi S1 (Long BTC / Short ETH)
+      gap <= -early_lead_gap → BTC memimpin → potensi S2 (Long ETH / Short BTC)
+      Kirim alert segera saat lead baru terdeteksi.
+
+    Phase 2 — 5-Minute Move Alert:
+      Setelah Phase-1 aktif, pantau tiap scan.
+      ETH atau BTC bergerak >= early_5m_move% dalam 5 menit
+      → Kirim "Kesempatan entry — harga bergerak signifikan"
+    """
+    global es_leader, es_lead_gap, es_lead_alerted, es_lead_start_ts
+    global es_eth_peak, es_btc_peak, es_eth_trough, es_btc_trough
+    global es_move_alerted, es_last_eth_price, es_last_btc_price
+
+    if not settings.get("early_signal_enabled", True):
+        return
+    if current_mode == Mode.TRACK:
+        _es_reset()
+        return
+
+    _update_price_buffer(eth_price, btc_price)
+
+    gap_f    = eth_ret - btc_ret
+    lead_min = settings["early_lead_gap"]
+
+    new_leader = None
+    if gap_f >= lead_min:
+        new_leader = "ETH"
+    elif gap_f <= -lead_min:
+        new_leader = "BTC"
+
+    # Phase 1 — leader berubah
+    if new_leader != es_leader:
+        prev_leader    = es_leader
+        prev_lead_gap  = es_lead_gap
+        prev_lead_ts   = es_lead_start_ts
+        was_alerted    = es_lead_alerted
+        _es_reset()
+
+        if new_leader is not None:
+            # Leader baru terdeteksi — kirim Phase-1 alert
+            es_leader         = new_leader
+            es_lead_gap       = gap_f
+            es_lead_start_ts  = datetime.now(timezone.utc)
+            es_eth_peak       = eth_price
+            es_eth_trough     = eth_price
+            es_btc_peak       = btc_price
+            es_btc_trough     = btc_price
+            es_last_eth_price = eth_price
+            es_last_btc_price = btc_price
+            _send_early_lead_alert(new_leader, gap_f, eth_ret, btc_ret, eth_price, btc_price)
+            es_lead_alerted = True
+            logger.info(f"Early signal Phase-1: {new_leader} leads, gap {gap_f:+.2f}%")
+        elif prev_leader is not None and was_alerted:
+            # Leader hilang → pasar kembali neutral → kirim neutral alert
+            _send_neutral_alert(
+                prev_leader=prev_leader,
+                prev_gap=prev_lead_gap,
+                prev_ts=prev_lead_ts,
+                gap_now=gap_f,
+                eth_ret=eth_ret,
+                btc_ret=btc_ret,
+                eth_price=eth_price,
+                btc_price=btc_price,
+            )
+            logger.info(f"Neutral alert: {prev_leader} lead ended, gap now {gap_f:+.2f}%")
+        return
+
+    if es_leader is None:
+        return
+
+    # Update peak/trough — reset move_alerted saat level baru tercapai
+    if eth_price > (es_eth_peak or 0):
+        es_eth_peak     = eth_price
+        es_move_alerted = False
+    if eth_price < (es_eth_trough or float("inf")):
+        es_eth_trough   = eth_price
+        es_move_alerted = False
+    if btc_price > (es_btc_peak or 0):
+        es_btc_peak     = btc_price
+        es_move_alerted = False
+    if btc_price < (es_btc_trough or float("inf")):
+        es_btc_trough   = btc_price
+        es_move_alerted = False
+
+    if es_move_alerted:
+        es_last_eth_price = eth_price
+        es_last_btc_price = btc_price
+        return
+
+    # Phase 2 — 5m movement check
+    chg      = _get_5m_changes()
+    move_th  = settings["early_5m_move"]
+    eth_5m   = chg["eth_5m"]
+    btc_5m   = chg["btc_5m"]
+    trigger  = False
+    mover    = None
+    move_pct = 0.0
+
+    if eth_5m is not None and abs(eth_5m) >= move_th:
+        trigger  = True
+        mover    = "ETH"
+        move_pct = eth_5m
+    elif btc_5m is not None and abs(btc_5m) >= move_th:
+        trigger  = True
+        mover    = "BTC"
+        move_pct = btc_5m
+
+    if trigger:
+        es_move_alerted = True
+        _send_early_move_alert(
+            leader=es_leader,
+            mover=mover,
+            move_pct=move_pct,
+            eth_5m=eth_5m,
+            btc_5m=btc_5m,
+            eth_from=chg["eth_from"],
+            btc_from=chg["btc_from"],
+            eth_price=eth_price,
+            btc_price=btc_price,
+            gap_f=gap_f,
+            eth_ret=eth_ret,
+            btc_ret=btc_ret,
+        )
+        logger.info(
+            f"Early signal Phase-2: {mover} {move_pct:+.2f}% in 5m | "
+            f"leader={es_leader} | gap={gap_f:+.2f}%"
+        )
+
+    es_last_eth_price = eth_price
+    es_last_btc_price = btc_price
+
+
+def _send_early_lead_alert(
+    leader: str, gap_f: float,
+    eth_ret: float, btc_ret: float,
+    eth_price: float, btc_price: float,
+) -> None:
+    lb  = get_lookback_label()
+    adp = calc_adaptive_thresholds()
+    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else settings["entry_threshold"]
+
+    if leader == "ETH":
+        strat, strat_desc = "S1", "Long BTC / Short ETH"
+        long_leg   = f"Long BTC  — harga sekarang ${btc_price:,.2f}"
+        short_leg  = f"Short ETH — harga sekarang ${eth_price:,.2f}"
+        leader_line = f"ETH memimpin *+{gap_f:.2f}%* di atas BTC"
+        why = "ETH sudah outperform BTC. Saat gap konvergen, BTC akan catch up."
+    else:
+        strat, strat_desc = "S2", "Long ETH / Short BTC"
+        long_leg   = f"Long ETH  — harga sekarang ${eth_price:,.2f}"
+        short_leg  = f"Short BTC — harga sekarang ${btc_price:,.2f}"
+        leader_line = f"BTC memimpin *{gap_f:.2f}%* di atas ETH"
+        why = "BTC sudah outperform ETH. ETH tertinggal dan berpotensi menyusul."
+
+    gap_abs = abs(gap_f)
+    if gap_abs >= eff_et:
+        thresh_line = f"Gap *{gap_f:+.2f}%* sudah melewati threshold ±{eff_et:.2f}%"
+    else:
+        remain   = eff_et - gap_abs
+        pct_fill = int(gap_abs / eff_et * 100)
+        bar      = "█" * min(10, int(gap_abs / eff_et * 10)) + "░" * max(0, 10 - int(gap_abs / eff_et * 10))
+        thresh_line = (
+            f"`[{bar}]` {gap_abs:.2f}% / ±{eff_et:.2f}% ({pct_fill}%)\n"
+            f"_Butuh {remain:.2f}% lagi ke threshold_"
+        )
+
+    msg = (
+        f"📡 *Early Signal {strat} — {leader} Memimpin*\n"
+        f"\n"
+        f"{leader_line}\n"
+        f"_{why}_\n"
+        f"\n"
+        f"┌─────────────────────\n"
+        f"│ ETH ({lb}): {eth_ret:+.2f}%  —  ${eth_price:,.2f}\n"
+        f"│ BTC ({lb}): {btc_ret:+.2f}%  —  ${btc_price:,.2f}\n"
+        f"│ Gap: *{gap_f:+.2f}%*\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Strategi terbentuk: {strat_desc}*\n"
+        f"┌─────────────────────\n"
+        f"│ 📈 {long_leg}\n"
+        f"│ 📉 {short_leg}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"{thresh_line}\n"
+        f"\n"
+        f"_Bot memantau pergerakan 5 menit... ⚡_"
+    )
+    send_alert(msg)
+
+
+def _send_early_move_alert(
+    leader: str, mover: str, move_pct: float,
+    eth_5m: Optional[float], btc_5m: Optional[float],
+    eth_from: Optional[float], btc_from: Optional[float],
+    eth_price: float, btc_price: float,
+    gap_f: float, eth_ret: float, btc_ret: float,
+) -> None:
+    lb  = get_lookback_label()
+    adp = calc_adaptive_thresholds()
+    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else settings["entry_threshold"]
+
+    if leader == "ETH":
+        strat, strat_desc = "S1", "Long BTC / Short ETH"
+        long_leg  = f"📈 *Long BTC*  — entry di ${btc_price:,.2f}"
+        short_leg = f"📉 *Short ETH* — entry di ${eth_price:,.2f}"
+    else:
+        strat, strat_desc = "S2", "Long ETH / Short BTC"
+        long_leg  = f"📈 *Long ETH*  — entry di ${eth_price:,.2f}"
+        short_leg = f"📉 *Short BTC* — entry di ${btc_price:,.2f}"
+
+    def _5m_row(coin, price_now, price_from, chg_5m):
+        if chg_5m is None or price_from is None:
+            return f"│ {coin}: ${price_now:,.2f}  (5m N/A)"
+        arrow = "📈" if chg_5m > 0 else "📉"
+        return f"│ {coin}: ${price_from:,.2f} → ${price_now:,.2f}  {arrow} *{chg_5m:+.2f}% (5m)*"
+
+    move_dir = "naik" if move_pct > 0 else "turun"
+    urgency  = "🔥 Bergerak cepat" if abs(move_pct) >= settings["early_5m_move"] * 2 else "⚡ Mulai bergerak"
+
+    gap_abs = abs(gap_f)
+    if gap_abs >= eff_et:
+        thresh_line = f"✅ Gap *{gap_f:+.2f}%* — *sudah di threshold* ±{eff_et:.2f}%"
+    else:
+        remain    = eff_et - gap_abs
+        pct_fill  = int(gap_abs / eff_et * 100)
+        thresh_line = f"🔔 Gap *{gap_f:+.2f}%* — butuh {remain:.2f}% lagi ({pct_fill}%)"
+
+    lead_str = es_lead_start_ts.strftime("%H:%M UTC") if es_lead_start_ts else "—"
+
+    msg = (
+        f"⚡ *Kesempatan Entry {strat} — {mover} {move_dir} dalam 5 menit*\n"
+        f"\n"
+        f"{urgency} — {leader} memimpin sejak pukul {lead_str}\n"
+        f"\n"
+        f"┌─────────────────────\n"
+        f"{_5m_row('ETH', eth_price, eth_from, eth_5m)}\n"
+        f"{_5m_row('BTC', btc_price, btc_from, btc_5m)}\n"
+        f"├─────────────────────\n"
+        f"│ Gap ({lb}): *{gap_f:+.2f}%*\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Strategi: {strat_desc}*\n"
+        f"┌─────────────────────\n"
+        f"│ {long_leg}\n"
+        f"│ {short_leg}\n"
+        f"│ Target: gap konvergen ke nol\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"{thresh_line}\n"
+        f"\n"
+        f"_`/analysis` untuk full context._"
+    )
+    send_alert(msg)
+
+
+def _send_neutral_alert(
+    prev_leader: str,
+    prev_gap: Optional[float],
+    prev_ts: Optional[object],
+    gap_now: float,
+    eth_ret: float, btc_ret: float,
+    eth_price: float, btc_price: float,
+) -> None:
+    """
+    Alert saat lead hilang dan pasar kembali ke kondisi neutral/seimbang.
+    Berguna sebagai:
+    - Peringatan bahwa peluang entry dari early signal sudah melemah
+    - Konfirmasi konvergensi untuk yang sudah dalam posisi
+    """
+    lb = get_lookback_label()
+
+    # Strategi yang sebelumnya terbentuk
+    if prev_leader == "ETH":
+        prev_strat     = "S1 (Long BTC / Short ETH)"
+        was_leader_str = "ETH memimpin BTC"
+    else:
+        prev_strat     = "S2 (Long ETH / Short BTC)"
+        was_leader_str = "BTC memimpin ETH"
+
+    # Berapa lama lead berlangsung
+    duration_str = ""
+    if prev_ts is not None:
+        elapsed = (datetime.now(timezone.utc) - prev_ts).total_seconds()
+        if elapsed >= 3600:
+            duration_str = f"{elapsed/3600:.1f} jam"
+        else:
+            duration_str = f"{elapsed/60:.0f} menit"
+
+    prev_gap_str = f"{prev_gap:+.2f}%" if prev_gap is not None else "—"
+
+    # Kondisi posisi aktif
+    if current_mode == Mode.TRACK and active_strategy is not None:
+        pos_note = (
+            f"\n⚠️ *Kamu sedang dalam posisi {active_strategy.value}.*\n"
+            f"Konvergensi ini bisa jadi sinyal exit — cek `/pnl`."
+        )
+    else:
+        pos_note = "\n_Tidak ada posisi aktif._"
+
+    msg = (
+        f"⚪ *Market Neutral — Lead Berakhir*\n"
+        f"\n"
+        f"{was_leader_str}, kini *ETH dan BTC bergerak seimbang.*\n"
+        f"\n"
+        f"┌─────────────────────\n"
+        f"│ Lead sebelumnya: {prev_gap_str} ({prev_strat})\n"
+        f"│ Durasi lead:     {duration_str}\n"
+        f"│ Gap sekarang:    *{gap_now:+.2f}%* — di bawah threshold\n"
+        f"├─────────────────────\n"
+        f"│ ETH ({lb}): {eth_ret:+.2f}%  —  ${eth_price:,.2f}\n"
+        f"│ BTC ({lb}): {btc_ret:+.2f}%  —  ${btc_price:,.2f}\n"
+        f"└─────────────────────\n"
+        f"{pos_note}\n"
+        f"\n"
+        f"_Bot kembali memantau — menunggu lead baru terbentuk._"
+    )
+    send_alert(msg)
+
+
+# =============================================================================
+# Legacy ETH Pullback (dipakai /ethpullback command)
+# =============================================================================
 def _get_5m_eth_change(eth_now: float) -> Optional[float]:
-    """
-    Hitung perubahan harga ETH dalam 5 menit terakhir dari buffer.
-    Returns: % change (negatif = turun), atau None kalau data tidak cukup.
-    """
     if not eth_5m_buffer:
         return None
-    now_ts   = datetime.now(timezone.utc)
-    cutoff   = now_ts.timestamp() - ETH_5M_WINDOW
-    # Ambil titik tertua yang masih dalam window 5 menit
-    in_window = [(ts, ep, bp) for ts, ep, bp in eth_5m_buffer if ts.timestamp() >= cutoff]
-    if not in_window:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff = now_ts - ETH_5M_WINDOW
+    in_win = [(ts, ep, bp) for ts, ep, bp in eth_5m_buffer if ts.timestamp() >= cutoff]
+    if not in_win:
         return None
-    oldest_eth = in_window[0][1]
-    if oldest_eth <= 0:
-        return None
-    return (eth_now - oldest_eth) / oldest_eth * 100
+    oldest_eth = in_win[0][1]
+    return (eth_now - oldest_eth) / oldest_eth * 100 if oldest_eth > 0 else None
 
 
 def _update_5m_buffer(eth_price: float, btc_price: float) -> None:
-    """Tambah entry ke buffer 5 menit dan prune data lama (>10 menit)."""
     global eth_5m_buffer
-    now = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc)
     eth_5m_buffer.append((now, eth_price, btc_price))
-    cutoff = now.timestamp() - (ETH_5M_WINDOW * 2)   # simpan 2x window sebagai buffer
+    cutoff = now.timestamp() - ETH_5M_WINDOW * 2
     eth_5m_buffer = [(ts, ep, bp) for ts, ep, bp in eth_5m_buffer if ts.timestamp() >= cutoff]
 
 
@@ -2707,110 +2931,41 @@ def check_eth_pullback_alert(
     btc_ret: float, eth_ret: float,
     btc_price: float, eth_price: float,
 ) -> None:
-    """
-    Deteksi ETH reversal — dua mode:
-
-    MODE A — 5-Menit Early Alert (gap rendah, sebelum threshold):
-      Kondisi: ETH outperform BTC (gap >= early_gap_pct, default 0.5%)
-               + ETH turun >= eth_pullback_5m_pct% dalam 5 menit terakhir
-      → Kirim early warning meski gap belum sampai entry threshold
-
-    MODE B — Peak Drop Alert (gap sudah signifikan):
-      Kondisi: ETH outperform + ETH turun >= eth_pullback_pct% dari peak absolut
-      → Konfirmasi reversal lebih besar, sinyal S1 lebih kuat
-
-    Keduanya bisa aktif bersamaan — alert terpisah per mode.
-    """
     global eth_peak_price, eth_peak_btc_price, eth_peak_gap, eth_peak_time
     global eth_outperform_active, eth_pullback_alerted
-    global eth_5m_buffer
-
     if not settings["eth_pullback_enabled"]:
         return
     if current_mode == Mode.TRACK:
         _reset_eth_peak()
         return
-
-    # Update buffer 5 menit setiap scan
     _update_5m_buffer(eth_price, btc_price)
-
-    # gap_f = ETH return - BTC return (pakai lookback panjang untuk context outperform)
-    gap_f           = eth_ret - btc_ret
-    early_gap_min   = settings["eth_early_gap_pct"]   # default 0.5%
-    outperform_min  = early_gap_min                    # sama saja
-
-    # ── Cek outperform ──
-    is_outperforming = gap_f >= outperform_min
-
-    if not is_outperforming:
+    gap_f = eth_ret - btc_ret
+    if gap_f >= settings["eth_early_gap_pct"]:
+        if not eth_outperform_active:
+            eth_outperform_active = True
+            eth_pullback_alerted  = False
+            eth_peak_price        = eth_price
+            eth_peak_btc_price    = btc_price
+            eth_peak_gap          = gap_f
+            eth_peak_time         = datetime.now(timezone.utc)
+        elif eth_price > (eth_peak_price or 0):
+            eth_peak_price        = eth_price
+            eth_peak_btc_price    = btc_price
+            eth_peak_gap          = gap_f
+            eth_peak_time         = datetime.now(timezone.utc)
+            eth_pullback_alerted  = False
+        if eth_peak_price and eth_price < eth_peak_price and not eth_pullback_alerted:
+            drop_pct   = (eth_peak_price - eth_price) / eth_peak_price * 100
+            eth_5m_chg = _get_5m_eth_change(eth_price)
+            if (drop_pct >= settings["eth_pullback_pct"]
+                    or (eth_5m_chg is not None
+                        and eth_5m_chg <= -settings["eth_pullback_5m_pct"])):
+                eth_pullback_alerted = True
+                logger.info(f"Legacy pullback drop {drop_pct:.2f}%, 5m {eth_5m_chg}")
+    else:
         if eth_outperform_active:
-            logger.info("ETH outperform ended — resetting tracker")
+            logger.info("ETH outperform ended (legacy)")
         _reset_eth_peak()
-        return
-
-    # ── ETH sedang outperform → update tracker ──
-    if not eth_outperform_active:
-        eth_outperform_active = True
-        eth_pullback_alerted  = False
-        eth_peak_price        = eth_price
-        eth_peak_btc_price    = btc_price
-        eth_peak_gap          = gap_f
-        eth_peak_time         = datetime.now(timezone.utc)
-        logger.info(f"ETH outperform started (gap {gap_f:+.2f}%) — peak init ${eth_price:,.2f}")
-    elif eth_price > (eth_peak_price or 0):
-        eth_peak_price     = eth_price
-        eth_peak_btc_price = btc_price
-        eth_peak_gap       = gap_f
-        eth_peak_time      = datetime.now(timezone.utc)
-        eth_pullback_alerted = False   # peak baru = alert bisa kirim lagi
-        logger.info(f"ETH new peak: ${eth_peak_price:,.2f} (gap {gap_f:+.2f}%)")
-
-    # ── MODE A: 5-Menit Early Alert ──
-    eth_5m_chg = _get_5m_eth_change(eth_price)
-    trigger_5m = settings["eth_pullback_5m_pct"]
-
-    if (eth_5m_chg is not None
-            and eth_5m_chg <= -trigger_5m
-            and not eth_pullback_alerted):
-        # Cek apakah peak drop juga sudah trigger (Mode B)
-        peak_drop = (
-            (eth_peak_price - eth_price) / eth_peak_price * 100
-            if eth_peak_price and eth_price < eth_peak_price else 0.0
-        )
-        trigger_peak = settings["eth_pullback_pct"]
-
-        if peak_drop >= trigger_peak:
-            # Mode B — drop dari peak sudah signifikan
-            eth_pullback_alerted = True
-            _send_eth_pullback_alert(
-                eth_price, eth_peak_price, btc_price,
-                peak_drop, gap_f, eth_ret, btc_ret,
-                eth_5m_chg=eth_5m_chg,
-                alert_type="peak",
-            )
-        else:
-            # Mode A — hanya 5-menit drop, peak drop belum cukup
-            eth_pullback_alerted = True
-            _send_eth_pullback_alert(
-                eth_price, eth_peak_price, btc_price,
-                peak_drop, gap_f, eth_ret, btc_ret,
-                eth_5m_chg=eth_5m_chg,
-                alert_type="early_5m",
-            )
-
-    elif (eth_peak_price
-            and eth_price < eth_peak_price
-            and not eth_pullback_alerted):
-        # Mode B saja (5m belum cukup tapi peak drop besar)
-        peak_drop = (eth_peak_price - eth_price) / eth_peak_price * 100
-        if peak_drop >= settings["eth_pullback_pct"]:
-            eth_pullback_alerted = True
-            _send_eth_pullback_alert(
-                eth_price, eth_peak_price, btc_price,
-                peak_drop, gap_f, eth_ret, btc_ret,
-                eth_5m_chg=eth_5m_chg,
-                alert_type="peak",
-            )
 
 
 def _reset_eth_peak() -> None:
@@ -2824,176 +2979,72 @@ def _reset_eth_peak() -> None:
     eth_peak_time         = None
 
 
-def _send_eth_pullback_alert(
-    eth_now: float, eth_peak: float, btc_now: float,
-    drop_pct: float, gap_f: float, eth_ret: float, btc_ret: float,
-    eth_5m_chg: Optional[float] = None,
-    alert_type: str = "early_5m",   # "early_5m" | "peak"
-) -> None:
-    """Kirim alert ETH pullback — dua varian: early 5m atau peak drop."""
-    peak_time_str = eth_peak_time.strftime("%H:%M UTC") if eth_peak_time else "—"
-    eth_peak_disp = f"${eth_peak:,.2f}" if eth_peak else "—"
-
-    # Jarak ke entry threshold
-    et     = settings["entry_threshold"]
-    adp    = calc_adaptive_thresholds()
-    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else et
-
-    if gap_f >= eff_et:
-        thresh_line = f"✅ Gap *{gap_f:+.2f}%* — sudah di atas threshold ±{eff_et:.2f}%"
-    elif gap_f >= eff_et * 0.6:
-        remain = eff_et - gap_f
-        thresh_line = f"🔔 Gap *{gap_f:+.2f}%* — butuh *{remain:.2f}%* lagi ke threshold"
-    else:
-        remain = eff_et - gap_f
-        thresh_line = f"📡 Gap *{gap_f:+.2f}%* — *{remain:.2f}%* lagi ke threshold ±{eff_et:.2f}%"
-
-    # 5-menit change line
-    if eth_5m_chg is not None:
-        arr_5m = "📉" if eth_5m_chg < 0 else "📈"
-        line_5m = f"│ ETH 5m:      {arr_5m} *{eth_5m_chg:+.2f}%* dari ${eth_now + (eth_now * (-eth_5m_chg/100)):,.2f}\n"
-    else:
-        line_5m = ""
-
-    if alert_type == "early_5m":
-        header = (
-            f"📡 *Early Pullback Signal*\n"
-            f"\n"
-            f"ETH outperforming BTC namun *mulai turun dalam 5 menit terakhir.*\n"
-            f"Gap belum di threshold — ini sinyal dini.\n"
-        )
-        strat_label = "S1 (dini — gap belum penuh)"
-    else:
-        header = (
-            f"⚠️ *ETH Pullback Alert*\n"
-            f"\n"
-            f"ETH outperforming BTC, kemudian *berbalik turun signifikan.*\n"
-        )
-        strat_label = "S1"
-
-    # Peak drop line — hanya tampil kalau ada drop
-    if eth_peak and drop_pct >= 0.1:
-        peak_drop_line = f"│ Drop dari peak: *{drop_pct:.2f}%* (dari {eth_peak_disp} pukul {peak_time_str})\n"
-    else:
-        peak_drop_line = f"│ Peak terakhir: {eth_peak_disp}  _(pukul {peak_time_str})_\n"
-
-    msg = (
-        f"{header}"
-        f"\n"
-        f"┌─────────────────────\n"
-        f"│ ETH Sekarang: *${eth_now:,.2f}*\n"
-        f"{line_5m}"
-        f"{peak_drop_line}"
-        f"│ BTC Sekarang: ${btc_now:,.2f}\n"
-        f"├─────────────────────\n"
-        f"│ ETH ({get_lookback_label()}): {eth_ret:+.2f}%\n"
-        f"│ BTC ({get_lookback_label()}): {btc_ret:+.2f}%\n"
-        f"│ Gap:  *{gap_f:+.2f}%* — ETH masih outperform\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"*💡 Strategi {strat_label}:*\n"
-        f"┌─────────────────────\n"
-        f"│ 📈 *Long BTC* — BTC tertinggal, potensi catch up\n"
-        f"│ 📉 *Short ETH* — ETH mulai koreksi setelah outperform\n"
-        f"│ Target: gap konvergen kembali ke nol\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"{thresh_line}\n"
-        f"\n"
-        f"_`/analysis` untuk full market context._"
-    )
-    send_alert(msg)
-    logger.info(
-        f"ETH pullback alert [{alert_type}] sent — "
-        f"5m: {eth_5m_chg:.2f}% | peak drop: {drop_pct:.2f}% | gap: {gap_f:.2f}%"
-    )
-
-
 def build_market_snapshot() -> str:
     """
-    Compact snapshot untuk heartbeat & status:
-    - Siapa outperform (ETH vs BTC) multi-TF
-    - Early signal warning (gap mendekati threshold)
+    Compact market snapshot untuk heartbeat & /status:
+    - Siapa outperform (ETH vs BTC) per TF
+    - Early signal status (leader & phase)
+    - Gap progress bar ke threshold
     """
     gap_now = scan_stats.get("last_gap")
-    btc_r   = scan_stats.get("last_btc_ret")
-    eth_r   = scan_stats.get("last_eth_ret")
-
     if gap_now is None:
         return ""
 
-    gap_f = float(gap_now)
-    et    = settings["entry_threshold"]
-    adp   = calc_adaptive_thresholds()
-    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else et
+    gap_f  = float(gap_now)
+    adp    = calc_adaptive_thresholds()
+    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else settings["entry_threshold"]
+    dom    = calc_dominance_score()
+    mtf    = calc_multitf_gap()
 
-    # ── Outperformance line ──
-    dom   = calc_dominance_score()
-    mtf   = calc_multitf_gap()
+    # Outperform summary
+    if dom["dominant"] == "ETH":
+        dom_str = f"🟡 *ETH outperforming BTC* ({dom['strength']}) — {dom['score']:+.2f}%"
+    elif dom["dominant"] == "BTC":
+        dom_str = f"🟠 *BTC outperforming ETH* ({dom['strength']}) — {dom['score']:+.2f}%"
+    else:
+        dom_str = "⚪ ETH & BTC seimbang"
 
-    # Per-TF outperform label
-    def _tf_label(gap_val):
-        if gap_val is None:   return "—"
-        if gap_val > 0.15:    return "🟡ETH"
-        if gap_val < -0.15:   return "🟠BTC"
+    # Per-TF label
+    def _tf(g):
+        if g is None:   return "—"
+        if g > 0.15:    return "🟡ETH"
+        if g < -0.15:   return "🟠BTC"
         return "⚪"
 
-    tf_line = (
-        f"1h:{_tf_label(mtf['gap_1h'])}  "
-        f"4h:{_tf_label(mtf['gap_4h'])}  "
-        f"24h:{_tf_label(mtf['gap_24h'])}"
-    )
+    tf_line = f"1h:{_tf(mtf['gap_1h'])}  4h:{_tf(mtf['gap_4h'])}  24h:{_tf(mtf['gap_24h'])}"
 
-    # Overall outperform summary
-    dom_str = ""
-    if dom["dominant"] == "ETH":
-        dom_str = f"🟡 *ETH outperforming BTC* ({dom['strength']}) — Dominant {dom['score']:+.2f}%"
-    elif dom["dominant"] == "BTC":
-        dom_str = f"🟠 *BTC outperforming ETH* ({dom['strength']}) — Dominant {dom['score']:+.2f}%"
+    # Early signal status
+    if es_leader is not None:
+        phase2_str = " | ⚡ 5m aktif" if not es_move_alerted else " | ✅ 5m terkirim"
+        es_str = f"\n🔎 Early Signal: *{es_leader} memimpin* → {'S1' if es_leader == 'ETH' else 'S2'}{phase2_str}"
     else:
-        dom_str = f"⚪ ETH & BTC seimbang — tidak ada dominance jelas"
+        es_str = ""
 
-    # ── Early Signal line ──
+    # Gap progress bar
     gap_abs  = abs(gap_f)
     pct_fill = min(100, int(gap_abs / eff_et * 100))
     bar_fill = min(10, int(gap_abs / eff_et * 10))
     bar      = "█" * bar_fill + "░" * (10 - bar_fill)
 
     if current_mode != Mode.SCAN:
-        early_line = ""  # sudah dalam posisi, tidak perlu early signal
+        gap_line = ""
     elif gap_abs >= eff_et:
-        # Sudah lewat threshold tapi masih SCAN (mungkin diblokir regime)
-        cand = "Long BTC / Short ETH" if gap_f > 0 else "Long ETH / Short BTC"
-        early_line = (
-            f"\n⚡ *Di atas threshold* — sinyal *{cand}*\n"
-            f"`[{bar}]` {gap_abs:.2f}% / ±{eff_et:.2f}% ({pct_fill}%)\n"
-            f"_Diblokir regime filter atau menunggu peak reversal_"
-        )
-    elif gap_abs >= eff_et * 0.6:
-        # 60–99% dari threshold = early warning
-        cand    = "Long BTC / Short ETH" if gap_f > 0 else "Long ETH / Short BTC"
-        remain  = eff_et - gap_abs
-        early_line = (
-            f"\n🔔 *Early Signal: {cand}*\n"
-            f"`[{bar}]` {gap_abs:.2f}% / ±{eff_et:.2f}% ({pct_fill}%)\n"
-            f"_Butuh {remain:.2f}% lagi ke threshold_"
-        )
+        cand = "Long BTC/Short ETH" if gap_f > 0 else "Long ETH/Short BTC"
+        gap_line = f"\n⚡ *Di atas threshold* — {cand}\n`[{bar}]` {gap_abs:.2f}% / ±{eff_et:.2f}%"
     elif gap_abs >= eff_et * 0.3:
-        cand   = "Long BTC / Short ETH" if gap_f > 0 else "Long ETH / Short BTC"
-        remain = eff_et - gap_abs
-        early_line = (
-            f"\n📡 *Pemantauan dini: {cand}*\n"
-            f"`[{bar}]` {gap_abs:.2f}% ({pct_fill}%) — butuh {remain:.2f}% lagi"
-        )
+        cand    = "Long BTC/Short ETH" if gap_f > 0 else "Long ETH/Short BTC"
+        remain  = eff_et - gap_abs
+        gap_line = f"\n🔔 *{cand}* — butuh {remain:.2f}% lagi\n`[{bar}]` {pct_fill}%"
     else:
-        early_line = f"\n💤 Gap {gap_f:+.2f}% — jauh dari threshold ±{eff_et:.2f}%"
+        gap_line = f"\n💤 Gap {gap_f:+.2f}% — jauh dari threshold ±{eff_et:.2f}%"
 
     return (
         f"┌─────────────────────\n"
         f"│ {dom_str}\n"
         f"│ TF: {tf_line}\n"
         f"└─────────────────────"
-        f"{early_line}"
+        f"{es_str}"
+        f"{gap_line}"
     )
 
 
@@ -3072,7 +3123,7 @@ def build_heartbeat_message() -> str:
             f"└─────────────────────\n"
         )
 
-    last_r = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum"
+    last_r   = last_redis_refresh.strftime("%H:%M UTC") if last_redis_refresh else "Belum"
     snapshot = build_market_snapshot()
     return (
         f"💓 *Heartbeat — Bot Aktif*\n"
@@ -3790,9 +3841,6 @@ def handle_ratio_command(reply_chat: str) -> None:
     stars_s1, _ = get_ratio_conviction(Strategy.S1, pct_r)
     stars_s2, _ = get_ratio_conviction(Strategy.S2, pct_r)
     ext         = _calc_ratio_extended_stats(curr_r, avg_r, hi_r, lo_r, pct_r)
-    mom         = calc_ratio_momentum()
-    mtf         = calc_multitf_gap()
-    adp         = calc_adaptive_thresholds()
 
     if pct_r <= 20:   signal = "🟢 *ETH sangat murah vs BTC* — momentum S2 kuat"
     elif pct_r <= 40: signal = "🟡 *ETH relatif murah* — setup S2 cukup bagus"
@@ -3806,37 +3854,6 @@ def handle_ratio_command(reply_chat: str) -> None:
     detail_s2 = _build_conviction_detail(Strategy.S2, stars_s2, pct_r, curr_r, avg_r, hi_r, lo_r, ext)
     ready_s1  = build_entry_readiness(Strategy.S1, pct_r, curr_r, avg_r, ext)
     ready_s2  = build_entry_readiness(Strategy.S2, pct_r, curr_r, avg_r, ext)
-
-    # Ratio Momentum block
-    def _sfmt(v): return f"{v:+.3f}%" if v is not None else "N/A"
-    mom_block = (
-        f"*📊 Ratio Momentum:*\n"
-        f"┌─────────────────────\n"
-        f"│ Arah:  {mom['emoji']} *{mom['direction']}* — {mom['strength']}\n"
-        f"│  1h:  {_sfmt(mom['slope_1h'])}  4h: {_sfmt(mom['slope_4h'])}  24h: {_sfmt(mom['slope_24h'])}\n"
-        f"│ Akselerasi: {mom['acceleration']}\n"
-        f"└─────────────────────\n"
-    )
-
-    # Multi-TF Gap block
-    def _gfmt(v): return f"{v:+.2f}%" if v is not None else "N/A"
-    align_emoji = {"ALIGNED_S1": "✅", "ALIGNED_S2": "✅", "MIXED_S1": "🟡",
-                   "MIXED_S2": "🟠", "FLAT": "⚪", "N/A": "—"}.get(mtf["alignment"], "—")
-    mtf_block = (
-        f"*🔀 Multi-TF Gap (ETH - BTC):*\n"
-        f"┌─────────────────────\n"
-        f"│  1h: {_gfmt(mtf['gap_1h'])}  4h: {_gfmt(mtf['gap_4h'])}  24h: {_gfmt(mtf['gap_24h'])}\n"
-        f"│ {align_emoji} {mtf['note']}\n"
-        f"└─────────────────────\n"
-    )
-
-    # Adaptive threshold note
-    adp_note = ""
-    if settings["adaptive_threshold"] and abs(adp["multiplier"] - 1.0) > 0.15:
-        adp_note = (
-            f"\n_💡 Adaptive: volatility {adp['vol_label']} (×{adp['multiplier']:.1f}) → "
-            f"entry rekomendasi ±{adp['entry_adaptive']}% | exit ±{adp['exit_adaptive']}%_\n"
-        )
 
     send_reply(
         f"📈 *ETH/BTC Ratio Monitor*\n"
@@ -3855,9 +3872,6 @@ def handle_ratio_command(reply_chat: str) -> None:
         f"\n"
         f"{signal}\n"
         f"\n"
-        f"{mom_block}\n"
-        f"{mtf_block}"
-        f"{adp_note}"
         f"──────────────────────\n"
         f"{detail_s1}\n"
         f"\n"
@@ -3869,7 +3883,7 @@ def handle_ratio_command(reply_chat: str) -> None:
         f"══════════════════════\n"
         f"{ready_s2}\n"
         f"\n"
-        f"_Dari {len(price_history)} price points._",
+        f"_Dari {len(price_history)} price points~_",
         reply_chat,
     )
 
@@ -4001,33 +4015,26 @@ def handle_analysis_command(reply_chat: str) -> None:
     curr_r, avg_r, _, _, pct_r = calc_ratio_percentile()
     ratio_str = f"{curr_r:.5f} ({pct_r}th percentile)" if curr_r else "N/A"
 
-    # New features
-    mom  = calc_ratio_momentum()
-    mtf  = calc_multitf_gap()
-    adp  = calc_adaptive_thresholds()
-    sess = get_market_session()
-
-    # Gap status — use adaptive threshold if enabled
-    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else et
+    # Gap status
     gap_abs = abs(gap_f)
-    if gap_abs < eff_et * 0.5:   gap_status = "💤 Jauh dari threshold — pasar seimbang"
-    elif gap_abs < eff_et:        gap_status = f"🔔 Mendekati ±{eff_et:.2f}% — mulai perhatikan"
-    elif gap_abs < eff_et * 1.5:  gap_status = f"🚨 Di atas ±{eff_et:.2f}% — zona entry"
-    else:                         gap_status = f"⚡ Divergence ekstrem"
+    if gap_abs < et * 0.5:   gap_status = "💤 Jauh dari threshold — pasar seimbang"
+    elif gap_abs < et:        gap_status = f"🔔 Mendekati ±{et}% — mulai perhatikan"
+    elif gap_abs < et * 1.5:  gap_status = f"🚨 Di atas ±{et}% — zona entry"
+    else:                     gap_status = f"⚡ Divergence ekstrem"
 
     # Kandidat
-    if gap_f >= eff_et:
+    if gap_f >= et:
         cand_str  = f"🔍 Kandidat *S1* (Long BTC / Short ETH)"
         stars, cv = get_ratio_conviction(Strategy.S1, pct_r)
         hint      = get_convergence_hint(Strategy.S1, drv)
-    elif gap_f <= -eff_et:
+    elif gap_f <= -et:
         cand_str  = f"🔍 Kandidat *S2* (Long ETH / Short BTC)"
         stars, cv = get_ratio_conviction(Strategy.S2, pct_r)
         hint      = get_convergence_hint(Strategy.S2, drv)
     else:
         cand_str  = "💤 Belum ada kandidat entry"
         stars, cv = "—", "—"
-        hint      = f"Tunggu gap ±{eff_et:.2f}%"
+        hint      = f"Tunggu gap ±{et}%"
 
     # Sizing preview
     sizing_str = ""
@@ -4055,57 +4062,15 @@ def handle_analysis_command(reply_chat: str) -> None:
             f"Net P&L: {net_s} | {he} {hd}\n"
         )
 
-    # Session block
-    sess_block = (
-        f"*🕐 Market Session:*\n"
-        f"┌─────────────────────\n"
-        f"│ {sess['emoji']} *{sess['primary']}* — {sess['time_str']}\n"
-        f"│ Volatility ekspektasi: {sess['volatility_expect']}\n"
-        f"│ _{sess['pairs_note']}_\n"
-        f"└─────────────────────\n"
-    ) if settings["session_awareness"] else ""
-
-    # Multi-TF gap block
-    def _gf(v): return f"{v:+.2f}%" if v is not None else "N/A"
-    align_e = {"ALIGNED_S1": "✅", "ALIGNED_S2": "✅", "MIXED_S1": "🟡",
-               "MIXED_S2": "🟠", "FLAT": "⚪", "N/A": "—"}.get(mtf["alignment"], "—")
-    mtf_block = (
-        f"*🔀 Multi-TF Gap:*\n"
-        f"┌─────────────────────\n"
-        f"│  1h: {_gf(mtf['gap_1h'])}  4h: {_gf(mtf['gap_4h'])}  24h: {_gf(mtf['gap_24h'])}\n"
-        f"│ {align_e} {mtf['note']}\n"
-        f"└─────────────────────\n"
-    )
-
-    # Adaptive threshold note
-    adp_block = ""
-    if settings["adaptive_threshold"]:
-        adp_block = (
-            f"*⚡ Adaptive Threshold:*\n"
-            f"┌─────────────────────\n"
-            f"│ Volatility: {adp['vol_label']} (×{adp['multiplier']:.2f})\n"
-            f"│ Entry: {adp['entry_base']:.2f}% → *{adp['entry_adaptive']:.2f}%*\n"
-            f"│ Exit:  {adp['exit_base']:.2f}% → *{adp['exit_adaptive']:.2f}%*\n"
-            f"│ _{adp['note']}_\n"
-            f"└─────────────────────\n"
-        )
-
-    # Ratio momentum (compact for analysis)
-    def _sf(v): return f"{v:+.3f}%" if v is not None else "N/A"
-    mom_line = f"Ratio: {mom['emoji']} {mom['direction']} {mom['strength']} | 1h {_sf(mom['slope_1h'])} 4h {_sf(mom['slope_4h'])} | {mom['acceleration']}\n"
-
     # Price recap 24h/48h/72h
     recap_block = build_price_recap_block()
 
     send_reply(
         f"🧠 *Full Market Analysis*\n"
-        f"_Snapshot kondisi pasar terkini._\n"
+        f"_Akeno analisis semuanya~ _\n"
         f"\n"
         f"{recap_block}\n"
-        f"{sess_block}\n"
         f"{reg_block}\n"
-        f"{mtf_block}\n"
-        f"{adp_block}\n"
         f"*📊 Gap ({lb}):*\n"
         f"┌─────────────────────\n"
         f"│ BTC:    {format_value(btc_r)}%\n"
@@ -4118,7 +4083,6 @@ def handle_analysis_command(reply_chat: str) -> None:
         f"\n"
         f"*📈 ETH/BTC Ratio:*\n"
         f"{ratio_str}\n"
-        f"{mom_line}"
         f"\n"
         f"*🔍 Setup:*\n"
         f"{cand_str}\n"
@@ -4128,7 +4092,7 @@ def handle_analysis_command(reply_chat: str) -> None:
         f"{pos_str}\n"
         f"Mode: *{current_mode.value}* | Peak: {'✅ ON' if settings['peak_enabled'] else '❌ OFF'}\n"
         f"\n"
-        f"_`/ratio` untuk detail ratio lengkap._",
+        f"_`/ratio` detail ratio | `/pnl` P&L posisi aktif~_",
         reply_chat,
     )
 
@@ -4251,20 +4215,103 @@ def handle_sizeratio_command(args: list, reply_chat: str) -> None:
             f"ETH leg: *{val:.0f}%* | BTC leg: *{btc_pct:.0f}%*\n"
             f"_{tag}_\n"
             f"{preview}\n"
-            f"Berlaku untuk sinyal entry berikutnya.",
+            f"Berlaku di semua sinyal entry berikutnya",
             reply_chat,
         )
     except ValueError:
         send_reply("Nilai tidak valid. Contoh: `/sizeratio 60`", reply_chat)
 
 
+def handle_earlysignal_command(args: list, reply_chat: str) -> None:
+    """
+    /earlysignal              — status tracker sekarang
+    /earlysignal on|off       — aktifkan/nonaktifkan
+    /earlysignal lead <pct>   — set gap minimum Phase-1 (default 0.4%)
+    /earlysignal move <pct>   — set 5m move threshold Phase-2 (default 0.35%)
+    """
+    if not args:
+        enabled  = settings.get("early_signal_enabled", True)
+        lead_gap = settings["early_lead_gap"]
+        move_th  = settings["early_5m_move"]
+        status   = "✅ ON" if enabled else "❌ OFF"
+
+        if es_leader is not None:
+            lead_str = es_lead_start_ts.strftime("%H:%M UTC") if es_lead_start_ts else "—"
+            phase2   = "⚡ Memantau 5m" if not es_move_alerted else "✅ 5m alert terkirim"
+            chg      = _get_5m_changes()
+            eth_5m_s = f"{chg['eth_5m']:+.2f}%" if chg["eth_5m"] is not None else "N/A"
+            btc_5m_s = f"{chg['btc_5m']:+.2f}%" if chg["btc_5m"] is not None else "N/A"
+            tracker_str = (
+                f"\n*Tracker aktif:*\n"
+                f"┌─────────────────────\n"
+                f"│ Leader:   *{es_leader}* memimpin sejak {lead_str}\n"
+                f"│ Gap lead: {es_lead_gap:+.2f}%\n"
+                f"│ Phase-2:  {phase2}\n"
+                f"│ ETH 5m:   {eth_5m_s} | BTC 5m: {btc_5m_s}\n"
+                f"└─────────────────────\n"
+            )
+        else:
+            tracker_str = "\n_Tidak ada leader aktif saat ini._\n"
+
+        send_reply(
+            f"📡 *Early Signal System: {status}*\n"
+            f"\n"
+            f"*Konfigurasi:*\n"
+            f"┌─────────────────────\n"
+            f"│ Phase-1 lead gap: {lead_gap}%\n"
+            f"│ Phase-2 5m move:  {move_th}%\n"
+            f"└─────────────────────\n"
+            f"{tracker_str}\n"
+            f"`/earlysignal on|off`\n"
+            f"`/earlysignal lead <pct>` | `/earlysignal move <pct>`",
+            reply_chat,
+        )
+        return
+
+    cmd     = args[0].lower()
+    val_arg = args[1] if len(args) > 1 else None
+    if cmd == "on":
+        settings["early_signal_enabled"] = True
+        send_reply(
+            f"✅ *Early Signal aktif.*\n"
+            f"Phase-1 (lead ±{settings['early_lead_gap']}%) + Phase-2 (5m ±{settings['early_5m_move']}%).",
+            reply_chat,
+        )
+    elif cmd == "off":
+        settings["early_signal_enabled"] = False
+        _es_reset()
+        send_reply("❌ *Early Signal dinonaktifkan.*", reply_chat)
+    elif cmd in ("lead", "move") and val_arg:
+        try:
+            val = float(val_arg)
+            if cmd == "lead":
+                if not 0.1 <= val <= 5.0:
+                    send_reply("Nilai harus antara 0.1–5.0%.", reply_chat); return
+                settings["early_lead_gap"] = val
+                send_reply(f"✅ Phase-1 lead gap diperbarui: *{val}%*", reply_chat)
+            else:
+                if not 0.1 <= val <= 5.0:
+                    send_reply("Nilai harus antara 0.1–5.0%.", reply_chat); return
+                settings["early_5m_move"] = val
+                send_reply(f"✅ Phase-2 5m move threshold diperbarui: *{val}%*", reply_chat)
+        except ValueError:
+            send_reply("Nilai tidak valid.", reply_chat)
+    else:
+        send_reply(
+            "Gunakan:\n`/earlysignal on|off`\n"
+            "`/earlysignal lead <pct>`\n"
+            "`/earlysignal move <pct>`",
+            reply_chat,
+        )
+
+
 def handle_ethpullback_command(args: list, reply_chat: str) -> None:
     """
-    /ethpullback                  — status + nilai sekarang
-    /ethpullback on|off           — aktifkan/nonaktifkan
-    /ethpullback peak <nilai>     — set % drop dari peak (default 1.5)
-    /ethpullback 5m <nilai>       — set % drop 5 menit untuk early alert (default 0.3)
-    /ethpullback earlygap <nilai> — set gap minimum untuk aktifkan tracker (default 0.5)
+    /ethpullback                  — status
+    /ethpullback on|off
+    /ethpullback peak <pct>       — drop dari peak trigger
+    /ethpullback 5m <pct>         — drop 5m trigger
+    /ethpullback earlygap <pct>   — gap minimum aktifkan tracker
     """
     if not args:
         enabled   = settings["eth_pullback_enabled"]
@@ -4273,65 +4320,43 @@ def handle_ethpullback_command(args: list, reply_chat: str) -> None:
         early_gap = settings["eth_early_gap_pct"]
         status    = "✅ ON" if enabled else "❌ OFF"
 
-        # Status 5m buffer
-        buf_count = len(eth_5m_buffer)
-        if buf_count > 0:
-            oldest  = eth_5m_buffer[0][0]
-            newest  = eth_5m_buffer[-1][0]
-            span_s  = (newest - oldest).total_seconds()
-            buf_str = f"{buf_count} titik ({span_s:.0f}s span)"
-        else:
-            buf_str = "kosong"
-
-        # Status tracker
         if eth_outperform_active and eth_peak_price:
-            curr_eth  = float(scan_stats.get("last_eth_price") or 0)
+            curr_eth = float(scan_stats.get("last_eth_price") or 0)
+            drop_now = (eth_peak_price - curr_eth) / eth_peak_price * 100 if curr_eth > 0 else 0
+            peak_str = eth_peak_time.strftime("%H:%M UTC") if eth_peak_time else "—"
             eth_5m_ch = _get_5m_eth_change(curr_eth) if curr_eth > 0 else None
-            drop_now  = (eth_peak_price - curr_eth) / eth_peak_price * 100 if curr_eth > 0 else 0
-            peak_str  = eth_peak_time.strftime("%H:%M UTC") if eth_peak_time else "—"
             chg_5m_s  = f"{eth_5m_ch:+.2f}%" if eth_5m_ch is not None else "N/A"
             tracker_str = (
                 f"\n*Tracker aktif:*\n"
                 f"┌─────────────────────\n"
                 f"│ ETH Peak:       ${eth_peak_price:,.2f} (pukul {peak_str})\n"
                 f"│ ETH Sekarang:   ${curr_eth:,.2f}\n"
-                f"│ Drop dari peak: {drop_now:.2f}% (trigger peak: {pct_peak}%)\n"
-                f"│ ETH 5m change:  {chg_5m_s} (trigger 5m: {pct_5m}%)\n"
-                f"│ Alert terkirim: {'✅ Ya' if eth_pullback_alerted else '❌ Belum'}\n"
+                f"│ Drop dari peak: {drop_now:.2f}% (trigger: {pct_peak}%)\n"
+                f"│ ETH 5m:         {chg_5m_s} (trigger: {pct_5m}%)\n"
                 f"└─────────────────────\n"
             )
         else:
-            tracker_str = "\n_ETH tidak sedang outperform BTC — tracker tidak aktif._\n"
+            tracker_str = "\n_ETH tidak sedang outperform — tracker tidak aktif._\n"
 
         send_reply(
             f"⚠️ *ETH Pullback Alert: {status}*\n"
-            f"\n"
-            f"*Konfigurasi:*\n"
             f"┌─────────────────────\n"
-            f"│ Early gap min:  {early_gap}% _(gap minimum untuk aktifkan tracker)_\n"
-            f"│ 5m trigger:     {pct_5m}% _(ETH turun X% dalam 5 menit → early alert)_\n"
-            f"│ Peak trigger:   {pct_peak}% _(ETH turun X% dari peak → peak alert)_\n"
-            f"│ 5m buffer:      {buf_str}\n"
+            f"│ Early gap:  {early_gap}%\n"
+            f"│ 5m trigger: {pct_5m}%\n"
+            f"│ Peak trigger: {pct_peak}%\n"
             f"└─────────────────────\n"
             f"{tracker_str}\n"
             f"`/ethpullback on|off`\n"
-            f"`/ethpullback 5m <pct>` | `/ethpullback peak <pct>`\n"
-            f"`/ethpullback earlygap <pct>`",
+            f"`/ethpullback peak <pct>` | `5m <pct>` | `earlygap <pct>`",
             reply_chat,
         )
         return
 
-    cmd = args[0].lower()
+    cmd     = args[0].lower()
     val_arg = args[1] if len(args) > 1 else None
-
     if cmd == "on":
         settings["eth_pullback_enabled"] = True
-        send_reply(
-            f"✅ *ETH Pullback Alert aktif.*\n"
-            f"Early alert saat ETH turun {settings['eth_pullback_5m_pct']}% dalam 5m.\n"
-            f"Peak alert saat ETH turun {settings['eth_pullback_pct']}% dari puncak.",
-            reply_chat,
-        )
+        send_reply(f"✅ *ETH Pullback Alert aktif.* Peak {settings['eth_pullback_pct']}% | 5m {settings['eth_pullback_5m_pct']}%.", reply_chat)
     elif cmd == "off":
         settings["eth_pullback_enabled"] = False
         _reset_eth_peak()
@@ -4339,96 +4364,23 @@ def handle_ethpullback_command(args: list, reply_chat: str) -> None:
     elif cmd in ("peak", "5m", "earlygap") and val_arg:
         try:
             val = float(val_arg)
-            if cmd == "peak":
-                if not 0.2 <= val <= 10.0:
-                    send_reply("Nilai peak harus antara 0.2–10.0%.", reply_chat); return
-                settings["eth_pullback_pct"] = val
-                send_reply(f"✅ Peak drop trigger diperbarui: *{val}%*", reply_chat)
-            elif cmd == "5m":
-                if not 0.1 <= val <= 5.0:
-                    send_reply("Nilai 5m harus antara 0.1–5.0%.", reply_chat); return
-                settings["eth_pullback_5m_pct"] = val
-                send_reply(f"✅ 5-menit drop trigger diperbarui: *{val}%*", reply_chat)
-            elif cmd == "earlygap":
-                if not 0.1 <= val <= 3.0:
-                    send_reply("Nilai early gap harus antara 0.1–3.0%.", reply_chat); return
-                settings["eth_early_gap_pct"] = val
-                send_reply(f"✅ Early gap minimum diperbarui: *{val}%*", reply_chat)
+            ranges = {"peak": (0.2, 10.0), "5m": (0.1, 5.0), "earlygap": (0.1, 3.0)}
+            lo, hi = ranges[cmd]
+            if not lo <= val <= hi:
+                send_reply(f"Nilai harus antara {lo}–{hi}%.", reply_chat); return
+            key = {"peak": "eth_pullback_pct", "5m": "eth_pullback_5m_pct", "earlygap": "eth_early_gap_pct"}[cmd]
+            settings[key] = val
+            send_reply(f"✅ *{cmd} trigger diperbarui: {val}%*", reply_chat)
         except ValueError:
-            send_reply("Nilai tidak valid. Masukkan angka persentase.", reply_chat)
+            send_reply("Nilai tidak valid.", reply_chat)
     else:
-        # Coba parse langsung sebagai angka (backward compat)
-        try:
-            val = float(cmd)
-            if not 0.2 <= val <= 10.0:
-                send_reply("Nilai harus antara 0.2–10.0%.", reply_chat); return
-            settings["eth_pullback_pct"] = val
-            send_reply(f"✅ Peak drop trigger diperbarui: *{val}%*", reply_chat)
-        except ValueError:
-            send_reply(
-                "Gunakan:\n`/ethpullback on|off`\n"
-                "`/ethpullback peak <pct>`\n"
-                "`/ethpullback 5m <pct>`\n"
-                "`/ethpullback earlygap <pct>`",
-                reply_chat,
-            )
-
-
-def handle_adaptive_command(args: list, reply_chat: str) -> None:
-    """
-    /adaptivethreshold         — tampilkan status & nilai sekarang
-    /adaptivethreshold on|off  — aktifkan/nonaktifkan
-    """
-    if not args:
-        adp = calc_adaptive_thresholds()
-        status = "✅ ON" if settings["adaptive_threshold"] else "❌ OFF"
         send_reply(
-            f"⚡ *Adaptive Threshold: {status}*\n"
-            f"\n"
-            f"Volatility sekarang: {adp['vol_label']} ({adp['vol_pct']:.4f}%/scan)\n"
-            f"Multiplier: ×{adp['multiplier']:.2f}\n"
-            f"\n"
-            f"*Threshold saat ini:*\n"
-            f"├─ Entry base: ±{adp['entry_base']:.2f}% → rekomendasi *±{adp['entry_adaptive']:.2f}%*\n"
-            f"└─ Exit base:  ±{adp['exit_base']:.2f}% → rekomendasi *±{adp['exit_adaptive']:.2f}%*\n"
-            f"\n"
-            f"_{adp['note']}_\n"
-            f"\n"
-            f"`/adaptivethreshold on` | `/adaptivethreshold off`",
+            "Gunakan:\n`/ethpullback on|off`\n"
+            "`/ethpullback peak <pct>`\n"
+            "`/ethpullback 5m <pct>`\n"
+            "`/ethpullback earlygap <pct>`",
             reply_chat,
         )
-        return
-    cmd = args[0].lower()
-    if cmd == "on":
-        settings["adaptive_threshold"] = True
-        send_reply("✅ *Adaptive threshold aktif.* Threshold entry/exit akan menyesuaikan volatility.", reply_chat)
-    elif cmd == "off":
-        settings["adaptive_threshold"] = False
-        send_reply("❌ *Adaptive threshold dinonaktifkan.* Threshold kembali ke nilai base setting.", reply_chat)
-    else:
-        send_reply("Gunakan `on` atau `off`.", reply_chat)
-
-
-def handle_session_command(reply_chat: str) -> None:
-    """Tampilkan sesi trading aktif dan implikasinya."""
-    sess = get_market_session()
-    adp  = calc_adaptive_thresholds()
-    send_reply(
-        f"🕐 *Market Session*\n"
-        f"\n"
-        f"┌─────────────────────\n"
-        f"│ {sess['emoji']} *{sess['primary']}*\n"
-        f"│ Waktu: {sess['time_str']}\n"
-        f"│ Volatility ekspektasi: {sess['volatility_expect']}\n"
-        f"├─────────────────────\n"
-        f"│ _{sess['pairs_note']}_\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"*Sesi aktif sekarang:* {', '.join(sess['sessions'])}\n"
-        f"\n"
-        f"_Volatility bot sekarang: {adp['vol_label']} — threshold adaptif ±{adp['entry_adaptive']:.2f}%_",
-        reply_chat,
-    )
 
 
 def handle_regimefilter_command(args: list, reply_chat: str) -> None:
@@ -4514,9 +4466,9 @@ def handle_peak_command(args: list, reply_chat: str) -> None:
             send_reply("Nilai harus antara 0–3.0.", reply_chat)
             return
         settings["peak_reversal"] = val
-        send_reply(f"Reversal *{val}%* dari puncak.", reply_chat)
+        send_reply(f"Reversal *{val}%* dari puncak", reply_chat)
     except ValueError:
-        send_reply("Gunakan `on`, `off`, atau angka reversal.", reply_chat)
+        send_reply("Gunakan `on`, `off`, atau angka reversal", reply_chat)
 
 
 def _cancel_peak_watch_if_active(reply_chat=None) -> None:
@@ -4525,7 +4477,7 @@ def _cancel_peak_watch_if_active(reply_chat=None) -> None:
         if reply_chat:
             send_reply(
                 f"⚠️ Peak Watch *{peak_strategy.value}* dibatalkan.\n"
-                "Bot kembali ke mode SCAN.",
+                "Kembali ke SCAN",
                 reply_chat,
             )
         current_mode  = Mode.SCAN
@@ -4569,15 +4521,15 @@ def handle_sltp_command(args: list, reply_chat: str) -> None:
             return
         if key == "sl":
             settings["sl_pct"] = val
-            send_reply(f"Trailing SL distance *{val}%*.", reply_chat)
+            send_reply(f"Trailing SL distance *{val}%*", reply_chat)
         elif key == "tp":
             send_reply(
                 f"TP mengikuti exit threshold ±{settings['exit_threshold']}%\n"
-                f"Gunakan `/threshold exit <nilai>` untuk menyesuaikan.",
+                f"Gunakan `/threshold exit <nilai>` ya",
                 reply_chat,
             )
         else:
-            send_reply("Gunakan parameter `sl`.", reply_chat)
+            send_reply("Gunakan `sl`", reply_chat)
     except ValueError:
         send_reply("Nilai tidak valid.", reply_chat)
 
@@ -4592,7 +4544,7 @@ def handle_interval_command(args: list, reply_chat: str) -> None:
             send_reply("Nilai harus antara 60–3600 detik.", reply_chat)
             return
         settings["scan_interval"] = val
-        send_reply(f"Interval scan diatur ke *{val}s*.", reply_chat)
+        send_reply(f"Scan setiap *{val}s*", reply_chat)
     except ValueError:
         send_reply("Nilai tidak valid.", reply_chat)
 
@@ -4611,15 +4563,15 @@ def handle_threshold_command(args: list, reply_chat: str) -> None:
             return
         if t_type == "entry":
             settings["entry_threshold"] = val
-            send_reply(f"Entry threshold diatur ke *±{val}%*.", reply_chat)
+            send_reply(f"Entry threshold *±{val}%*", reply_chat)
         elif t_type == "exit":
             settings["exit_threshold"] = val
-            send_reply(f"Exit/TP threshold diatur ke *±{val}%*.", reply_chat)
+            send_reply(f"Exit/TP threshold *±{val}%*", reply_chat)
         elif t_type in ("invalid", "invalidation"):
             settings["invalidation_threshold"] = val
-            send_reply(f"Invalidation threshold diatur ke *±{val}%*.", reply_chat)
+            send_reply(f"Invalidation *±{val}%*", reply_chat)
         else:
-            send_reply("Gunakan parameter `entry`, `exit`, atau `invalid`.", reply_chat)
+            send_reply("Gunakan `entry`, `exit`, atau `invalid`", reply_chat)
     except ValueError:
         send_reply("Nilai tidak valid.", reply_chat)
 
@@ -4636,7 +4588,7 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
         old = settings["lookback_hours"]
         settings["lookback_hours"] = val
         prune_history(datetime.now(timezone.utc))
-        send_reply(f"Lookback diperbarui: *{old}h* → *{val}h*. History di-prune.", reply_chat)
+        send_reply(f"Lookback *{old}h* → *{val}h*~ History di-prune.", reply_chat)
     except ValueError:
         send_reply("Nilai tidak valid.", reply_chat)
 
@@ -5079,7 +5031,7 @@ def handle_clearpos_command(reply_chat: str) -> None:
     for k in pos_data:
         pos_data[k] = None
     clear_pos_data_redis()
-    send_reply("🗑️ *Data posisi dihapus~*\nRedis juga dibersihkan.", reply_chat)
+    send_reply("🗑️ *Data posisi dihapus~*\nRedis juga dibersihkan", reply_chat)
 
 
 def handle_sim_command(args: list, reply_chat: str) -> None:
@@ -5303,7 +5255,7 @@ def handle_help_command(reply_chat: str) -> None:
 
     send_reply(
         f"📟 *Menu Utama*\n"
-        f"_Gap: {gap_s} | Mode: {mode_s} | Peak: {peak_s} | Modal: {cap_str} | Posisi: {pos_str}_\n"
+        f"_Gap: {gap_s} | Mode: {mode_s} | Peak: {peak_s} | Modal: {cap_str} | Pos: {pos_str}_\n"
         f"\n"
         f"Ketik salah satu untuk detail:\n"
         f"\n"
@@ -5363,7 +5315,7 @@ def handle_help_pos_command(reply_chat: str) -> None:
         f"`/clearpos`  — Hapus data posisi\n"
         f"\n"
         f"───────────────────\n"
-        f"_Data tersimpan di Redis dan akan bertahan saat restart._",
+        f"_Data tersimpan di Redis, survive restart~_",
         reply_chat,
     )
 
@@ -5410,9 +5362,6 @@ def handle_help_config_command(reply_chat: str) -> None:
         f"`/exitconf scans|buffer|pnl <val>`\n"
         f"`/sizeratio <eth_pct>` _(sekarang ETH {int(settings['eth_size_ratio'])}%)_\n"
         f"`/regimefilter on|off` _(sekarang: {'✅ ON' if settings['regime_filter_enabled'] else '❌ OFF'})_\n"
-        f"`/adaptivethreshold on|off` _(sekarang: {'✅ ON' if settings['adaptive_threshold'] else '❌ OFF'})_\n"
-        f"`/ethpullback on|off|<pct>` _(sekarang: {'✅ ON' if settings['eth_pullback_enabled'] else '❌ OFF'}, trigger {settings['eth_pullback_pct']}%)_\n"
-        f"`/session` _(info sesi trading sekarang)_\n"
         f"`/interval <detik>`\n"
         f"`/lookback <jam>`\n"
         f"`/heartbeat <menit>`",
@@ -5470,9 +5419,9 @@ def send_startup_message() -> bool:
     )
     hrs_loaded  = len(price_history) * settings["scan_interval"] / 3600
     hist_info   = (
-        f"⚡ History: *{hrs_loaded:.1f}h* siap!\n"
+        f"⚡ History Bot A: *{hrs_loaded:.1f}h* siap!\n"
         if price_history
-        else f"⏳ Memuat data... Sinyal tersedia setelah {settings['lookback_hours']}h\n"
+        else f"⏳ Menunggu Bot A~ Sinyal setelah {settings['lookback_hours']}h tersedia\n"
     )
     peak_s      = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
     cap_str     = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset (gunakan /capital)"
@@ -5492,7 +5441,7 @@ def send_startup_message() -> bool:
 
     return send_alert(
         f"………\n"
-        f"✅ *Bot Aktif*\n"
+        f"*Bot Aktif* \n"
         f"_Swing / Day Trade Edition — Mentor Analysis_\n"
         f"{price_info}\n"
         f"📊 Scan: {settings['scan_interval']}s | Lookback: {settings['lookback_hours']}h\n"
@@ -5605,7 +5554,13 @@ def main_loop() -> None:
                             f"ETH: {format_value(eth_ret)}% | Gap: {format_value(gap)}%"
                         )
 
-                        # ETH Pullback Alert — cek setiap scan
+                        # Early signal system — Phase 1 & 2
+                        check_early_signal(
+                            float(btc_ret), float(eth_ret),
+                            float(price_data.btc_price), float(price_data.eth_price),
+                        )
+
+                        # Legacy ETH pullback tracker
                         check_eth_pullback_alert(
                             float(btc_ret), float(eth_ret),
                             float(price_data.btc_price), float(price_data.eth_price),
