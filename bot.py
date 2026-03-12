@@ -133,6 +133,16 @@ settings = {
     # S1 hanya valid saat BULLISH | S2 hanya valid saat BEARISH
     # pump + ETH < BTC (gap -) = SKIP S2 | dump + ETH > BTC (gap +) = SKIP S1
     "regime_filter_enabled":  True,
+    # — Adaptive Threshold —
+    # Threshold entry/exit otomatis menyesuaikan volatility market
+    # Saat volatility tinggi → threshold naik | rendah → threshold turun
+    "adaptive_threshold":     True,
+    "adaptive_min_entry":     0.8,    # batas bawah entry threshold
+    "adaptive_max_entry":     3.0,    # batas atas entry threshold
+    "adaptive_min_exit":      0.1,    # batas bawah exit threshold
+    "adaptive_max_exit":      0.8,    # batas atas exit threshold
+    # — Session Awareness —
+    "session_awareness":      True,   # tampilkan info session di analysis
     # — Simulation Mode —
     "sim_enabled":            False,   # bot otomatis open/close posisi saat sinyal
     "sim_margin_usd":         100.0,   # margin per leg dalam USD
@@ -430,7 +440,9 @@ def process_commands() -> None:
             # — Swing / Day Trade —
             "/capital":    lambda: handle_capital_command(args, chat_id),
             "/sizeratio":     lambda: handle_sizeratio_command(args, chat_id),
-            "/regimefilter":  lambda: handle_regimefilter_command(args, chat_id),
+            "/regimefilter":      lambda: handle_regimefilter_command(args, chat_id),
+            "/adaptivethreshold": lambda: handle_adaptive_command(args, chat_id),
+            "/session":           lambda: handle_session_command(chat_id),
             "/sim":        lambda: handle_sim_command(args, chat_id),
             "/simstats":   lambda: handle_simstats_command(chat_id),
             "/ratio":     lambda: handle_ratio_command(chat_id),
@@ -803,6 +815,304 @@ def calc_ratio_percentile() -> Tuple[
     percentile = int(below / len(ratios) * 100)
 
     return current, avg, high, low, percentile
+
+
+# =============================================================================
+# Feature: Ratio Momentum
+# =============================================================================
+def calc_ratio_momentum() -> dict:
+    """
+    Hitung momentum ETH/BTC ratio — apakah ratio sedang naik atau turun.
+
+    Windows: 1h, 4h, 24h
+    Slope = (ratio_sekarang - ratio_N_lalu) / ratio_N_lalu * 100  (% change)
+
+    Returns dict:
+      slope_1h / 4h / 24h : % change ratio per window
+      direction            : "NAIK" / "TURUN" / "SIDEWAYS"
+      strength             : "Kuat" / "Moderat" / "Lemah"
+      emoji                : str
+      label                : str (human readable)
+      acceleration         : "Mempercepat" / "Melambat" / "Stabil"
+    """
+    if not price_history or len(price_history) < 5:
+        return {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
+                "slope_1h": None, "slope_4h": None, "slope_24h": None,
+                "label": "Data belum cukup", "acceleration": "N/A"}
+
+    interval  = settings["scan_interval"]
+    now_pt    = price_history[-1]
+    ratio_now = float(now_pt.eth) / float(now_pt.btc)
+
+    def _slope(minutes: int) -> Optional[float]:
+        scans_back = max(1, int(minutes * 60 / interval))
+        if len(price_history) <= scans_back:
+            return None
+        old = price_history[-scans_back - 1]
+        ratio_old = float(old.eth) / float(old.btc)
+        if ratio_old == 0:
+            return None
+        return (ratio_now - ratio_old) / ratio_old * 100
+
+    s1h  = _slope(60)
+    s4h  = _slope(240)
+    s24h = _slope(1440)
+
+    # Primary signal dari 4h (most reliable)
+    primary = s4h if s4h is not None else s1h
+
+    if primary is None:
+        return {"direction": "N/A", "emoji": "⚪", "strength": "N/A",
+                "slope_1h": s1h, "slope_4h": s4h, "slope_24h": s24h,
+                "label": "Data belum cukup", "acceleration": "N/A"}
+
+    abs_p = abs(primary)
+    if abs_p >= 1.5:   strength = "Kuat"
+    elif abs_p >= 0.5: strength = "Moderat"
+    else:              strength = "Lemah"
+
+    if primary > 0.1:
+        direction, emoji = "NAIK", "📈"
+    elif primary < -0.1:
+        direction, emoji = "TURUN", "📉"
+    else:
+        direction, emoji = "SIDEWAYS", "➡️"
+
+    # Acceleration: bandingkan 1h vs 4h slope (normalized per jam)
+    acceleration = "Stabil"
+    if s1h is not None and s4h is not None:
+        rate_1h = s1h          # % per 1h
+        rate_4h = s4h / 4      # % per 1h (normalized)
+        if abs(rate_4h) > 0.01:
+            ratio_accel = rate_1h / rate_4h
+            if ratio_accel > 1.3:
+                acceleration = "Mempercepat 🔥"
+            elif ratio_accel < 0.7:
+                acceleration = "Melambat 🧊"
+
+    label = f"Ratio {direction} {strength} — 4h: {s4h:+.3f}% | {acceleration}"
+
+    return {
+        "direction":    direction,
+        "emoji":        emoji,
+        "strength":     strength,
+        "slope_1h":     s1h,
+        "slope_4h":     s4h,
+        "slope_24h":    s24h,
+        "label":        label,
+        "acceleration": acceleration,
+    }
+
+
+# =============================================================================
+# Feature: Adaptive Threshold
+# =============================================================================
+def calc_adaptive_thresholds() -> dict:
+    """
+    Hitung threshold entry/exit adaptif berdasarkan volatility saat ini.
+
+    Logika:
+      - Ambil volatility dari detect_market_regime() (avg |Δ%| per scan 1h)
+      - Scale threshold: vol rendah → threshold lebih ketat, vol tinggi → lebih longgar
+      - Base threshold tetap dari settings, adaptive adalah REKOMENDASI saja
+
+    Returns dict:
+      entry_base    : float (dari settings)
+      exit_base     : float (dari settings)
+      entry_adaptive: float (rekomendasi)
+      exit_adaptive : float (rekomendasi)
+      vol_pct       : float
+      vol_label     : str
+      multiplier    : float
+      note          : str
+    """
+    reg       = detect_market_regime()
+    vol_pct   = reg["vol_pct"]    # avg |Δ%| per scan (1h window)
+    vol_label = reg["volatility"]
+
+    entry_base = settings["entry_threshold"]
+    exit_base  = settings["exit_threshold"]
+
+    # Volatility reference: 0.05% per scan = normal
+    # Multiplier: vol / 0.05, clamped antara 0.5–2.5
+    ref_vol    = 0.05
+    multiplier = max(0.5, min(2.5, vol_pct / ref_vol)) if vol_pct > 0 else 1.0
+
+    min_e = settings["adaptive_min_entry"]
+    max_e = settings["adaptive_max_entry"]
+    min_x = settings["adaptive_min_exit"]
+    max_x = settings["adaptive_max_exit"]
+
+    entry_adaptive = round(max(min_e, min(max_e, entry_base * multiplier)), 2)
+    exit_adaptive  = round(max(min_x, min(max_x, exit_base  * multiplier)), 2)
+
+    if multiplier > 1.3:
+        note = "Volatility tinggi — threshold lebih lebar agar tidak false entry"
+    elif multiplier < 0.8:
+        note = "Volatility rendah — threshold lebih ketat, gap kecil sudah signifikan"
+    else:
+        note = "Volatility normal — threshold sesuai base setting"
+
+    return {
+        "entry_base":     entry_base,
+        "exit_base":      exit_base,
+        "entry_adaptive": entry_adaptive,
+        "exit_adaptive":  exit_adaptive,
+        "vol_pct":        vol_pct,
+        "vol_label":      vol_label,
+        "multiplier":     multiplier,
+        "note":           note,
+    }
+
+
+# =============================================================================
+# Feature: Session Awareness
+# =============================================================================
+def get_market_session() -> dict:
+    """
+    Deteksi sesi trading aktif berdasarkan UTC sekarang.
+
+    Session windows (UTC):
+      Asian:  00:00 – 08:00
+      London: 08:00 – 16:00
+      NY:     13:00 – 21:00
+      Overlap London+NY: 13:00 – 16:00 (paling volatile)
+      Dead zone: 21:00 – 00:00
+
+    Returns dict:
+      sessions  : list of active session names
+      primary   : str (dominant session)
+      emoji     : str
+      volatility_expect: "Tinggi" / "Sedang" / "Rendah"
+      pairs_note: str (implikasi untuk ETH/BTC pairs)
+    """
+    now_utc = datetime.now(timezone.utc)
+    hour    = now_utc.hour
+
+    active = []
+    if 0 <= hour < 8:
+        active.append("Asian")
+    if 8 <= hour < 16:
+        active.append("London")
+    if 13 <= hour < 21:
+        active.append("NY")
+
+    overlap = "London" in active and "NY" in active
+
+    if overlap:
+        primary          = "London + NY Overlap"
+        emoji            = "🔥"
+        vol_expect       = "Tinggi"
+        pairs_note       = "Overlap session — volume tertinggi, gap lebih besar dan cepat revert. Sinyal lebih reliable."
+    elif "NY" in active:
+        primary          = "New York"
+        emoji            = "🗽"
+        vol_expect       = "Sedang-Tinggi"
+        pairs_note       = "NY session — BTC/ETH aktif, gap bisa terbentuk cepat mengikuti berita AS."
+    elif "London" in active:
+        primary          = "London"
+        emoji            = "🏦"
+        vol_expect       = "Sedang"
+        pairs_note       = "London session — likuiditas baik, momentum pairs biasanya stabil."
+    elif "Asian" in active:
+        primary          = "Asian"
+        emoji            = "🌏"
+        vol_expect       = "Rendah-Sedang"
+        pairs_note       = "Asian session — volatility lebih rendah, gap cenderung lebih kecil dan lambat revert."
+    else:
+        primary          = "Dead Zone"
+        emoji            = "🌙"
+        vol_expect       = "Rendah"
+        pairs_note       = "Di luar sesi utama — likuiditas tipis, sinyal kurang reliable. Lebih baik tunggu London/NY."
+
+    return {
+        "sessions":           active if active else ["Dead Zone"],
+        "primary":            primary,
+        "emoji":              emoji,
+        "volatility_expect":  vol_expect,
+        "pairs_note":         pairs_note,
+        "hour_utc":           hour,
+        "time_str":           now_utc.strftime("%H:%M UTC"),
+    }
+
+
+# =============================================================================
+# Feature: Multi-TF Gap
+# =============================================================================
+def calc_multitf_gap() -> dict:
+    """
+    Hitung gap ETH vs BTC di multiple timeframe (1h, 4h, 24h).
+
+    gap_Nh = ETH_ret_Nh - BTC_ret_Nh
+    Berbeda dari lookback gap (settings["lookback_hours"]) yang dipakai untuk sinyal —
+    ini khusus untuk context analysis.
+
+    Returns dict:
+      gap_1h / 4h / 24h  : float atau None
+      btc_1h/4h/24h      : float atau None
+      eth_1h/4h/24h      : float atau None
+      alignment          : "ALIGNED_S1" / "ALIGNED_S2" / "MIXED" / "FLAT"
+      consistency        : int (0-3, berapa banyak TF setuju)
+      note               : str
+    """
+    if not price_history or len(price_history) < 3:
+        return {"gap_1h": None, "gap_4h": None, "gap_24h": None,
+                "alignment": "N/A", "consistency": 0, "note": "Data belum cukup"}
+
+    interval = settings["scan_interval"]
+    now_pt   = price_history[-1]
+    btc_now  = float(now_pt.btc)
+    eth_now  = float(now_pt.eth)
+
+    def _gap(minutes: int):
+        scans_back = max(1, int(minutes * 60 / interval))
+        if len(price_history) <= scans_back:
+            return None, None, None
+        old     = price_history[-scans_back - 1]
+        btc_ret = (btc_now - float(old.btc)) / float(old.btc) * 100
+        eth_ret = (eth_now - float(old.eth)) / float(old.eth) * 100
+        return eth_ret - btc_ret, btc_ret, eth_ret
+
+    g1h,  b1h,  e1h  = _gap(60)
+    g4h,  b4h,  e4h  = _gap(240)
+    g24h, b24h, e24h = _gap(1440)
+
+    # Alignment: berapa banyak TF agree arahnya
+    gaps = [g for g in [g1h, g4h, g24h] if g is not None]
+    pos  = sum(1 for g in gaps if g > 0.2)
+    neg  = sum(1 for g in gaps if g < -0.2)
+
+    if len(gaps) == 0:
+        alignment, consistency, note = "N/A", 0, "Data belum cukup"
+    elif pos == len(gaps):
+        alignment   = "ALIGNED_S1"
+        consistency = pos
+        note        = f"Semua {pos} timeframe ETH outperform — S1 setup kuat"
+    elif neg == len(gaps):
+        alignment   = "ALIGNED_S2"
+        consistency = neg
+        note        = f"Semua {neg} timeframe BTC outperform — S2 setup kuat"
+    elif pos > neg:
+        alignment   = "MIXED_S1"
+        consistency = pos
+        note        = f"ETH dominant di {pos}/{len(gaps)} timeframe — S1 lebih likely"
+    elif neg > pos:
+        alignment   = "MIXED_S2"
+        consistency = neg
+        note        = f"BTC dominant di {neg}/{len(gaps)} timeframe — S2 lebih likely"
+    else:
+        alignment   = "FLAT"
+        consistency = 0
+        note        = "Tidak ada arah dominan — sinyal lemah"
+
+    return {
+        "gap_1h":  g1h,  "btc_1h":  b1h,  "eth_1h":  e1h,
+        "gap_4h":  g4h,  "btc_4h":  b4h,  "eth_4h":  e4h,
+        "gap_24h": g24h, "btc_24h": b24h, "eth_24h": e24h,
+        "alignment":    alignment,
+        "consistency":  consistency,
+        "note":         note,
+    }
 
 
 def get_ratio_conviction(strategy: Strategy, pct: Optional[int]) -> Tuple[str, str]:
@@ -3130,6 +3440,9 @@ def handle_ratio_command(reply_chat: str) -> None:
     stars_s1, _ = get_ratio_conviction(Strategy.S1, pct_r)
     stars_s2, _ = get_ratio_conviction(Strategy.S2, pct_r)
     ext         = _calc_ratio_extended_stats(curr_r, avg_r, hi_r, lo_r, pct_r)
+    mom         = calc_ratio_momentum()
+    mtf         = calc_multitf_gap()
+    adp         = calc_adaptive_thresholds()
 
     if pct_r <= 20:   signal = "🟢 *ETH sangat murah vs BTC* — momentum S2 kuat"
     elif pct_r <= 40: signal = "🟡 *ETH relatif murah* — setup S2 cukup bagus"
@@ -3143,6 +3456,37 @@ def handle_ratio_command(reply_chat: str) -> None:
     detail_s2 = _build_conviction_detail(Strategy.S2, stars_s2, pct_r, curr_r, avg_r, hi_r, lo_r, ext)
     ready_s1  = build_entry_readiness(Strategy.S1, pct_r, curr_r, avg_r, ext)
     ready_s2  = build_entry_readiness(Strategy.S2, pct_r, curr_r, avg_r, ext)
+
+    # Ratio Momentum block
+    def _sfmt(v): return f"{v:+.3f}%" if v is not None else "N/A"
+    mom_block = (
+        f"*📊 Ratio Momentum:*\n"
+        f"┌─────────────────────\n"
+        f"│ Arah:  {mom['emoji']} *{mom['direction']}* — {mom['strength']}\n"
+        f"│  1h:  {_sfmt(mom['slope_1h'])}  4h: {_sfmt(mom['slope_4h'])}  24h: {_sfmt(mom['slope_24h'])}\n"
+        f"│ Akselerasi: {mom['acceleration']}\n"
+        f"└─────────────────────\n"
+    )
+
+    # Multi-TF Gap block
+    def _gfmt(v): return f"{v:+.2f}%" if v is not None else "N/A"
+    align_emoji = {"ALIGNED_S1": "✅", "ALIGNED_S2": "✅", "MIXED_S1": "🟡",
+                   "MIXED_S2": "🟠", "FLAT": "⚪", "N/A": "—"}.get(mtf["alignment"], "—")
+    mtf_block = (
+        f"*🔀 Multi-TF Gap (ETH - BTC):*\n"
+        f"┌─────────────────────\n"
+        f"│  1h: {_gfmt(mtf['gap_1h'])}  4h: {_gfmt(mtf['gap_4h'])}  24h: {_gfmt(mtf['gap_24h'])}\n"
+        f"│ {align_emoji} {mtf['note']}\n"
+        f"└─────────────────────\n"
+    )
+
+    # Adaptive threshold note
+    adp_note = ""
+    if settings["adaptive_threshold"] and abs(adp["multiplier"] - 1.0) > 0.15:
+        adp_note = (
+            f"\n_💡 Adaptive: volatility {adp['vol_label']} (×{adp['multiplier']:.1f}) → "
+            f"entry rekomendasi ±{adp['entry_adaptive']}% | exit ±{adp['exit_adaptive']}%_\n"
+        )
 
     send_reply(
         f"📈 *ETH/BTC Ratio Monitor*\n"
@@ -3161,6 +3505,9 @@ def handle_ratio_command(reply_chat: str) -> None:
         f"\n"
         f"{signal}\n"
         f"\n"
+        f"{mom_block}\n"
+        f"{mtf_block}"
+        f"{adp_note}"
         f"──────────────────────\n"
         f"{detail_s1}\n"
         f"\n"
@@ -3172,7 +3519,7 @@ def handle_ratio_command(reply_chat: str) -> None:
         f"══════════════════════\n"
         f"{ready_s2}\n"
         f"\n"
-        f"_Dari {len(price_history)} price points~_",
+        f"_Dari {len(price_history)} price points._",
         reply_chat,
     )
 
@@ -3304,26 +3651,33 @@ def handle_analysis_command(reply_chat: str) -> None:
     curr_r, avg_r, _, _, pct_r = calc_ratio_percentile()
     ratio_str = f"{curr_r:.5f} ({pct_r}th percentile)" if curr_r else "N/A"
 
-    # Gap status
+    # New features
+    mom  = calc_ratio_momentum()
+    mtf  = calc_multitf_gap()
+    adp  = calc_adaptive_thresholds()
+    sess = get_market_session()
+
+    # Gap status — use adaptive threshold if enabled
+    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else et
     gap_abs = abs(gap_f)
-    if gap_abs < et * 0.5:   gap_status = "💤 Jauh dari threshold — pasar seimbang"
-    elif gap_abs < et:        gap_status = f"🔔 Mendekati ±{et}% — mulai perhatikan"
-    elif gap_abs < et * 1.5:  gap_status = f"🚨 Di atas ±{et}% — zona entry"
-    else:                     gap_status = f"⚡ Divergence ekstrem"
+    if gap_abs < eff_et * 0.5:   gap_status = "💤 Jauh dari threshold — pasar seimbang"
+    elif gap_abs < eff_et:        gap_status = f"🔔 Mendekati ±{eff_et:.2f}% — mulai perhatikan"
+    elif gap_abs < eff_et * 1.5:  gap_status = f"🚨 Di atas ±{eff_et:.2f}% — zona entry"
+    else:                         gap_status = f"⚡ Divergence ekstrem"
 
     # Kandidat
-    if gap_f >= et:
+    if gap_f >= eff_et:
         cand_str  = f"🔍 Kandidat *S1* (Long BTC / Short ETH)"
         stars, cv = get_ratio_conviction(Strategy.S1, pct_r)
         hint      = get_convergence_hint(Strategy.S1, drv)
-    elif gap_f <= -et:
+    elif gap_f <= -eff_et:
         cand_str  = f"🔍 Kandidat *S2* (Long ETH / Short BTC)"
         stars, cv = get_ratio_conviction(Strategy.S2, pct_r)
         hint      = get_convergence_hint(Strategy.S2, drv)
     else:
         cand_str  = "💤 Belum ada kandidat entry"
         stars, cv = "—", "—"
-        hint      = f"Tunggu gap ±{et}%"
+        hint      = f"Tunggu gap ±{eff_et:.2f}%"
 
     # Sizing preview
     sizing_str = ""
@@ -3351,6 +3705,45 @@ def handle_analysis_command(reply_chat: str) -> None:
             f"Net P&L: {net_s} | {he} {hd}\n"
         )
 
+    # Session block
+    sess_block = (
+        f"*🕐 Market Session:*\n"
+        f"┌─────────────────────\n"
+        f"│ {sess['emoji']} *{sess['primary']}* — {sess['time_str']}\n"
+        f"│ Volatility ekspektasi: {sess['volatility_expect']}\n"
+        f"│ _{sess['pairs_note']}_\n"
+        f"└─────────────────────\n"
+    ) if settings["session_awareness"] else ""
+
+    # Multi-TF gap block
+    def _gf(v): return f"{v:+.2f}%" if v is not None else "N/A"
+    align_e = {"ALIGNED_S1": "✅", "ALIGNED_S2": "✅", "MIXED_S1": "🟡",
+               "MIXED_S2": "🟠", "FLAT": "⚪", "N/A": "—"}.get(mtf["alignment"], "—")
+    mtf_block = (
+        f"*🔀 Multi-TF Gap:*\n"
+        f"┌─────────────────────\n"
+        f"│  1h: {_gf(mtf['gap_1h'])}  4h: {_gf(mtf['gap_4h'])}  24h: {_gf(mtf['gap_24h'])}\n"
+        f"│ {align_e} {mtf['note']}\n"
+        f"└─────────────────────\n"
+    )
+
+    # Adaptive threshold note
+    adp_block = ""
+    if settings["adaptive_threshold"]:
+        adp_block = (
+            f"*⚡ Adaptive Threshold:*\n"
+            f"┌─────────────────────\n"
+            f"│ Volatility: {adp['vol_label']} (×{adp['multiplier']:.2f})\n"
+            f"│ Entry: {adp['entry_base']:.2f}% → *{adp['entry_adaptive']:.2f}%*\n"
+            f"│ Exit:  {adp['exit_base']:.2f}% → *{adp['exit_adaptive']:.2f}%*\n"
+            f"│ _{adp['note']}_\n"
+            f"└─────────────────────\n"
+        )
+
+    # Ratio momentum (compact for analysis)
+    def _sf(v): return f"{v:+.3f}%" if v is not None else "N/A"
+    mom_line = f"Ratio: {mom['emoji']} {mom['direction']} {mom['strength']} | 1h {_sf(mom['slope_1h'])} 4h {_sf(mom['slope_4h'])} | {mom['acceleration']}\n"
+
     # Price recap 24h/48h/72h
     recap_block = build_price_recap_block()
 
@@ -3359,7 +3752,10 @@ def handle_analysis_command(reply_chat: str) -> None:
         f"_Snapshot kondisi pasar terkini._\n"
         f"\n"
         f"{recap_block}\n"
+        f"{sess_block}\n"
         f"{reg_block}\n"
+        f"{mtf_block}\n"
+        f"{adp_block}\n"
         f"*📊 Gap ({lb}):*\n"
         f"┌─────────────────────\n"
         f"│ BTC:    {format_value(btc_r)}%\n"
@@ -3372,6 +3768,7 @@ def handle_analysis_command(reply_chat: str) -> None:
         f"\n"
         f"*📈 ETH/BTC Ratio:*\n"
         f"{ratio_str}\n"
+        f"{mom_line}"
         f"\n"
         f"*🔍 Setup:*\n"
         f"{cand_str}\n"
@@ -3381,7 +3778,7 @@ def handle_analysis_command(reply_chat: str) -> None:
         f"{pos_str}\n"
         f"Mode: *{current_mode.value}* | Peak: {'✅ ON' if settings['peak_enabled'] else '❌ OFF'}\n"
         f"\n"
-        f"_`/ratio` detail ratio | `/pnl` P&L posisi aktif~_",
+        f"_`/ratio` untuk detail ratio lengkap._",
         reply_chat,
     )
 
@@ -3509,6 +3906,63 @@ def handle_sizeratio_command(args: list, reply_chat: str) -> None:
         )
     except ValueError:
         send_reply("Nilai tidak valid. Contoh: `/sizeratio 60`", reply_chat)
+
+
+def handle_adaptive_command(args: list, reply_chat: str) -> None:
+    """
+    /adaptivethreshold         — tampilkan status & nilai sekarang
+    /adaptivethreshold on|off  — aktifkan/nonaktifkan
+    """
+    if not args:
+        adp = calc_adaptive_thresholds()
+        status = "✅ ON" if settings["adaptive_threshold"] else "❌ OFF"
+        send_reply(
+            f"⚡ *Adaptive Threshold: {status}*\n"
+            f"\n"
+            f"Volatility sekarang: {adp['vol_label']} ({adp['vol_pct']:.4f}%/scan)\n"
+            f"Multiplier: ×{adp['multiplier']:.2f}\n"
+            f"\n"
+            f"*Threshold saat ini:*\n"
+            f"├─ Entry base: ±{adp['entry_base']:.2f}% → rekomendasi *±{adp['entry_adaptive']:.2f}%*\n"
+            f"└─ Exit base:  ±{adp['exit_base']:.2f}% → rekomendasi *±{adp['exit_adaptive']:.2f}%*\n"
+            f"\n"
+            f"_{adp['note']}_\n"
+            f"\n"
+            f"`/adaptivethreshold on` | `/adaptivethreshold off`",
+            reply_chat,
+        )
+        return
+    cmd = args[0].lower()
+    if cmd == "on":
+        settings["adaptive_threshold"] = True
+        send_reply("✅ *Adaptive threshold aktif.* Threshold entry/exit akan menyesuaikan volatility.", reply_chat)
+    elif cmd == "off":
+        settings["adaptive_threshold"] = False
+        send_reply("❌ *Adaptive threshold dinonaktifkan.* Threshold kembali ke nilai base setting.", reply_chat)
+    else:
+        send_reply("Gunakan `on` atau `off`.", reply_chat)
+
+
+def handle_session_command(reply_chat: str) -> None:
+    """Tampilkan sesi trading aktif dan implikasinya."""
+    sess = get_market_session()
+    adp  = calc_adaptive_thresholds()
+    send_reply(
+        f"🕐 *Market Session*\n"
+        f"\n"
+        f"┌─────────────────────\n"
+        f"│ {sess['emoji']} *{sess['primary']}*\n"
+        f"│ Waktu: {sess['time_str']}\n"
+        f"│ Volatility ekspektasi: {sess['volatility_expect']}\n"
+        f"├─────────────────────\n"
+        f"│ _{sess['pairs_note']}_\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Sesi aktif sekarang:* {', '.join(sess['sessions'])}\n"
+        f"\n"
+        f"_Volatility bot sekarang: {adp['vol_label']} — threshold adaptif ±{adp['entry_adaptive']:.2f}%_",
+        reply_chat,
+    )
 
 
 def handle_regimefilter_command(args: list, reply_chat: str) -> None:
