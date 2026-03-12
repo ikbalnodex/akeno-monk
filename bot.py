@@ -2979,72 +2979,118 @@ def _reset_eth_peak() -> None:
     eth_peak_time         = None
 
 
+def build_gap_bar(gap_f: float, eff_et: float, lead_min: float) -> str:
+    """
+    Visual spektrum gap — menunjukkan posisi gap sekarang di antara BTC lead dan ETH lead.
+
+    Format (monospace Telegram):
+        {gap_f:+.2f}%
+    [BTC]────────●──────[ETH]
+           |Netral|
+
+    Skala: -eff_et (kiri) sampai +eff_et (kanan), total 21 slot
+    Neutral zone: |gap| < lead_min
+    Threshold zone: lead_min ≤ |gap| < eff_et
+    Entry zone: |gap| ≥ eff_et
+    """
+    BAR_W      = 21          # total slot bar (harus ganjil, tengah = slot 10)
+    CENTER     = BAR_W // 2  # 10
+
+    # Posisi dot — clamp agar tetap di dalam bar
+    ratio      = max(-1.0, min(1.0, gap_f / eff_et))
+    dot_pos    = int(round(CENTER + ratio * CENTER))  # 0–20
+
+    # Neutral zone batas (dalam slot)
+    neutral_w  = max(1, int(round(lead_min / eff_et * CENTER)))
+    nz_left    = CENTER - neutral_w   # slot kiri neutral
+    nz_right   = CENTER + neutral_w   # slot kanan neutral
+
+    # Bangun bar char per char
+    bar_chars = []
+    for i in range(BAR_W):
+        if i == dot_pos:
+            bar_chars.append("●")
+        elif i == nz_left or i == nz_right:
+            bar_chars.append("|")
+        else:
+            bar_chars.append("─")
+    bar_str = "".join(bar_chars)
+
+    # Label posisi gap di atas dot (spasi sesuai posisi dot)
+    label       = f"{gap_f:+.2f}%"
+    label_pad   = max(0, dot_pos - len(label) // 2)
+    label_line  = " " * label_pad + label
+
+    # Neutral label di bawah bar, di tengah
+    neutral_lbl = "Netral"
+    nz_center   = (nz_left + nz_right) // 2
+    ntl_pad     = max(0, nz_center - len(neutral_lbl) // 2)
+    neutral_line = " " * ntl_pad + f"|{neutral_lbl}|"
+
+    bar_block = (
+        f"`{label_line}`\n"
+        f"`[BTC]{bar_str}[ETH]`\n"
+        f"`{neutral_line}`"
+    )
+
+    # Sinyal keterangan di bawah bar
+    gap_abs = abs(gap_f)
+    if gap_abs >= eff_et:
+        if gap_f > 0:
+            sig = "⚡ *ETH outperforming* — Early Signal S1: Long BTC / Short ETH"
+        else:
+            sig = "⚡ *BTC outperforming* — Early Signal S2: Long ETH / Short BTC"
+    elif gap_abs >= lead_min:
+        if gap_f > 0:
+            sig = "🔔 ETH mulai memimpin — potensi S1 (Long BTC / Short ETH)"
+        else:
+            sig = "🔔 BTC mulai memimpin — potensi S2 (Long ETH / Short BTC)"
+    else:
+        sig = "⚪ ETH & BTC bergerak seimbang — belum ada lead"
+
+    return f"{bar_block}\n{sig}"
+
+
 def build_market_snapshot() -> str:
     """
-    Compact market snapshot untuk heartbeat & /status:
-    - Siapa outperform (ETH vs BTC) per TF
-    - Early signal status (leader & phase)
-    - Gap progress bar ke threshold
+    Market snapshot untuk /status dan heartbeat:
+    - Visual gap bar (spektrum BTC lead ↔ ETH lead)
+    - Per-TF dominance
+    - Early signal phase status
     """
     gap_now = scan_stats.get("last_gap")
     if gap_now is None:
-        return ""
+        return "_Belum ada data scan._"
 
-    gap_f  = float(gap_now)
-    adp    = calc_adaptive_thresholds()
-    eff_et = adp["entry_adaptive"] if settings["adaptive_threshold"] else settings["entry_threshold"]
-    dom    = calc_dominance_score()
-    mtf    = calc_multitf_gap()
+    gap_f    = float(gap_now)
+    adp      = calc_adaptive_thresholds()
+    eff_et   = adp["entry_adaptive"] if settings["adaptive_threshold"] else settings["entry_threshold"]
+    lead_min = settings["early_lead_gap"]
+    mtf      = calc_multitf_gap()
 
-    # Outperform summary
-    if dom["dominant"] == "ETH":
-        dom_str = f"🟡 *ETH outperforming BTC* ({dom['strength']}) — {dom['score']:+.2f}%"
-    elif dom["dominant"] == "BTC":
-        dom_str = f"🟠 *BTC outperforming ETH* ({dom['strength']}) — {dom['score']:+.2f}%"
-    else:
-        dom_str = "⚪ ETH & BTC seimbang"
+    # Visual bar
+    gap_bar = build_gap_bar(gap_f, eff_et, lead_min)
 
-    # Per-TF label
+    # Per-TF label singkat
     def _tf(g):
-        if g is None:   return "—"
-        if g > 0.15:    return "🟡ETH"
-        if g < -0.15:   return "🟠BTC"
-        return "⚪"
-
+        if g is None:  return "—"
+        if g > 0.15:   return "🟡ETH"
+        if g < -0.15:  return "🟠BTC"
+        return "⚪─"
     tf_line = f"1h:{_tf(mtf['gap_1h'])}  4h:{_tf(mtf['gap_4h'])}  24h:{_tf(mtf['gap_24h'])}"
 
-    # Early signal status
+    # Early signal phase status
     if es_leader is not None:
-        phase2_str = " | ⚡ 5m aktif" if not es_move_alerted else " | ✅ 5m terkirim"
-        es_str = f"\n🔎 Early Signal: *{es_leader} memimpin* → {'S1' if es_leader == 'ETH' else 'S2'}{phase2_str}"
+        phase2_str = "⚡ memantau 5m" if not es_move_alerted else "✅ 5m terkirim"
+        lead_str   = es_lead_start_ts.strftime("%H:%M UTC") if es_lead_start_ts else "—"
+        es_line    = f"\n📡 Early Signal: *{es_leader} lead* sejak {lead_str} — {phase2_str}"
     else:
-        es_str = ""
-
-    # Gap progress bar
-    gap_abs  = abs(gap_f)
-    pct_fill = min(100, int(gap_abs / eff_et * 100))
-    bar_fill = min(10, int(gap_abs / eff_et * 10))
-    bar      = "█" * bar_fill + "░" * (10 - bar_fill)
-
-    if current_mode != Mode.SCAN:
-        gap_line = ""
-    elif gap_abs >= eff_et:
-        cand = "Long BTC/Short ETH" if gap_f > 0 else "Long ETH/Short BTC"
-        gap_line = f"\n⚡ *Di atas threshold* — {cand}\n`[{bar}]` {gap_abs:.2f}% / ±{eff_et:.2f}%"
-    elif gap_abs >= eff_et * 0.3:
-        cand    = "Long BTC/Short ETH" if gap_f > 0 else "Long ETH/Short BTC"
-        remain  = eff_et - gap_abs
-        gap_line = f"\n🔔 *{cand}* — butuh {remain:.2f}% lagi\n`[{bar}]` {pct_fill}%"
-    else:
-        gap_line = f"\n💤 Gap {gap_f:+.2f}% — jauh dari threshold ±{eff_et:.2f}%"
+        es_line = ""
 
     return (
-        f"┌─────────────────────\n"
-        f"│ {dom_str}\n"
-        f"│ TF: {tf_line}\n"
-        f"└─────────────────────"
-        f"{es_str}"
-        f"{gap_line}"
+        f"{gap_bar}\n"
+        f"TF: {tf_line}"
+        f"{es_line}"
     )
 
 
