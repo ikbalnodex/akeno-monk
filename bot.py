@@ -499,6 +499,7 @@ def process_commands() -> None:
             "/status":    lambda: handle_status_command(chat_id),
             "/help": lambda: (
                 handle_help_market_command(chat_id)  if args and args[0].lower() in ("market", "m") else
+                handle_help_trade_command(chat_id)   if args and args[0].lower() in ("trade", "t", "close", "history") else
                 handle_help_pos_command(chat_id)     if args and args[0].lower() in ("pos", "p", "health") else
                 handle_help_config_command(chat_id)  if args and args[0].lower() in ("config", "c", "conf") else
                 handle_help_example_command(chat_id) if args and args[0].lower() in ("example", "ex", "contoh") else
@@ -6008,56 +6009,165 @@ def handle_simstats_command(reply_chat: str) -> None:
 
 def handle_help_command(reply_chat: str) -> None:
     """
-    /help          — menu utama
-    /help market   — perintah analisis pasar
-    /help pos      — position health tracker
-    /help config   — konfigurasi bot
-    /help examples — contoh lengkap setpos & setfunding
+    /help           — menu utama
+    /help market    — analisis pasar & sinyal
+    /help trade     — close posisi, history, stress alert
+    /help pos       — position health tracker
+    /help config    — konfigurasi threshold & bot
+    /help example   — contoh perintah lengkap
     """
-    args_raw = getattr(handle_help_command, "_last_args", [])
-
-    peak_s  = "✅" if settings["peak_enabled"] else "❌"
-    cap_str = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "—"
-    pos_str = pos_data.get("strategy") or "—"
-    mode_s  = current_mode.value if current_mode else "SCAN"
-    gap_s   = f"{float(scan_stats['last_gap']):+.2f}%" if scan_stats.get("last_gap") is not None else "—"
+    mode_s    = current_mode.value if current_mode else "SCAN"
+    gap_s     = f"{float(scan_stats['last_gap']):+.2f}%" if scan_stats.get("last_gap") is not None else "—"
+    pos_s     = active_strategy.value if active_strategy else "—"
+    cap_str   = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "—"
+    n_history = len(trade_history)
+    n_wins    = sum(1 for t in trade_history if t["net_pct"] > 0)
+    wr_s      = f"{n_wins}/{n_history} ({n_wins/n_history*100:.0f}%)" if n_history else "—"
+    candles_s = f"{len(candle_history)}C" if candle_history else "warming up"
 
     send_reply(
-        f"📟 *Menu Utama*\n"
-        f"_Gap: {gap_s} | Mode: {mode_s} | Peak: {peak_s} | Modal: {cap_str} | Pos: {pos_str}_\n"
+        f"📟 *Monk Bot — Menu Utama*\n"
+        f"_Gap: {gap_s} | Mode: {mode_s} | Posisi: {pos_s}_\n"
+        f"_Modal: {cap_str} | Candles: {candles_s} | Trade: {n_history} (WR: {wr_s})_\n"
         f"\n"
-        f"Ketik salah satu untuk detail:\n"
+        f"Pilih kategori:\n"
         f"\n"
-        f"📈 `/help market` — Analisis & sinyal\n"
-        f"🏥 `/help pos`    — Position tracker\n"
-        f"⚙️ `/help config` — Konfigurasi bot\n"
-        f"📋 `/help example`— Contoh perintah\n"
+        f"📈 `/help market` — Analisis & sinyal pasar\n"
+        f"🔒 `/help trade`  — Close, history & stress alert\n"
+        f"🏥 `/help pos`    — Position health tracker\n"
+        f"⚙️  `/help config` — Konfigurasi bot\n"
+        f"📋 `/help example`— Contoh format perintah\n"
         f"\n"
-        f"*Shortcut cepat:*\n"
-        f"`/analysis` `/ratio` `/health` `/status`",
+        f"*── Shortcut Cepat ──*\n"
+        f"`/status`    — Snapshot market + mode bot\n"
+        f"`/health`    — Cek kesehatan posisi aktif\n"
+        f"`/pnl`       — P&L posisi sekarang\n"
+        f"`/analysis`  — Analisis market lengkap\n"
+        f"`/close`     — Close posisi manual\n"
+        f"`/history`   — Rekap semua trade\n"
+        f"`/divstress` — Cek stress divergence",
         reply_chat,
     )
 
 
+
 def handle_help_market_command(reply_chat: str) -> None:
+    n_candles = len(candle_history)
+    lb        = settings["lookback_hours"]
+    entry_t   = settings["entry_threshold"]
+    exit_t    = settings["exit_threshold"]
+    invalid_t = settings["invalidation_threshold"]
+    regime_on = "✅ ON" if settings["regime_filter_enabled"] else "❌ OFF"
+    adaptive  = "✅ ON" if settings["adaptive_threshold"] else "❌ OFF"
+    es_on     = "✅ ON" if settings.get("early_signal_enabled", True) else "❌ OFF"
+
     send_reply(
-        f"📈 *Market Analysis*\n"
-        f"───────────────────\n"
-        f"`/analysis`  — Snapshot lengkap\n"
-        f"             _(regime + gap + ratio + setup)_\n"
+        f"📈 *Market Analysis & Sinyal*\n"
+        f"_Candle 1H tersedia: {n_candles} | Lookback: {lb}h_\n"
+        f"_Gap threshold: ±{entry_t}% entry | ±{exit_t}% exit | ±{invalid_t}% invalid_\n"
         f"\n"
-        f"`/ratio`     — ETH/BTC ratio detail\n"
-        f"             _(conviction + entry readiness)_\n"
+        f"*── Status & Snapshot ──*\n"
+        f"`/status`\n"
+        f"  Gap bar visual + early signal + TF alignment\n"
+        f"`/analysis`\n"
+        f"  Regime + gap multi-TF + ratio + sizing + setup\n"
+        f"`/ratio`\n"
+        f"  ETH/BTC ratio percentile + momentum + conviction\n"
+        f"`/velocity`\n"
+        f"  Kecepatan gap bergerak + estimasi waktu TP\n"
+        f"`/pnl`\n"
+        f"  P&L posisi aktif (leg BTC + leg ETH + net)\n"
+        f"`/session`\n"
+        f"  Sesi trading sekarang (Asia/London/NY/Overlap)\n"
         f"\n"
-        f"`/velocity`  — Kecepatan gap & ETA TP\n"
+        f"*── Early Signal ──*\n"
+        f"_Status: {es_on}_\n"
+        f"`/earlysignal`\n"
+        f"  Status Phase 1 (lead) & Phase 2 (5m move)\n"
+        f"`/earlysignal on` / `off`\n"
+        f"`/earlysignal lead <pct>` — threshold gap lead\n"
+        f"`/earlysignal move <pct>` — threshold gerak 5m\n"
         f"\n"
-        f"`/pnl`       — Net P&L posisi bot aktif\n"
+        f"*── Regime & Adaptive ──*\n"
+        f"_Regime filter: {regime_on} | Adaptive threshold: {adaptive}_\n"
+        f"`/regimefilter on` / `off`\n"
+        f"  Blokir entry kalau regime tidak sesuai\n"
+        f"`/adaptivethreshold on` / `off`\n"
+        f"  Sesuaikan threshold otomatis dengan volatility\n"
         f"\n"
-        f"`/capital <usd>`\n"
-        f"             — Set modal untuk sizing\n"
+        f"*── Data Candle (1H OHLC) ──*\n"
+        f"  Bot pakai close candle 1H sebagai basis gap\n"
+        f"  Bukan tick acak — bebas noise intra-jam\n"
+        f"  Setiap scan rebuild dari price_history → 1H candle\n"
+        f"  _Max simpan: {CANDLE_MAX} candle ({CANDLE_MAX}h)_",
+        reply_chat,
+    )
+
+
+
+def handle_help_trade_command(reply_chat: str) -> None:
+    """Bantuan untuk command close posisi, history, dan stress alert."""
+    mode_s      = current_mode.value if current_mode else "SCAN"
+    strat_s     = active_strategy.value if active_strategy else "—"
+    n_trades    = len(trade_history)
+    wins        = sum(1 for t in trade_history if t["net_pct"] > 0)
+    wr_s        = f"{wins}/{n_trades} ({wins/n_trades*100:.0f}%)" if n_trades else "belum ada"
+    net_cum     = sum(t["net_pct"] for t in trade_history)
+    net_usd_cum = sum(t["net_usd"] for t in trade_history if t["net_usd"] is not None)
+    ds_on       = "✅ ON" if settings.get("div_stress_enabled", True) else "❌ OFF"
+    ds_loss     = settings.get("div_stress_leg_loss_pct", 1.5)
+    ds_widen    = settings.get("div_stress_gap_widen_pct", 0.3)
+
+    summary_line = (
+        f"WR: {wr_s} | Net: {net_cum:+.2f}%"
+        + (f" (${net_usd_cum:+.2f})" if net_usd_cum else "")
+        if n_trades else "Belum ada trade sesi ini"
+    )
+
+    send_reply(
+        f"🔒 *Trade Management*\n"
+        f"_Mode: {mode_s} | Posisi: {strat_s}_\n"
+        f"_{summary_line}_\n"
         f"\n"
-        f"───────────────────\n"
-        f"_Sinyal otomatis dikirim saat gap ±threshold~_",
+        f"*── Close Posisi ──*\n"
+        f"`/close`\n"
+        f"  Minta konfirmasi close posisi aktif\n"
+        f"`/close confirm`\n"
+        f"  Eksekusi close manual sekarang\n"
+        f"  _Otomatis record ke history_\n"
+        f"\n"
+        f"  Close *otomatis* terjadi saat:\n"
+        f"  🎯 TP hit  🔔 TSL hit  🚪 Exit  ⛔ Invalid\n"
+        f"  _Semua auto-close juga tercatat di history_\n"
+        f"\n"
+        f"*── Trade History ──*\n"
+        f"`/history`\n"
+        f"  10 trade terakhir\n"
+        f"  _(tanggal | S1/S2 | reason | net PnL | durasi)_\n"
+        f"`/history all`\n"
+        f"  Semua trade sesi ini\n"
+        f"`/history clear`\n"
+        f"  Hapus semua history\n"
+        f"\n"
+        f"  Kode reason:\n"
+        f"  🎯 TP | 🔔 TSL | 🚪 EXIT | ⛔ INVALID | 🔒 MANUAL\n"
+        f"\n"
+        f"*── Divergence Stress Alert ──*\n"
+        f"_Status: {ds_on}_\n"
+        f"_Trigger: leg rugi ≥{ds_loss}% + gap melebar ≥{ds_widen}%_\n"
+        f"`/divstress`\n"
+        f"  Status lengkap + P&L leg sekarang\n"
+        f"`/divstress on` / `off`\n"
+        f"  Aktifkan atau nonaktifkan\n"
+        f"`/divstress loss <pct>`\n"
+        f"  Threshold % leg rugi untuk trigger _(default 1.5)_\n"
+        f"`/divstress widen <pct>`\n"
+        f"  Threshold gap melebar dari entry _(default 0.3)_\n"
+        f"\n"
+        f"*── Alur Normal ──*\n"
+        f"Entry signal → Bot pantau → TP/TSL otomatis close\n"
+        f"  └─ kalau mau tutup duluan → `/close confirm`\n"
+        f"Semua close → tercatat di `/history`",
         reply_chat,
     )
 
@@ -6084,58 +6194,72 @@ def handle_help_pos_command(reply_chat: str) -> None:
         f"`/clearpos`  — Hapus data posisi\n"
         f"\n"
         f"───────────────────\n"
-        f"_Data tersimpan di Redis, survive restart~_",
+        f"_Data tersimpan di Redis, survive restart~_\n"
+        f"\n"
+        f"💡 Untuk *close posisi & history trade*:\n"
+        f"→ `/help trade`",
         reply_chat,
     )
 
 
 def handle_help_config_command(reply_chat: str) -> None:
-    et    = settings["entry_threshold"]
-    xt    = settings["exit_threshold"]
-    it    = settings["invalidation_threshold"]
-    sl    = settings["sl_pct"]
-    peak  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
-    pr    = settings["peak_reversal"]
-    ec_s  = int(settings["exit_confirm_scans"])
-    ec_b  = float(settings["exit_confirm_buffer"])
-    ec_p  = float(settings["exit_pnl_gate"])
-    hb    = settings["heartbeat_minutes"]
-    iv    = settings["scan_interval"]
-    lk    = settings["lookback_hours"]
+    et      = settings["entry_threshold"]
+    xt      = settings["exit_threshold"]
+    it      = settings["invalidation_threshold"]
+    sl      = settings["sl_pct"]
+    peak_s  = "✅ ON" if settings["peak_enabled"] else "❌ OFF"
+    pr      = settings["peak_reversal"]
+    ec_s    = int(settings["exit_confirm_scans"])
+    ec_b    = float(settings["exit_confirm_buffer"])
+    ec_p    = float(settings["exit_pnl_gate"])
+    hb      = settings["heartbeat_minutes"]
+    iv      = settings["scan_interval"]
+    lk      = settings["lookback_hours"]
+    rf_on   = "✅" if settings["regime_filter_enabled"] else "❌"
+    at_on   = "✅" if settings["adaptive_threshold"] else "❌"
+    es_on   = "✅" if settings.get("early_signal_enabled", True) else "❌"
+    ds_on   = "✅" if settings.get("div_stress_enabled", True) else "❌"
+    eth_sr  = settings["eth_size_ratio"]
+    btc_sr  = 100.0 - eth_sr
+    cap_s   = f"${settings['capital']:,.0f}" if settings["capital"] > 0 else "belum diset"
+
     send_reply(
         f"⚙️ *Konfigurasi Bot*\n"
-        f"───────────────────\n"
-        f"*Threshold:*\n"
-        f"  Entry:      ±{et}%\n"
-        f"  Exit/TP:    ±{xt}%\n"
-        f"  Invalid:    ±{it}%\n"
-        f"  Trail SL:   {sl}%\n"
+        f"_Modal: {cap_s} | Scan: {iv}s | Lookback: {lk}h_\n"
         f"\n"
-        f"*Peak Mode:* {peak} ({pr}% reversal)\n"
+        f"*── Threshold ──*\n"
+        f"  Entry:    ±{et}%   → `/threshold entry <val>`\n"
+        f"  Exit/TP:  ±{xt}%   → `/threshold exit <val>`\n"
+        f"  Invalid:  ±{it}%  → `/threshold invalid <val>`\n"
+        f"  Trail SL: {sl}%    → `/sltp sl <val>`\n"
         f"\n"
-        f"*Exit Confirmation:*\n"
-        f"  Scans:  {ec_s}x\n"
-        f"  Buffer: {ec_b:.2f}%\n"
-        f"  P&L gate: {ec_p:.2f}%\n"
+        f"*── Exit Confirmation ──*\n"
+        f"  Scans:    {ec_s}x   → `/exitconf scans <n>`\n"
+        f"  Buffer:   {ec_b:.2f}% → `/exitconf buffer <val>`\n"
+        f"  P&L gate: {ec_p:.2f}% → `/exitconf pnl <val>`\n"
         f"\n"
-        f"*Timing:*\n"
-        f"  Scan:      {iv}s\n"
-        f"  Lookback:  {lk}h\n"
-        f"  Heartbeat: {hb}m\n"
+        f"*── Mode & Filter ──*\n"
+        f"  Peak Mode:    {peak_s} ({pr}%) → `/peak on|off|<val>`\n"
+        f"  Regime filter:    {rf_on} → `/regimefilter on|off`\n"
+        f"  Adaptive thresh:  {at_on} → `/adaptivethreshold on|off`\n"
         f"\n"
-        f"───────────────────\n"
-        f"*Ubah dengan:*\n"
-        f"`/threshold entry|exit|invalid <val>`\n"
-        f"`/sltp sl <val>`\n"
-        f"`/peak on|off|<val>`\n"
-        f"`/exitconf scans|buffer|pnl <val>`\n"
-        f"`/sizeratio <eth_pct>` _(sekarang ETH {int(settings['eth_size_ratio'])}%)_\n"
-        f"`/regimefilter on|off` _(sekarang: {'✅ ON' if settings['regime_filter_enabled'] else '❌ OFF'})_\n"
-        f"`/interval <detik>`\n"
-        f"`/lookback <jam>`\n"
-        f"`/heartbeat <menit>`",
+        f"*── Sinyal Awal ──*\n"
+        f"  Early Signal:   {es_on} → `/earlysignal on|off`\n"
+        f"  Div Stress:     {ds_on} → `/divstress on|off`\n"
+        f"\n"
+        f"*── Sizing ──*\n"
+        f"  ETH/BTC ratio: {int(eth_sr)}/{int(btc_sr)}% → `/sizeratio <eth_pct>`\n"
+        f"  Modal:         {cap_s} → `/capital <usd>`\n"
+        f"\n"
+        f"*── Timing ──*\n"
+        f"  Scan interval: {iv}s    → `/interval <detik>`\n"
+        f"  Lookback:      {lk}h   → `/lookback <jam>`\n"
+        f"  Heartbeat:     {hb}m   → `/heartbeat <menit>`\n"
+        f"\n"
+        f"_Ketik `/help example` untuk contoh format lengkap_",
         reply_chat,
     )
+
 
 
 def handle_help_example_command(reply_chat: str) -> None:
