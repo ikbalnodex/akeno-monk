@@ -210,6 +210,12 @@ sim_trade: dict = {
     "history":       [],      # list of dict per trade
 }
 
+# =============================================================================
+# Trade History — semua posisi closed (manual + auto), persisten di session
+# =============================================================================
+trade_history: list = []   # list of dict, append setiap kali posisi closed
+
+
 last_update_id:      int                = 0
 last_heartbeat_time: Optional[datetime] = None
 last_redis_refresh:  Optional[datetime] = None
@@ -512,6 +518,8 @@ def process_commands() -> None:
             "/regimefilter":      lambda: handle_regimefilter_command(args, chat_id),
             "/earlysignal":       lambda: handle_earlysignal_command(args, chat_id),
             "/divstress":         lambda: handle_divstress_command(args, chat_id),
+            "/close":             lambda: handle_close_command(args, chat_id),
+            "/history":           lambda: handle_history_command(args, chat_id),
             "/ethpullback":       lambda: handle_ethpullback_command(args, chat_id),
             "/sim":        lambda: handle_sim_command(args, chat_id),
             "/simstats":   lambda: handle_simstats_command(chat_id),
@@ -3717,6 +3725,73 @@ def reset_to_scan() -> None:
 # =============================================================================
 # TP + TSL Check
 # =============================================================================
+def record_trade(reason: str, btc_exit: float, eth_exit: float) -> None:
+    """
+    Simpan rekap trade ke trade_history.
+    Dipanggil setiap kali posisi ditutup: TP, TSL, EXIT, INVALID, MANUAL.
+    """
+    if active_strategy is None or entry_btc_price is None or entry_eth_price is None:
+        return
+
+    now_utc  = datetime.now(timezone.utc)
+    strat    = active_strategy.value   # "S1" / "S2"
+
+    # Hitung P&L per leg
+    if active_strategy == Strategy.S1:
+        # Long BTC / Short ETH
+        leg_btc_pct = (btc_exit - float(entry_btc_price)) / float(entry_btc_price) * 100
+        leg_eth_pct = (float(entry_eth_price) - eth_exit)  / float(entry_eth_price) * 100
+    else:
+        # Long ETH / Short BTC
+        leg_eth_pct = (eth_exit - float(entry_eth_price)) / float(entry_eth_price) * 100
+        leg_btc_pct = (float(entry_btc_price) - btc_exit) / float(entry_btc_price) * 100
+
+    net_pct = (leg_eth_pct + leg_btc_pct) / 2
+
+    # Hitung PnL dalam USD kalau ada data capital
+    capital   = settings.get("capital", 0.0)
+    net_usd   = capital * net_pct / 100 if capital > 0 else None
+
+    # Durasi
+    dur_str = "N/A"
+    if entry_gap_value is not None and hasattr(record_trade, "_entry_ts"):
+        try:
+            dur_s   = int((now_utc - record_trade._entry_ts).total_seconds())
+            h, rem  = divmod(dur_s, 3600)
+            m, _    = divmod(rem, 60)
+            dur_str = f"{h}h {m}m" if h > 0 else f"{m}m"
+        except Exception:
+            pass
+
+    trade_history.append({
+        "no":         len(trade_history) + 1,
+        "date":       now_utc.strftime("%d %b %Y"),
+        "time":       now_utc.strftime("%H:%M"),
+        "strategy":   strat,
+        "reason":     reason,                      # TP / TSL / EXIT / INVALID / MANUAL
+        "gap_entry":  round(entry_gap_value, 3) if entry_gap_value else None,
+        "gap_exit":   round(float(scan_stats.get("last_gap") or 0), 3),
+        "btc_entry":  float(entry_btc_price),
+        "eth_entry":  float(entry_eth_price),
+        "btc_exit":   btc_exit,
+        "eth_exit":   eth_exit,
+        "leg_btc":    round(leg_btc_pct, 2),
+        "leg_eth":    round(leg_eth_pct, 2),
+        "net_pct":    round(net_pct, 2),
+        "net_usd":    round(net_usd, 2) if net_usd is not None else None,
+        "duration":   dur_str,
+        "closed_at":  now_utc.isoformat(),
+    })
+    logger.info(
+        f"Trade recorded #{len(trade_history)}: {strat} {reason} "
+        f"net={net_pct:+.2f}% "
+        + (f"${net_usd:+.2f}" if net_usd else "")
+    )
+
+# Simpan timestamp entry saat posisi dibuka — dipakai record_trade untuk hitung durasi
+record_trade._entry_ts = None  # type: ignore
+
+
 def check_sltp(
     gap_float: float,
     btc_ret:   Decimal,
@@ -3731,6 +3806,9 @@ def check_sltp(
     et     = settings["exit_threshold"]
     sl_pct = settings["sl_pct"]
 
+    btc_now = scan_stats.get("last_btc_price") or Decimal("0")
+    eth_now = scan_stats.get("last_eth_price") or Decimal("0")
+
     if active_strategy == Strategy.S1:
         if gap_float < trailing_gap_best:
             trailing_gap_best = gap_float
@@ -3738,13 +3816,17 @@ def check_sltp(
 
         if gap_float <= et:
             eth_target, _ = calc_tp_target_price(Strategy.S1)
-            send_alert(build_tp_message(btc_ret, eth_ret, gap, entry_gap_value, et, eth_target))
+            sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="TP")
+            record_trade(reason="TP", btc_exit=float(btc_now), eth_exit=float(eth_now))
+            send_alert(build_tp_message(btc_ret, eth_ret, gap, entry_gap_value, et, eth_target) + sim_msg)
             logger.info(f"TP S1. Gap: {gap_float:.2f}%")
             reset_to_scan()
             return True
 
         if gap_float >= tsl_level:
-            send_alert(build_trailing_sl_message(btc_ret, eth_ret, gap, entry_gap_value, trailing_gap_best, tsl_level))
+            sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="TSL")
+            record_trade(reason="TSL", btc_exit=float(btc_now), eth_exit=float(eth_now))
+            send_alert(build_trailing_sl_message(btc_ret, eth_ret, gap, entry_gap_value, trailing_gap_best, tsl_level) + sim_msg)
             logger.info(f"TSL S1. Best: {trailing_gap_best:.2f}% TSL: {tsl_level:.2f}%")
             reset_to_scan()
             return True
@@ -3756,13 +3838,17 @@ def check_sltp(
 
         if gap_float >= -et:
             eth_target, _ = calc_tp_target_price(Strategy.S2)
-            send_alert(build_tp_message(btc_ret, eth_ret, gap, entry_gap_value, -et, eth_target))
+            sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="TP")
+            record_trade(reason="TP", btc_exit=float(btc_now), eth_exit=float(eth_now))
+            send_alert(build_tp_message(btc_ret, eth_ret, gap, entry_gap_value, -et, eth_target) + sim_msg)
             logger.info(f"TP S2. Gap: {gap_float:.2f}%")
             reset_to_scan()
             return True
 
         if gap_float <= tsl_level:
-            send_alert(build_trailing_sl_message(btc_ret, eth_ret, gap, entry_gap_value, trailing_gap_best, tsl_level))
+            sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="TSL")
+            record_trade(reason="TSL", btc_exit=float(btc_now), eth_exit=float(eth_now))
+            send_alert(build_trailing_sl_message(btc_ret, eth_ret, gap, entry_gap_value, trailing_gap_best, tsl_level) + sim_msg)
             logger.info(f"TSL S2. Best: {trailing_gap_best:.2f}% TSL: {tsl_level:.2f}%")
             reset_to_scan()
             return True
@@ -3813,6 +3899,7 @@ def evaluate_and_transition(
         entry_driver      = drv
         peak              = peak_gap if not is_direct else 0.0
         peak_gap, peak_strategy = None, None
+        record_trade._entry_ts = datetime.now(timezone.utc)   # catat waktu entry
 
         send_alert(build_entry_message(
             strategy, btc_ret, eth_ret, gap,
@@ -3952,6 +4039,7 @@ def evaluate_and_transition(
                 send_alert(build_exit_message(btc_ret, eth_ret, gap, confirm_note=confirm_note))
                 # Simulation: auto-close posisi
                 sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="EXIT")
+                record_trade(reason="EXIT", btc_exit=float(btc_now), eth_exit=float(eth_now))
                 if sim_msg:
                     send_alert(sim_msg)
                 logger.info(f"EXIT {active_strategy.value}. Gap: {gap_float:.2f}% "
@@ -3984,6 +4072,7 @@ def evaluate_and_transition(
         if active_strategy == Strategy.S1 and gap_float >= invalid_thresh:
             send_alert(build_invalidation_message(Strategy.S1, btc_ret, eth_ret, gap))
             sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="INVALID")
+            record_trade(reason="INVALID", btc_exit=float(btc_now), eth_exit=float(eth_now))
             if sim_msg: send_alert(sim_msg)
             logger.info(f"INVALIDATION S1. Gap: {gap_float:.2f}%")
             reset_to_scan()
@@ -3992,6 +4081,7 @@ def evaluate_and_transition(
         if active_strategy == Strategy.S2 and gap_float <= -invalid_thresh:
             send_alert(build_invalidation_message(Strategy.S2, btc_ret, eth_ret, gap))
             sim_msg = sim_close_position(float(btc_now), float(eth_now), reason="INVALID")
+            record_trade(reason="INVALID", btc_exit=float(btc_now), eth_exit=float(eth_now))
             if sim_msg: send_alert(sim_msg)
             logger.info(f"INVALIDATION S2. Gap: {gap_float:.2f}%")
             reset_to_scan()
@@ -4660,6 +4750,149 @@ def handle_sizeratio_command(args: list, reply_chat: str) -> None:
         )
     except ValueError:
         send_reply("Nilai tidak valid. Contoh: `/sizeratio 60`", reply_chat)
+
+
+def handle_close_command(args: list, reply_chat: str) -> None:
+    """
+    /close          — close posisi bot + sim sekarang (manual)
+    /close confirm  — wajib konfirmasi agar tidak salah tekan
+    """
+    if current_mode != Mode.TRACK or active_strategy is None:
+        send_reply("Tidak ada posisi aktif saat ini.", reply_chat)
+        return
+
+    # Minta konfirmasi kalau tidak ada argumen
+    if not args or args[0].lower() != "confirm":
+        strat = active_strategy.value
+        gap_f = float(scan_stats.get("last_gap") or 0)
+        send_reply(
+            f"⚠️ *Kamu yakin mau close posisi {strat} secara manual?*\n"
+            f"Gap sekarang: {gap_f:+.2f}%\n\n"
+            f"Ketik `/close confirm` untuk lanjutkan.",
+            reply_chat,
+        )
+        return
+
+    # Eksekusi close manual
+    btc_now = float(scan_stats.get("last_btc_price") or 0)
+    eth_now = float(scan_stats.get("last_eth_price") or 0)
+    strat   = active_strategy.value
+
+    # Hitung P&L sebelum reset
+    leg_btc_pct, leg_eth_pct, net_pct = None, None, None
+    net_usd = None
+    if entry_btc_price and entry_eth_price and btc_now and eth_now:
+        if active_strategy == Strategy.S1:
+            leg_btc_pct = (btc_now - float(entry_btc_price)) / float(entry_btc_price) * 100
+            leg_eth_pct = (float(entry_eth_price) - eth_now)  / float(entry_eth_price) * 100
+        else:
+            leg_eth_pct = (eth_now - float(entry_eth_price)) / float(entry_eth_price) * 100
+            leg_btc_pct = (float(entry_btc_price) - btc_now) / float(entry_btc_price) * 100
+        net_pct = (leg_btc_pct + leg_eth_pct) / 2
+        capital = settings.get("capital", 0.0)
+        if capital > 0:
+            net_usd = capital * net_pct / 100
+
+    gap_exit = float(scan_stats.get("last_gap") or 0)
+
+    # Record & close
+    record_trade(reason="MANUAL", btc_exit=btc_now, eth_exit=eth_now)
+    sim_msg = sim_close_position(btc_now, eth_now, reason="MANUAL")
+    reset_to_scan()
+
+    # Format notif
+    pnl_line = ""
+    if net_pct is not None:
+        e = "🟢" if net_pct >= 0 else "🔴"
+        pnl_line = (
+            f"\n┌─────────────────────\n"
+            f"│ {'🔴' if leg_btc_pct < 0 else '🟢'} BTC leg: {leg_btc_pct:+.2f}%\n"
+            f"│ {'🔴' if leg_eth_pct < 0 else '🟢'} ETH leg: {leg_eth_pct:+.2f}%\n"
+            f"│ {e} *Net: {net_pct:+.2f}%"
+            + (f" (${net_usd:+.2f})*" if net_usd else "*") +
+            f"\n│ Gap keluar: {gap_exit:+.2f}%\n"
+            f"└─────────────────────"
+        )
+
+    send_reply(
+        f"🔒 *Posisi {strat} ditutup manual*"
+        f"{pnl_line}\n\n"
+        f"Bot kembali ke mode SCAN.\n"
+        f"Ketik `/history` untuk lihat rekap."
+        + ("\n\n" + sim_msg if sim_msg else ""),
+        reply_chat,
+    )
+
+
+def handle_history_command(args: list, reply_chat: str) -> None:
+    """
+    /history        — lihat 10 trade terakhir
+    /history all    — semua trade
+    /history clear  — hapus semua history
+    """
+    if not trade_history:
+        send_reply(
+            "Belum ada trade history.\n"
+            "History akan muncul setelah posisi pertama ditutup.",
+            reply_chat,
+        )
+        return
+
+    cmd = args[0].lower() if args else ""
+
+    if cmd == "clear":
+        n = len(trade_history)
+        trade_history.clear()
+        send_reply(f"🗑️ Trade history dihapus ({n} trade).", reply_chat)
+        return
+
+    # Tentukan berapa trade yang ditampilkan
+    show_all = cmd == "all"
+    trades   = trade_history if show_all else trade_history[-10:]
+
+    # Header
+    total_net_usd = sum(t["net_usd"] for t in trade_history if t["net_usd"] is not None)
+    total_net_pct = sum(t["net_pct"] for t in trade_history)
+    wins  = sum(1 for t in trade_history if t["net_pct"] > 0)
+    total = len(trade_history)
+    wr    = wins / total * 100 if total else 0
+
+    usd_line = f"${total_net_usd:+.2f}" if any(t["net_usd"] for t in trade_history) else ""
+    summary  = (
+        f"📊 *Trade History*\n"
+        f"Total: {total} trade | WR: {wins}/{total} ({wr:.0f}%)\n"
+        f"Net kumulatif: {total_net_pct:+.2f}%"
+        + (f" | {usd_line}" if usd_line else "") +
+        f"\n"
+        f"{'─' * 28}\n"
+    )
+
+    # Rows — tiap trade satu baris ringkas
+    rows = []
+    for t in trades:
+        e      = "✅" if t["net_pct"] > 0 else "❌"
+        usd_s  = f" (${t['net_usd']:+.2f})" if t["net_usd"] is not None else ""
+        reason_emoji = {
+            "TP":      "🎯",
+            "TSL":     "🔔",
+            "EXIT":    "🚪",
+            "INVALID": "⛔",
+            "MANUAL":  "🔒",
+        }.get(t["reason"], "—")
+        rows.append(
+            f"{e} *#{t['no']}* | {t['date']} {t['time']} | "
+            f"*{t['strategy']}* | {reason_emoji}{t['reason']}\n"
+            f"   Gap: {t['gap_entry']:+.2f}% → {t['gap_exit']:+.2f}% | "
+            f"Net: *{t['net_pct']:+.2f}%*{usd_s} | ⏱{t['duration']}"
+        )
+
+    footer = ""
+    if not show_all and len(trade_history) > 10:
+        footer = f"\n_Menampilkan 10 terakhir dari {total}. Ketik `/history all` untuk semua._"
+    else:
+        footer = "\n`/history clear` untuk hapus semua."
+
+    send_reply(summary + "\n".join(rows) + footer, reply_chat)
 
 
 def handle_divstress_command(args: list, reply_chat: str) -> None:
